@@ -179,13 +179,15 @@ impl CredentialBroker {
             Ok(lease) => *guard = Some((key, token.clone(), lease)),
             Err(error) => {
                 *guard = None;
-                // Every post-exchange error, including database failure and
-                // missing scope, attempts to revoke the minted credential.
-                if self
-                    .api
-                    .revoke_installation_token(&jwt, scope.installation_id, &token.token)
-                    .await
-                    .is_err()
+                // Only revoke tokens minted by this request. Cached tokens
+                // have already been delivered to other callers; a failure
+                // here must not interrupt their ongoing GitHub work.
+                if existing.is_none()
+                    && self
+                        .api
+                        .revoke_installation_token(&jwt, scope.installation_id, &token.token)
+                        .await
+                        .is_err()
                 {
                     tracing::warn!("GitHub token cleanup failed; token remains valid until expiry");
                 }

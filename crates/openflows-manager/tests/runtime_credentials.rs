@@ -475,6 +475,38 @@ async fn database_failure_after_exchange_attempts_upstream_cleanup() {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
+async fn cached_token_survives_later_database_failure() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let ctx = setup(db.pool()).await;
+    let scope = ctx
+        .services
+        .runtime_credentials
+        .authenticate(&ctx.raw_credential)
+        .await
+        .unwrap();
+    ctx.services
+        .broker
+        .exchange(&scope, runtime::permissions::RuntimePurpose::Git, "first")
+        .await
+        .unwrap();
+    assert_eq!(ctx.api.exchanges.load(Ordering::SeqCst), 1);
+
+    // Call the broker directly so the failure occurs during the cached
+    // token's authorization recheck, not in the HTTP authentication layer.
+    ctx.services.db.pool().close().await;
+    assert!(ctx
+        .services
+        .broker
+        .exchange(&scope, runtime::permissions::RuntimePurpose::Git, "cached",)
+        .await
+        .is_err());
+    assert_eq!(ctx.api.exchanges.load(Ordering::SeqCst), 1);
+    assert!(ctx.api.revocations().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
 async fn successful_runtime_exchange_returns_scoped_token() {
     let db = TestDb::new().await.unwrap();
     db.migrate().await.unwrap();
