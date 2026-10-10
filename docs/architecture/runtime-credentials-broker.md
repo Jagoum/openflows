@@ -97,7 +97,7 @@ with `401`.
 
 No database transaction is held open across the GitHub request. The broker uses
 an in-process single-flight lock keyed by
-`(app, installation, repository, profile_hash, connection_generation,
+`(workspace, credential, app, installation, repository, profile_hash, connection_generation,
 workspace_generation)` to avoid duplicate upstream exchanges. A distributed lock
 is required when the Manager runs multiple replicas (operations follow-up).
 
@@ -138,7 +138,7 @@ supplied by a caller. `metadata` is implicit.
 | nexus | contents: read | contents: read, issues: write, pull_requests: write |
 | forge | contents: write | contents: write, pull_requests: write |
 | sentinel | contents: read | contents: read, pull_requests: write, checks: read |
-| vessel | contents: write | contents: write, pull_requests: write, checks: read, commit_statuses: read, actions: read |
+| vessel | contents: write | contents: write, pull_requests: write, checks: read, statuses: read, actions: read |
 | lore | contents: write | contents: write, pull_requests: write |
 
 ## Concurrency and revocation
@@ -159,13 +159,11 @@ supplied by a caller. `metadata` is implicit.
 
 ### Revocation limitations
 
-GitHub provides **no endpoint to revoke an installation access token** before it
-expires. The broker therefore:
-
-- discards the local lease (`revoked_at`, clears `encrypted_ref`),
-- attempts upstream revocation (`revoke_installation_token`, a documented no-op
-  in the real client),
-- relies on the token's short (1-hour) lifetime.
+The real client calls `DELETE /installation/token`, authenticating with the installation token.
+Post-exchange failures attempt this request, including database and authorization errors.
+Connection/workspace lifecycle cleanup currently marks leases revoked locally and clears
+their encrypted references; it does not yet perform durable upstream revocation.
+Local revocation must not be interpreted as invalidating an already-issued token at GitHub.
 
 An already-issued GitHub token may remain usable until upstream revocation
 succeeds or it expires. Local generation checks invalidate **future** issuance;
@@ -193,3 +191,5 @@ provisioning API is implemented in WP-04; the internal services and the
 documented scope derivation are the integration surface. A production
 `SecretProvider` adapter remains a deployment decision (WP-08); WP-04 preserves
 hosted-mode restrictions and never silently falls back to development secrets.
+
+Runtime requests are limited to 30 per workspace per database-clock minute (HTTP 429 on excess). Permission profiles use the `Permissions` struct with `Permission` and `PermissionLevel` enums; unknown or surplus upstream grants are rejected except implicit `metadata: read`. Identical requests within a manager reuse a live token and lease under a bounded shard lock; every caller is reauthorized under database row locks. This reuse is scoped to the workspace and credential, repository, profile, and generations. Multiple replicas can still perform separate exchanges.

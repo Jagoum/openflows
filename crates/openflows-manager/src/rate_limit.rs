@@ -22,6 +22,7 @@ pub enum LimitScope {
     /// `POST /invitations/accept` and other token-verification entry points.
     Invitation,
     Refresh,
+    RuntimeBroker,
 }
 
 impl LimitScope {
@@ -33,6 +34,7 @@ impl LimitScope {
             LimitScope::Poll => "poll",
             LimitScope::Invitation => "invitation",
             LimitScope::Refresh => "refresh",
+            LimitScope::RuntimeBroker => "runtime_broker",
         }
     }
 }

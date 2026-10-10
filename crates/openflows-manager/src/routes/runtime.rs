@@ -56,6 +56,19 @@ pub async fn github_credentials(
     // Authenticate as a workspace runtime principal only. This never touches
     // the human session manager, so browser cookies / human tokens are rejected.
     let scope = services.runtime_credentials.authenticate(&bearer).await?;
+    if !crate::rate_limit::RateLimiter::new(services.db.pool().clone())
+        .allow(
+            &scope.workspace_id.to_string(),
+            crate::rate_limit::LimitScope::RuntimeBroker,
+            30,
+        )
+        .await?
+    {
+        return Err(ManagerError::api(
+            "RATE_LIMITED",
+            "runtime credential request limit exceeded",
+        ));
+    }
 
     let purpose = RuntimePurpose::parse(&body.purpose)?;
     let request_id = crate::routes::organizations::request_id(&headers);

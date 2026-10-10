@@ -14,6 +14,52 @@
 use crate::error::ManagerError;
 use std::collections::BTreeMap;
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    Contents,
+    Issues,
+    PullRequests,
+    Checks,
+    Statuses,
+    Actions,
+    Metadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionLevel {
+    Read,
+    Write,
+}
+
+/// Server profiles use typed names and levels; strings exist only at the API boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Permissions(pub BTreeMap<Permission, PermissionLevel>);
+
+impl Permissions {
+    pub fn to_wire(&self) -> BTreeMap<String, String> {
+        serde_json::from_value(serde_json::to_value(&self.0).expect("permission serialization"))
+            .expect("permission map")
+    }
+}
+
+/// GitHub automatically includes read-only metadata; no other surplus grant is allowed.
+pub fn grants_match(
+    actual: &BTreeMap<String, String>,
+    expected: &BTreeMap<String, String>,
+) -> bool {
+    let mut actual = actual.clone();
+    if actual.get("metadata").map(String::as_str) == Some("read")
+        && !expected.contains_key("metadata")
+    {
+        actual.remove("metadata");
+    }
+    actual == *expected
+}
+
 /// The coarse runtime purpose accepted by the broker endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimePurpose {
@@ -51,7 +97,7 @@ pub struct PermissionProfile {
     /// Human/operator-readable profile name, e.g. "forge.git".
     pub name: String,
     /// GitHub permission name -> level ("read"/"write").
-    pub permissions: BTreeMap<String, String>,
+    pub permissions: Permissions,
     /// SHA-256 hex digest of the canonical (sorted) permission map. Recorded
     /// on the lease and used as part of the single-flight cache key.
     pub profile_hash: String,
@@ -72,9 +118,9 @@ impl PermissionProfile {
         format!("{:x}", hasher.finalize())
     }
 
-    fn build(role: &str, purpose: RuntimePurpose, permissions: BTreeMap<String, String>) -> Self {
+    fn build(role: &str, purpose: RuntimePurpose, permissions: Permissions) -> Self {
         let name = format!("{role}.{}", purpose.as_str());
-        let profile_hash = Self::hash(&permissions);
+        let profile_hash = Self::hash(&permissions.to_wire());
         PermissionProfile {
             name,
             permissions,
@@ -89,31 +135,25 @@ pub fn resolve_profile(
     role: &str,
     purpose: RuntimePurpose,
 ) -> Result<PermissionProfile, ManagerError> {
+    use Permission::*;
+    use PermissionLevel::*;
     use RuntimePurpose::*;
-    let perms: BTreeMap<String, String> = match (role, purpose) {
+    let perms = match (role, purpose) {
         // Git protocol: Forge/Vessel/Lore need to push; Nexus/Sentinel read.
-        ("nexus", Git) | ("sentinel", Git) => map(&[("contents", "read")]),
-        ("forge", Git) | ("vessel", Git) | ("lore", Git) => map(&[("contents", "write")]),
+        ("nexus", Git) | ("sentinel", Git) => map(&[(Contents, Read)]),
+        ("forge", Git) | ("vessel", Git) | ("lore", Git) => map(&[(Contents, Write)]),
         // API: Nexus coordinates issues/PRs; Forge/Sentinel review; Vessel CI.
-        ("nexus", Api) => map(&[
-            ("contents", "read"),
-            ("issues", "write"),
-            ("pull_requests", "write"),
-        ]),
-        ("forge", Api) => map(&[("contents", "write"), ("pull_requests", "write")]),
-        ("sentinel", Api) => map(&[
-            ("contents", "read"),
-            ("pull_requests", "write"),
-            ("checks", "read"),
-        ]),
+        ("nexus", Api) => map(&[(Contents, Read), (Issues, Write), (PullRequests, Write)]),
+        ("forge", Api) => map(&[(Contents, Write), (PullRequests, Write)]),
+        ("sentinel", Api) => map(&[(Contents, Read), (PullRequests, Write), (Checks, Read)]),
         ("vessel", Api) => map(&[
-            ("contents", "write"),
-            ("pull_requests", "write"),
-            ("checks", "read"),
-            ("commit_statuses", "read"),
-            ("actions", "read"),
+            (Contents, Write),
+            (PullRequests, Write),
+            (Checks, Read),
+            (Statuses, Read),
+            (Actions, Read),
         ]),
-        ("lore", Api) => map(&[("contents", "write"), ("pull_requests", "write")]),
+        ("lore", Api) => map(&[(Contents, Write), (PullRequests, Write)]),
         _ => {
             return Err(ManagerError::api(
                 "INVALID_INPUT",
@@ -129,28 +169,45 @@ pub fn resolve_profile(
     Ok(PermissionProfile::build(role, purpose, perms))
 }
 
-fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+fn map(pairs: &[(Permission, PermissionLevel)]) -> Permissions {
+    Permissions(pairs.iter().copied().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use Permission::*;
+    use PermissionLevel::*;
+
+    #[test]
+    fn vessel_uses_statuses_and_only_implicit_read_metadata_is_accepted() {
+        let expected = resolve_profile("vessel", RuntimePurpose::Api)
+            .unwrap()
+            .permissions
+            .to_wire();
+        assert_eq!(expected.get("statuses").map(String::as_str), Some("read"));
+        assert!(!expected.contains_key("commit_statuses"));
+        let mut actual = expected.clone();
+        actual.insert("metadata".into(), "read".into());
+        assert!(grants_match(&actual, &expected));
+        actual.insert("metadata".into(), "write".into());
+        assert!(!grants_match(&actual, &expected));
+        actual.insert("metadata".into(), "read".into());
+        actual.insert("administration".into(), "write".into());
+        assert!(!grants_match(&actual, &expected));
+    }
 
     #[test]
     fn profile_hash_is_order_independent() {
         let a = PermissionProfile::build(
             "forge",
             RuntimePurpose::Api,
-            map(&[("contents", "write"), ("pull_requests", "write")]),
+            map(&[(Contents, Write), (PullRequests, Write)]),
         );
         let b = PermissionProfile::build(
             "forge",
             RuntimePurpose::Api,
-            map(&[("pull_requests", "write"), ("contents", "write")]),
+            map(&[(PullRequests, Write), (Contents, Write)]),
         );
         assert_eq!(a.profile_hash, b.profile_hash);
     }
@@ -164,9 +221,13 @@ mod tests {
     #[test]
     fn metadata_is_never_requested_explicitly() {
         let profile = resolve_profile("forge", RuntimePurpose::Git).unwrap();
-        assert!(!profile.permissions.contains_key("metadata"));
+        assert!(!profile.permissions.to_wire().contains_key("metadata"));
         assert_eq!(
-            profile.permissions.get("contents").map(String::as_str),
+            profile
+                .permissions
+                .to_wire()
+                .get("contents")
+                .map(String::as_str),
             Some("write")
         );
     }
@@ -175,7 +236,7 @@ mod tests {
     fn purpose_changes_git_vs_api_scope() {
         let git = resolve_profile("forge", RuntimePurpose::Git).unwrap();
         let api = resolve_profile("forge", RuntimePurpose::Api).unwrap();
-        assert_eq!(git.permissions.len(), 1);
-        assert!(api.permissions.contains_key("pull_requests"));
+        assert_eq!(git.permissions.0.len(), 1);
+        assert!(api.permissions.to_wire().contains_key("pull_requests"));
     }
 }

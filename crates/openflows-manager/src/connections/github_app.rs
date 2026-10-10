@@ -440,7 +440,7 @@ impl GithubAppApi for RealGithubAppApi {
         // Validate the returned permission set: it must match the requested
         // profile exactly. A broader set is a privilege escalation and a
         // narrower set is an unusable/incomplete grant; both fail closed.
-        if resp.permissions != *permissions {
+        if !crate::runtime::permissions::grants_match(&resp.permissions, permissions) {
             return Err(ManagerError::api(
                 "GITHUB_UNAVAILABLE",
                 "GitHub returned different permissions than requested",

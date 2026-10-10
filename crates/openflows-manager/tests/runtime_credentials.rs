@@ -46,6 +46,7 @@ struct FixtureBrokerApi {
     override_repositories: Arc<Mutex<Option<Vec<i64>>>>,
     override_permissions: Arc<Mutex<Option<BTreeMap<String, String>>>>,
     fail_exchange: Arc<AtomicBool>,
+    exchanges: Arc<AtomicI64>,
     revocations: Arc<Mutex<Vec<String>>>,
     started: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
@@ -61,6 +62,7 @@ impl FixtureBrokerApi {
             override_repositories: Arc::new(Mutex::new(None)),
             override_permissions: Arc::new(Mutex::new(None)),
             fail_exchange: Arc::new(AtomicBool::new(false)),
+            exchanges: Arc::new(AtomicI64::new(0)),
             revocations: Arc::new(Mutex::new(Vec::new())),
             started: Arc::new(Mutex::new(None)),
             release: Arc::new(Mutex::new(None)),
@@ -139,6 +141,7 @@ impl GithubAppApi for FixtureBrokerApi {
         repository_ids: &[i64],
         permissions: &BTreeMap<String, String>,
     ) -> Result<InstallationToken, ManagerError> {
+        self.exchanges.fetch_add(1, Ordering::SeqCst);
         if self.fail_exchange.load(Ordering::SeqCst) {
             return Err(ManagerError::api(
                 "GITHUB_UNAVAILABLE",
@@ -168,7 +171,11 @@ impl GithubAppApi for FixtureBrokerApi {
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_else(|| permissions.clone());
+            .unwrap_or_else(|| {
+                let mut grants = permissions.clone();
+                grants.insert("metadata".into(), "read".into());
+                grants
+            });
         Ok(InstallationToken {
             token: self.token.clone(),
             expires_at: chrono::Utc::now()
@@ -318,6 +325,153 @@ fn broker_request(purpose: &str, bearer: &str) -> Request<Body> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn real_client_accepts_implicit_metadata_and_sends_statuses() {
+    use axum::{routing::post, Json, Router};
+    use openflows_manager::connections::{AppSigner, RealGithubAppApi};
+    let router = Router::new().route("/app/installations/42/access_tokens", post(|Json(body): Json<serde_json::Value>| async move {
+        assert_eq!(body["permissions"]["statuses"], "read");
+        assert!(body["permissions"].get("commit_statuses").is_none());
+        let mut permissions = body["permissions"].clone();
+        permissions["metadata"] = serde_json::json!("read");
+        Json(serde_json::json!({
+            "token": "fixture-token", "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            "permissions": permissions,
+            "repositories": [{"id": 9001, "owner": {"login":"owner"}, "name":"repo", "full_name":"owner/repo", "private":true}]
+        }))
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let signer = openflows_manager::connections::app_jwt::FixtureAppSigner::new(
+        openflows_manager::connections::AppJwtClaims {
+            iss: 1,
+            iat: 1,
+            exp: 2,
+        },
+    );
+    let jwt = signer.sign().await.unwrap();
+    let profile =
+        runtime::permissions::resolve_profile("vessel", runtime::permissions::RuntimePurpose::Api)
+            .unwrap();
+    let result = RealGithubAppApi::new(base)
+        .exchange_installation_token(&jwt, 42, &[9001], &profile.permissions.to_wire())
+        .await;
+    server.abort();
+    assert_eq!(
+        result
+            .unwrap()
+            .permissions
+            .get("metadata")
+            .map(String::as_str),
+        Some("read")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn repeated_requests_reuse_one_exchange_and_enforce_workspace_budget() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let ctx = setup(db.pool()).await;
+    // Run parallel callers, including callers waiting for the same lock.
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let router = ctx.router.clone();
+        let bearer = ctx.raw_credential.clone();
+        tasks.push(tokio::spawn(async move {
+            router
+                .oneshot(broker_request("git", &bearer))
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), StatusCode::OK);
+    }
+    assert_eq!(ctx.api.exchanges.load(Ordering::SeqCst), 1);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM credential_leases")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    // Fill the current window deterministically rather than depending on when
+    // the parallel requests straddle a minute boundary.
+    sqlx::query(
+        "INSERT INTO rate_limit_ledger (bucket_key, scope, window_start, count)
+        VALUES ($1, 'runtime_broker', date_trunc('minute', clock_timestamp()), 30)
+        ON CONFLICT (bucket_key, scope, window_start) DO UPDATE SET count = 30",
+    )
+    .bind(openflows_manager::auth::crypto::hash_token(
+        &ctx.workspace_id.to_string(),
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let response = ctx
+        .router
+        .clone()
+        .oneshot(broker_request("git", &ctx.raw_credential))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(ctx.api.exchanges.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn organization_deletion_during_exchange_discards_token() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let ctx = setup(db.pool()).await;
+    let (started, release) = ctx.api.block_on_exchange();
+    let router = ctx.router.clone();
+    let bearer = ctx.raw_credential.clone();
+    let task = tokio::spawn(async move {
+        router
+            .oneshot(broker_request("git", &bearer))
+            .await
+            .unwrap()
+    });
+    started.await.unwrap();
+    sqlx::query("UPDATE organizations SET status = 'deleting'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    assert_eq!(task.await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(ctx.api.revocations().len(), 1);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM credential_leases")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn database_failure_after_exchange_attempts_upstream_cleanup() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let ctx = setup(db.pool()).await;
+    let (started, release) = ctx.api.block_on_exchange();
+    let router = ctx.router.clone();
+    let bearer = ctx.raw_credential.clone();
+    let task = tokio::spawn(async move {
+        router
+            .oneshot(broker_request("git", &bearer))
+            .await
+            .unwrap()
+    });
+    started.await.unwrap();
+    // Close only this test's isolated pool; GitHub still returns its token.
+    ctx.services.db.pool().close().await;
+    release.send(()).unwrap();
+    assert!(task.await.unwrap().status().is_server_error());
+    assert_eq!(ctx.api.revocations().len(), 1);
+}
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]

@@ -326,6 +326,94 @@ impl RuntimeRepository {
         &self,
         lease: &NewCredentialLease,
     ) -> Result<CredentialLeaseId, ManagerError> {
+        let mut tx = self.pool.begin().await?;
+        let id = Self::insert_lease_in_tx(&mut tx, lease).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn record_authorized_lease(
+        &self,
+        scope: &RuntimeScope,
+        lease: &NewCredentialLease,
+        existing: Option<CredentialLeaseId>,
+    ) -> Result<CredentialLeaseId, ManagerError> {
+        let mut tx = self.pool.begin().await?;
+        // Match lifecycle lock ordering. State and credential locks are retained
+        // until the lease commits, serializing issuance against revocation.
+        for (query, id) in [
+            (
+                "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+                scope.organization_id.0,
+            ),
+            (
+                "SELECT id FROM github_connections WHERE id = $1 FOR UPDATE",
+                scope.connection_id.0,
+            ),
+            (
+                "SELECT id FROM tenants WHERE id = $1 FOR UPDATE",
+                scope.tenant_id.0,
+            ),
+            (
+                "SELECT id FROM workspaces WHERE id = $1 FOR UPDATE",
+                scope.workspace_id.0,
+            ),
+            (
+                "SELECT id FROM runtime_credentials WHERE id = $1 FOR UPDATE",
+                scope.credential_id,
+            ),
+        ] {
+            sqlx::query(query).bind(id).fetch_optional(&mut *tx).await?;
+        }
+        let valid: Option<i64> = sqlx::query_scalar("SELECT r.github_repository_id
+            FROM organizations o
+            JOIN tenants t ON t.organization_id = o.id
+            JOIN workspaces w ON w.tenant_id = t.id AND w.organization_id = o.id
+            JOIN runtime_credentials rc ON rc.workspace_id = w.id
+            JOIN github_connections c ON c.id = t.connection_id AND c.organization_id = o.id
+            JOIN github_repositories r ON r.connection_id = c.id AND r.organization_id = o.id AND r.github_repository_id = t.github_repository_id
+            WHERE o.id = $1 AND t.id = $2 AND w.id = $3 AND rc.id = $4 AND c.id = $5
+              AND r.github_repository_id = $6 AND c.installation_id = $7
+              AND c.access_generation = $8 AND w.credential_generation = $9
+              AND rc.generation = $9 AND rc.audience = 'openflows-workspace'
+              AND rc.revoked_at IS NULL AND rc.expires_at > clock_timestamp()
+              AND o.status IN ('ready','provisioning') AND c.status = 'active'
+              AND t.desired_state = 'running' AND t.observed_state = 'running'
+              AND w.desired_state = 'running' AND w.observed_state = 'running'
+              AND w.role = $10 AND r.accessible
+            FOR UPDATE OF r")
+            .bind(scope.organization_id.0).bind(scope.tenant_id.0).bind(scope.workspace_id.0)
+            .bind(scope.credential_id).bind(scope.connection_id.0).bind(scope.repository_id)
+            .bind(scope.installation_id).bind(scope.connection_generation).bind(scope.workspace_generation)
+            .bind(&scope.workspace_role).fetch_optional(&mut *tx).await?;
+        if valid.is_none() {
+            return Err(ManagerError::api(
+                "AUTH_CHANGED",
+                "runtime authorization changed",
+            ));
+        }
+        if let Some(id) = existing {
+            let valid: Option<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM credential_leases WHERE id = $1 AND workspace_id = $2 AND connection_id = $3 AND revoked_at IS NULL AND expires_at > clock_timestamp() AND token_fingerprint = $4 FOR UPDATE")
+                .bind(id.0).bind(scope.workspace_id.0).bind(scope.connection_id.0).bind(&lease.token_fingerprint)
+                .fetch_optional(&mut *tx).await?;
+            if valid.is_none() {
+                return Err(ManagerError::api(
+                    "AUTH_CHANGED",
+                    "credential lease is no longer valid",
+                ));
+            }
+            tx.commit().await?;
+            return Ok(id);
+        }
+        let id = Self::insert_lease_in_tx(&mut tx, lease).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn insert_lease_in_tx(
+        tx: &mut sqlx::PgConnection,
+        lease: &NewCredentialLease,
+    ) -> Result<CredentialLeaseId, ManagerError> {
         let id = CredentialLeaseId::new();
         sqlx::query(
             "INSERT INTO credential_leases
@@ -349,7 +437,7 @@ impl RuntimeRepository {
         .bind(&lease.token_fingerprint)
         .bind(&lease.encrypted_ref)
         .bind(lease.expires_at)
-        .execute(&self.pool)
+        .execute(tx)
         .await
         .map_err(ManagerError::from)?;
         Ok(id)

@@ -43,6 +43,9 @@ const MIN_TOKEN_VALIDITY: Duration = Duration::minutes(30);
 /// Manager runs multiple replicas (documented as an operations follow-up).
 const SINGLE_FLIGHT_SHARDS: usize = 64;
 
+type ExchangeCache =
+    Arc<Vec<tokio::sync::Mutex<Option<(BrokerKey, InstallationToken, CredentialLeaseId)>>>>;
+
 /// The GitHub username reported to clients for an installation access token.
 pub const INSTALLATION_TOKEN_USERNAME: &str = "x-access-token";
 
@@ -50,6 +53,8 @@ pub const INSTALLATION_TOKEN_USERNAME: &str = "x-access-token";
 /// exchange so concurrent identical requests coalesce.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BrokerKey {
+    workspace_id: crate::id::WorkspaceId,
+    credential_id: uuid::Uuid,
     app_id: i64,
     installation_id: i64,
     repository_id: i64,
@@ -66,7 +71,7 @@ pub struct CredentialBroker {
     pub signer: Arc<dyn AppSigner>,
     pub app_id: i64,
     pub auth_config: AuthConfig,
-    inflight: Arc<Vec<tokio::sync::Mutex<()>>>,
+    inflight: ExchangeCache,
 }
 
 impl CredentialBroker {
@@ -79,7 +84,7 @@ impl CredentialBroker {
     ) -> Self {
         let inflight = Arc::new(
             (0..SINGLE_FLIGHT_SHARDS)
-                .map(|_| tokio::sync::Mutex::new(()))
+                .map(|_| tokio::sync::Mutex::new(None))
                 .collect::<Vec<_>>(),
         );
         CredentialBroker {
@@ -120,6 +125,8 @@ impl CredentialBroker {
         let captured_workspace_generation = scope.workspace_generation;
 
         let key = BrokerKey {
+            workspace_id: scope.workspace_id,
+            credential_id: scope.credential_id,
             app_id: self.app_id,
             installation_id: scope.installation_id,
             repository_id: scope.repository_id,
@@ -128,122 +135,63 @@ impl CredentialBroker {
             workspace_generation: captured_workspace_generation,
         };
         let shard = CredentialBroker::shard_for(&key);
-        let _guard = self.inflight[shard].lock().await;
+        let mut guard = self.inflight[shard].lock().await;
 
-        // ---- 4. Exchange the App JWT for an installation token. ------------
+        let cached = guard
+            .as_ref()
+            .filter(|(k, token, _)| k == &key && token.expires_at - Utc::now() > MIN_TOKEN_VALIDITY)
+            .cloned();
         let jwt = self.signer.sign().await?;
-        let token = self
-            .api
-            .exchange_installation_token(
-                &jwt,
-                scope.installation_id,
-                &[scope.repository_id],
-                &profile.permissions,
+        let (token, existing) = if let Some((_, token, lease)) = cached {
+            (token, Some(lease))
+        } else {
+            (
+                self.api
+                    .exchange_installation_token(
+                        &jwt,
+                        scope.installation_id,
+                        &[scope.repository_id],
+                        &profile.permissions.to_wire(),
+                    )
+                    .await?,
+                None,
             )
-            .await?;
-
-        // Defense-in-depth: validate the returned repository scope, permission
-        // set, and expiry before it is used. Even if the underlying client did
-        // not enforce these, the broker fails closed on any mismatch.
-        if let Err(e) = validate_token(&token, &profile, scope.repository_id) {
-            let _ = self
-                .api
-                .revoke_installation_token(&jwt, scope.installation_id, &token.token)
-                .await;
-            return Err(e);
-        }
-
-        // ---- 5. Recheck authorization / resource state / generations. ------
-        // The token was issued for a specific connection/workspace generation
-        // and resource state. If any of that changed during the exchange, the
-        // token must be discarded before it is recorded or returned.
-        let fresh = self
-            .repo
-            .resolve_workspace_scope(scope.workspace_id)
-            .await?
-            .ok_or_else(|| ManagerError::api("AUTH_CHANGED", "runtime scope is no longer valid"))?;
-
-        let credential_current = self
-            .repo
-            .credential_is_current(
-                scope.credential_id,
-                scope.workspace_id,
-                captured_workspace_generation,
-            )
-            .await?;
-        let recheck_result = recheck(
-            &fresh,
-            captured_connection_generation,
-            captured_workspace_generation,
-        )
-        .and_then(|()| {
-            if credential_current {
-                Ok(())
-            } else {
-                Err(ManagerError::api(
-                    "AUTH_CHANGED",
-                    "runtime credential was revoked during token issuance",
-                ))
-            }
-        });
-        if let Err(e) = recheck_result {
-            // Authorization changed during the exchange: discard the token,
-            // attempt upstream revocation, and return a sanitized error.
-            let _ = self
-                .api
-                .revoke_installation_token(&jwt, scope.installation_id, &token.token)
-                .await;
-            self.repo
-                .revoke_leases_for_workspace(scope.workspace_id)
+        };
+        let result = async {
+            validate_token(&token, &profile, scope.repository_id)?;
+            let lease = self
+                .record_lease(scope, &profile, purpose, &token, existing)
                 .await?;
             audit::insert_with_pool(
                 self.repo.pool(),
-                &AuditEvent::new("runtime.github_credential_discarded")
+                &AuditEvent::new("runtime.github_credential_issued")
                     .organization(scope.organization_id)
                     .actor_type("runtime".to_string())
                     .resource("workspace", scope.workspace_id.0)
-                    .result(AuditResult::Denied)
+                    .result(AuditResult::Success)
                     .request_id(request_id),
             )
             .await?;
-            return Err(e);
+            Ok::<_, ManagerError>(lease)
         }
-
-        // ---- 6. Record the credential lease and return the token. ----------
-        let lease_id = self.record_lease(scope, &profile, purpose, &token).await?;
-
-        // Re-verify the recorded lease's generations are still current under an
-        // authoritative read; if they moved, revoke the lease and fail closed.
-        if !self
-            .repo
-            .lease_generations_current(
-                lease_id,
-                captured_connection_generation,
-                captured_workspace_generation,
-            )
-            .await?
-        {
-            self.repo.revoke_lease(lease_id).await?;
-            let _ = self
-                .api
-                .revoke_installation_token(&jwt, scope.installation_id, &token.token)
-                .await;
-            return Err(ManagerError::api(
-                "AUTH_CHANGED",
-                "authorization changed during token issuance",
-            ));
+        .await;
+        match result {
+            Ok(lease) => *guard = Some((key, token.clone(), lease)),
+            Err(error) => {
+                *guard = None;
+                // Every post-exchange error, including database failure and
+                // missing scope, attempts to revoke the minted credential.
+                if self
+                    .api
+                    .revoke_installation_token(&jwt, scope.installation_id, &token.token)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("GitHub token cleanup failed; token remains valid until expiry");
+                }
+                return Err(error);
+            }
         }
-
-        audit::insert_with_pool(
-            self.repo.pool(),
-            &AuditEvent::new("runtime.github_credential_issued")
-                .organization(scope.organization_id)
-                .actor_type("runtime".to_string())
-                .resource("workspace", scope.workspace_id.0)
-                .result(AuditResult::Success)
-                .request_id(request_id),
-        )
-        .await?;
 
         Ok(BrokerCredential {
             token: token.token,
@@ -264,6 +212,7 @@ impl CredentialBroker {
         profile: &PermissionProfile,
         purpose: RuntimePurpose,
         token: &InstallationToken,
+        existing: Option<CredentialLeaseId>,
     ) -> Result<CredentialLeaseId, ManagerError> {
         let cipher = self
             .auth_config
@@ -286,7 +235,9 @@ impl CredentialBroker {
             encrypted_ref: Some(encrypted_ref),
             expires_at: token.expires_at,
         };
-        self.repo.insert_lease(&lease).await
+        self.repo
+            .record_authorized_lease(scope, &lease, existing)
+            .await
     }
 }
 
@@ -331,25 +282,6 @@ pub(crate) fn validate_resource_state(scope: &RuntimeScope) -> Result<(), Manage
     Ok(())
 }
 
-/// Recheck that the authoritative scope still authorizes the exchange: the
-/// connection and workspace generations must be unchanged and resource state
-/// must still permit issuance.
-fn recheck(
-    fresh: &RuntimeScope,
-    expected_connection_generation: i64,
-    expected_workspace_generation: i64,
-) -> Result<(), ManagerError> {
-    if fresh.connection_generation != expected_connection_generation
-        || fresh.workspace_generation != expected_workspace_generation
-    {
-        return Err(ManagerError::api(
-            "AUTH_CHANGED",
-            "authorization changed during token issuance",
-        ));
-    }
-    validate_resource_state(fresh)
-}
-
 /// Validate that a returned installation token exactly matches the requested
 /// repository scope and permission profile and has a usable lifetime. Any
 /// mismatch, unexpected or unverifiable scope, or truncated expiry fails
@@ -366,7 +298,10 @@ fn validate_token(
             "GitHub returned a different repository scope than requested",
         ));
     }
-    if token.permissions != profile.permissions {
+    if !crate::runtime::permissions::grants_match(
+        &token.permissions,
+        &profile.permissions.to_wire(),
+    ) {
         return Err(ManagerError::api(
             "GITHUB_UNAVAILABLE",
             "GitHub returned different permissions than requested",
