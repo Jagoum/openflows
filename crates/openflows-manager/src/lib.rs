@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod connections;
 pub mod db;
 pub mod dto;
 pub mod error;
@@ -16,6 +17,7 @@ pub mod pagination;
 pub mod rate_limit;
 pub mod repositories;
 pub mod routes;
+pub mod runtime;
 pub mod secrets;
 pub mod server;
 

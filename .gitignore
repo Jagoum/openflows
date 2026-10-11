@@ -11,6 +11,10 @@ out/
 *.pyc
 __pycache__/
 
+# Presentation build artifacts (generated slides/pptx, not source)
+.presentation-build/
+output/
+
 # Environment files
 .env
 .env.local
@@ -18,6 +22,7 @@ __pycache__/
 .env.development
 .env.test
 .env.production
+.env.prod
 
 # IDE - VSCode
 .vscode/*
