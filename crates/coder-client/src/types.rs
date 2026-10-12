@@ -31,6 +31,61 @@ pub struct CoderUser {
     pub email: String,
 }
 
+/// A typed Coder organization identifier (opaque upstream string).
+///
+/// WP-05 requires hosted Coder operations to carry an explicit, typed
+/// organization id and never fall back to the default organization or global
+/// administrator. These newtypes make that scoping explicit at the type level.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CoderOrganizationId(pub String);
+
+impl CoderOrganizationId {
+    pub fn new(id: impl Into<String>) -> Self {
+        CoderOrganizationId(id.into())
+    }
+}
+
+impl std::fmt::Display for CoderOrganizationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A typed Coder template identifier (opaque upstream string).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CoderTemplateId(pub String);
+
+impl CoderTemplateId {
+    pub fn new(id: impl Into<String>) -> Self {
+        CoderTemplateId(id.into())
+    }
+}
+
+impl std::fmt::Display for CoderTemplateId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A typed Coder template-version identifier (opaque upstream string).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CoderTemplateVersionId(pub String);
+
+impl CoderTemplateVersionId {
+    pub fn new(id: impl Into<String>) -> Self {
+        CoderTemplateVersionId(id.into())
+    }
+}
+
+impl std::fmt::Display for CoderTemplateVersionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A Coder organization.
 ///
 /// Returned by `GET /api/v2/organizations`.
@@ -62,14 +117,234 @@ pub struct CoderTemplate {
     pub name: String,
     #[serde(default, rename = "updated_at")]
     pub updated_at: String,
+    #[serde(default, rename = "organization_id")]
+    pub organization_id: String,
+    #[serde(default, rename = "active_version_id")]
+    pub active_version_id: String,
 }
 
-/// Request to create a workspace.
+/// A Coder template version.
+///
+/// Returned by `GET /api/v2/organizations/{org}/templates/{template}/versions`
+/// and by `POST .../versions` (import). The import job status tells us whether
+/// the version's provisioning job succeeded; we never infer publication from a
+/// timestamp alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderTemplateVersion {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "template_id")]
+    pub template_id: String,
+    #[serde(default, rename = "organization_id")]
+    pub organization_id: String,
+    #[serde(default, rename = "job")]
+    pub job: Option<CoderProvisionerJob>,
+    #[serde(default, rename = "created_at")]
+    pub created_at: String,
+    #[serde(default, rename = "updated_at")]
+    pub updated_at: String,
+}
+
+/// A Coder provisioner job (the import job of a template version).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderProvisionerJob {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, rename = "error")]
+    pub error: String,
+    #[serde(default, rename = "error_code")]
+    pub error_code: String,
+}
+
+impl CoderProvisionerJob {
+    /// The job has finished and its provisioning succeeded.
+    pub fn is_succeeded(&self) -> bool {
+        self.status == "succeeded"
+    }
+
+    /// The job has reached a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "succeeded" | "failed" | "cancelled")
+    }
+}
+
+/// A Coder import job, returned by `GET /api/v2/organizations/{org}/imports/{id}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderImportJob {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, rename = "template_version_id")]
+    pub template_version_id: String,
+    #[serde(default, rename = "template_id")]
+    pub template_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default, rename = "error_code")]
+    pub error_code: String,
+}
+
+impl CoderImportJob {
+    pub fn is_succeeded(&self) -> bool {
+        self.status == "succeeded"
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "succeeded" | "failed" | "cancelled")
+    }
+}
+
+/// The response of `POST /api/v2/organizations/{org}/provisionerkeys`.
+///
+/// Per the pinned Coder version the key is a raw alphanumeric secret (no
+/// `coder_` prefix). It is returned once and must be treated as a credential.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderProvisionerKey {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A provisioner daemon entry, returned by
+/// `GET /api/v2/organizations/{org}/provisionerdaemons`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderProvisionerDaemon {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, rename = "key_name")]
+    pub key_name: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, rename = "last_seen_at")]
+    pub last_seen_at: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Response of `POST /api/v2/organizations/{org}/templates` (create template).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderTemplateCreated {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// The request body for `POST /api/v2/organizations/{org}/templates/{template}/versions`.
+///
+/// WP-05 requires explicit organization, template, and a deterministic version
+/// name so publication is idempotent and never inferred from timestamps.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateTemplateVersionRequest {
+    /// The deterministic, immutable version name (e.g. the release id).
+    pub name: String,
+    /// The directory name inside the uploaded archive.
+    #[serde(rename = "directory", skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
+}
+
+/// The request body for `POST /api/v2/organizations/{org}/templates`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateTemplateRequest {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "default_ttl_ms", skip_serializing_if = "Option::is_none")]
+    pub default_ttl_ms: Option<i64>,
+    /// The id of the version this template should initially point at.
+    #[serde(rename = "active_version_id", skip_serializing_if = "Option::is_none")]
+    pub active_version_id: Option<String>,
+}
+
+/// A Coder workspace used to parse explicit-org/owner/version responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderWorkspaceDetail {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "owner_id")]
+    pub owner_id: String,
+    #[serde(default, rename = "organization_id")]
+    pub organization_id: String,
+    #[serde(default, rename = "template_id")]
+    pub template_id: String,
+    #[serde(default, rename = "template_version_id")]
+    pub template_version_id: String,
+}
+
+/// A Coder user with the organization id for membership verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderUserDetail {
+    #[serde(default, alias = "user_id")]
+    pub id: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default, rename = "organization_ids")]
+    pub organization_ids: Vec<String>,
+    #[serde(default, rename = "roles")]
+    pub roles: Vec<String>,
+}
+
+/// A Coder organization membership/roles payload for permission checks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderOrgMember {
+    #[serde(default, rename = "user_id")]
+    pub user_id: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+/// Request to create a workspace (legacy, local-mode compatible).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateWorkspaceRequest {
     pub template_name: String,
     pub name: String,
     pub parameters: serde_json::Value,
+}
+
+/// Request to create a workspace with explicit organization/owner/version.
+///
+/// WP-05 hosted paths require `organization_id`, `template_version_id`, and an
+/// explicit owner; they never fall back to the default organization or current
+/// user.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateWorkspaceRequestExplicit {
+    #[serde(rename = "organization_id")]
+    pub organization_id: String,
+    #[serde(rename = "template_id")]
+    pub template_id: String,
+    #[serde(rename = "template_version_id")]
+    pub template_version_id: String,
+    pub name: String,
+    #[serde(
+        rename = "rich_parameter_values",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rich_parameter_values: Option<Vec<WorkspaceParameterValue>>,
+}
+
+/// A single rich parameter value for workspace creation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceParameterValue {
+    pub name: String,
+    pub value: String,
+}
+
+/// A Coder organization to be created (POST /api/v2/organizations).
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateOrganizationRequest {
+    pub name: String,
+    #[serde(rename = "display_name", skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A Coder workspace.
