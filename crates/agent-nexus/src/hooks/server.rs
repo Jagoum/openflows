@@ -775,6 +775,45 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
     // While nested_quote is Some, control operators are literal, not boundaries.
     let mut nested_quote: Option<char> = None;
 
+    /// True when `c` should be treated as a command boundary in the current quoting context.
+    /// Backticks are command substitution in double quotes (but not single quotes).
+    /// Other control operators (; & | etc.) are only boundaries outside quotes or in command_string
+    /// with no nested quote.
+    fn should_treat_as_boundary(
+        command_string: bool,
+        quote: Option<char>,
+        nested_quote: Option<char>,
+        c: char,
+    ) -> bool {
+        // Only control characters can be boundaries
+        let is_backtick = c == '`';
+        let is_other_control = matches!(c, ';' | '&' | '|' | '(' | ')' | '{' | '}');
+        if !is_backtick && !is_other_control {
+            return false;
+        }
+
+        match (command_string, quote, nested_quote) {
+            // In command_string (shell -c argument):
+            (true, _, None) => true, // no nested quote: all control ops are boundaries
+            (true, Some('\''), Some('"')) if is_backtick => true, // single-quoted cmd string, nested double quotes: backticks are boundaries
+            (true, Some('"'), Some('"')) if is_backtick => true, // double-quoted cmd string, nested double quotes: backticks are boundaries
+            (true, Some('\''), Some('\'')) => false,             // nested single quotes: literal
+            (true, Some('"'), Some('\'')) => false,              // nested single quotes: literal
+            (true, _, Some('"')) if is_other_control => false, // nested double quotes: other controls literal
+            // In double quotes (not command_string):
+            (false, Some('"'), None) if is_backtick => true, // in double quotes: backticks are boundaries
+            (false, Some('"'), Some('"')) if is_backtick => true, // nested double quotes: backticks are boundaries
+            (false, Some('"'), Some('\'')) => false,              // nested single quotes: literal
+            (false, Some('"'), _) if is_other_control => false, // other controls in double quotes: literal
+            // In single quotes: always literal
+            (false, Some('\''), _) => false,
+            // Outside quotes: all control operators are boundaries
+            (false, None, _) => true,
+            // Any other combination: conservative = not a boundary
+            _ => false,
+        }
+    }
+
     for c in cmd.chars() {
         if let Some(q) = quote {
             if c == q {
@@ -789,7 +828,7 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
                     has_cur = false;
                     at_start = false;
                 }
-            } else if command_string && nested_quote.is_none() && CONTROL.contains(&c) {
+            } else if should_treat_as_boundary(command_string, quote, nested_quote, c) {
                 if has_cur {
                     tokens.push((std::mem::take(&mut cur), at_start));
                     has_cur = false;
@@ -1438,6 +1477,29 @@ mod tests {
         assert!(!invokes_coder_lifecycle(r#"echo "coder d'ete'le ws""#));
         assert!(!invokes_coder_lifecycle(
             r#"grep 'coder d"elete" ws' file.txt"#
+        ));
+    }
+
+    #[test]
+    fn test_backticks_in_double_quotes() {
+        // Backticks in double quotes are command substitution (execute)
+        assert!(invokes_coder_lifecycle(r#"echo "` coder delete ws `""#));
+        assert!(invokes_coder_lifecycle(r#"echo "`coder delete ws`""#));
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo "` coder delete ws `""#
+        ));
+
+        // Backticks in single quotes are literal (do not execute)
+        assert!(!invokes_coder_lifecycle(r#"echo '` coder delete ws `'"#));
+        // bash -c with single-quoted outer, but inner double quotes allow command substitution
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo "` coder delete ws `""#
+        ));
+
+        // Backticks outside quotes are command substitution
+        assert!(invokes_coder_lifecycle(r#"echo `coder delete ws`"#));
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo `coder delete ws`'"#
         ));
     }
 }
