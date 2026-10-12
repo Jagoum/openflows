@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
 config = { version = "0.2.0", path = "../config" }
 pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
 axum = { version = "0.8", features = ["http1", "json"] }
@@ -23,6 +24,14 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 async-trait = { workspace = true }
+rand = { workspace = true }
+aes-gcm = "0.10"
+subtle = "2"
+http = "1"
+url = { workspace = true }
+reqwest = { workspace = true }
+jsonwebtoken = { workspace = true }
+hmac = "0.12"
 
 [features]
 default = []
