@@ -774,6 +774,12 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
     // Track nested quotes inside a command_string (e.g. bash -c 'echo "foo;bar"').
     // While nested_quote is Some, control operators are literal, not boundaries.
     let mut nested_quote: Option<char> = None;
+    // True while the current double-quoted argument is inside a backtick
+    // command substitution (`...`), where control operators are real command
+    // boundaries. After the closing backtick we return to the literal quoted
+    // argument, so trailing text is not a new command (P2 "Printed text becomes
+    // a command").
+    let mut backtick_sub = false;
 
     /// True when `c` should be treated as a command boundary in the current quoting context.
     /// Backticks are command substitution in double quotes (but not single quotes).
@@ -783,6 +789,7 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
         command_string: bool,
         quote: Option<char>,
         nested_quote: Option<char>,
+        backtick_sub: bool,
         c: char,
     ) -> bool {
         // Only control characters can be boundaries
@@ -801,10 +808,13 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
             (true, Some('"'), Some('\'')) => false,              // nested single quotes: literal
             (true, _, Some('"')) if is_other_control => false, // nested double quotes: other controls literal
             // In double quotes (not command_string):
-            (false, Some('"'), None) if is_backtick => true, // in double quotes: backticks are boundaries
-            (false, Some('"'), Some('"')) if is_backtick => true, // nested double quotes: backticks are boundaries
-            (false, Some('"'), Some('\'')) => false,              // nested single quotes: literal
-            (false, Some('"'), _) if is_other_control => false, // other controls in double quotes: literal
+            (false, Some('"'), _) if is_backtick => true, // backticks are command substitution boundaries
+            (false, Some('"'), Some('\'')) => false,      // nested single quotes: literal
+            // Other control operators in double quotes are literal except when
+            // inside a backtick command substitution, where they separate
+            // commands within the substituted script.
+            (false, Some('"'), _) if is_other_control && !backtick_sub => false,
+            (false, Some('"'), _) if is_other_control && backtick_sub => true,
             // In single quotes: always literal
             (false, Some('\''), _) => false,
             // Outside quotes: all control operators are boundaries
@@ -814,21 +824,47 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
         }
     }
 
-    for c in cmd.chars() {
+    let mut it = cmd.chars().peekable();
+    while let Some(c) = it.next() {
         if let Some(q) = quote {
             if c == q {
                 quote = None;
                 command_string = false;
                 nested_quote = None;
+                backtick_sub = false;
                 continue;
             }
-            if c.is_whitespace() {
+            if c == '\\' {
+                // A backslash escapes the next character, so an escaped backtick
+                // (\`) is literal text, not a command boundary (P2 "Escaped
+                // examples get blocked").
+                cur.push(c);
+                has_cur = true;
+                if let Some(&nc) = it.peek() {
+                    cur.push(nc);
+                    it.next();
+                    has_cur = true;
+                }
+            } else if c == '`' && quote == Some('"') && !command_string {
+                // Toggle a backtick command substitution inside a double-quoted
+                // argument. The opening backtick starts a real command; the
+                // closing backtick restores the surrounding literal argument so
+                // text after it is not treated as a new command (P2 "Printed
+                // text becomes a command").
+                if has_cur {
+                    tokens.push((std::mem::take(&mut cur), at_start));
+                    has_cur = false;
+                }
+                backtick_sub = !backtick_sub;
+                at_start = backtick_sub;
+            } else if c.is_whitespace() {
                 if has_cur {
                     tokens.push((std::mem::take(&mut cur), at_start));
                     has_cur = false;
                     at_start = false;
                 }
-            } else if should_treat_as_boundary(command_string, quote, nested_quote, c) {
+            } else if should_treat_as_boundary(command_string, quote, nested_quote, backtick_sub, c)
+            {
                 if has_cur {
                     tokens.push((std::mem::take(&mut cur), at_start));
                     has_cur = false;
@@ -862,6 +898,17 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
                 }
                 quote = Some(c);
                 command_string = quote_follows_shell_c(&tokens);
+            }
+            c if c == '\\' => {
+                // Outside quotes a backslash also escapes the next character
+                // (e.g. `\`` prints a literal backtick), so it is not a boundary.
+                cur.push(c);
+                has_cur = true;
+                if let Some(&nc) = it.peek() {
+                    cur.push(nc);
+                    it.next();
+                    has_cur = true;
+                }
             }
             c if c.is_whitespace() => {
                 if has_cur {
@@ -939,8 +986,10 @@ fn is_shell_word(word: &str) -> bool {
 /// (prints the binary path), not an invocation, and is never a boundary.
 const FORWARDING_BOUNDARY_WRAPPERS: &[&str] = &["command", "env", "exec", "sudo", "su"];
 
-/// Shells whose `-c` treats the next word as the command string.
-const SHELL_WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
+/// Shells (and shell-like wrappers) whose `-c` treats the next word as the
+/// command string. `su` is included because `su -c '<cmd>'` executes `<cmd>`
+/// exactly like `sh -c '<cmd>'` (Review "su commands bypass the guard").
+const SHELL_WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "su"];
 
 fn token_at_command_boundary(tokens: &[(String, bool)], i: usize, at_start: bool) -> bool {
     if at_start {
@@ -971,7 +1020,11 @@ fn token_at_command_boundary(tokens: &[(String, bool)], i: usize, at_start: bool
         while k > 0 && tokens[k].0.starts_with('-') && tokens[k].0 != "-c" {
             k -= 1;
         }
-        return is_shell_word(&tokens[k].0);
+        // The shell/`su` word must itself sit at a real command boundary;
+        // otherwise `-c '…'` is text passed to an earlier command (e.g.
+        // `man su -c 'coder delete ws'` only prints an example and must not be
+        // blocked). This matches the check quote_follows_shell_c performs.
+        return is_shell_word(&tokens[k].0) && token_at_command_boundary(tokens, k, tokens[k].1);
     }
     if FORWARDING_BOUNDARY_WRAPPERS.contains(&word.as_str()) {
         // `command -v/-V coder` resolves the binary path; it does not invoke a
@@ -1362,6 +1415,13 @@ mod tests {
             "/bin/sh -c 'coder start other-workspace'",
             "/usr/bin/bash -l -c 'coder stop my-ws'",
             "bash -l -c 'coder delete ws'",
+            // P1: `su -c '<cmd>'` executes the quoted command just like a shell,
+            // including through sudo (Review "su commands bypass the guard").
+            "su -c 'coder delete ws'",
+            "su -c \"coder stop my-ws\"",
+            "su -l -c 'coder start other-workspace'",
+            "sudo su -c 'coder delete ws'",
+            "su -c 'echo ok; coder delete ws'",
         ] {
             assert!(
                 invokes_coder_lifecycle(cmd),
@@ -1407,6 +1467,20 @@ mod tests {
             "python -c 'print(\"coder delete ws\")'",
             "node -c 'echo ok;coder delete ws'",
             "echo -c 'foo;coder delete ws'",
+            // P2: escaped backticks print literal text and must not be treated as
+            // a command (Review "Escaped examples get blocked").
+            "echo \"\\`coder delete ws\\`\"",
+            "echo '\\`coder delete ws\\`'",
+            "echo \\`coder delete ws\\`",
+            // P2: text after a closed backtick substitution is a literal part of
+            // the double-quoted argument, not a new command (Review "Printed
+            // text becomes a command").
+            "echo \"`date`coder delete ws\"",
+            "echo \"`echo ok`;coder start ws\"",
+            "printf '%s\\n' \"`date`coder stop my-ws\"",
+            // A `su -c` mention that is itself text passed to another command is
+            // not an invocation (Review "su commands bypass the guard").
+            "echo \"su -c 'coder delete ws'\"",
         ] {
             assert!(
                 !invokes_coder_lifecycle(cmd),
@@ -1500,6 +1574,24 @@ mod tests {
         assert!(invokes_coder_lifecycle(r#"echo `coder delete ws`"#));
         assert!(invokes_coder_lifecycle(
             r#"bash -c 'echo `coder delete ws`'"#
+        ));
+
+        // P2: escaped backticks (\`) are literal text, not command substitution
+        // (Review "Escaped examples get blocked").
+        assert!(!invokes_coder_lifecycle(r#"echo "\`coder delete ws\`""#));
+        assert!(!invokes_coder_lifecycle(r#"echo \`coder delete ws\`"#));
+
+        // P2: the closing backtick restores the surrounding quoted argument, so
+        // text after a substitution is literal, not a new command (Review
+        // "Printed text becomes a command").
+        assert!(!invokes_coder_lifecycle(r#"echo "`date`coder delete ws""#));
+        assert!(!invokes_coder_lifecycle(
+            r#"echo "`echo ok`;coder start ws""#
+        ));
+        // ... but a real coder invocation after a substituted command inside a
+        // double-quoted command string is still caught.
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo "`date`" && coder stop ws'"#
         ));
     }
 }
