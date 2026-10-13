@@ -80,7 +80,7 @@ fn api_v1_router() -> Router<AppState> {
             post(organizations::transfer_ownership),
         )
         .route("/operations/{id}", get(organizations::get_operation))
-        // WP-03 GitHub connection lifecycle.
+        // GitHub connection lifecycle.
         .route(
             "/organizations/{org}/github/connect",
             post(connections::connect),
@@ -99,9 +99,9 @@ fn api_v1_router() -> Router<AppState> {
             "/organizations/{org}/github/connections/{id}",
             delete(connections::disconnect),
         )
-        // WP-03 public signed webhook ingress.
+        // Public signed webhook ingress.
         .route("/webhooks/github", post(webhooks::receive_webhook))
-        // WP-04 runtime credential broker: authenticated by a workspace runtime
+        // Runtime credential broker: authenticated by a workspace runtime
         // credential, never by a human session.
         .route(
             "/runtime/github-credentials",

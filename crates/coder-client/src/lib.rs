@@ -514,6 +514,23 @@ impl CoderClient {
         }
     }
 
+    /// Perform an unauthenticated GET returning the raw JSON value, used by the
+    /// manager adapter for read-only probes such as `GET /api/v2/buildinfo`.
+    pub async fn raw_get(&self, path: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .get(self.url(path))
+            .send()
+            .await
+            .context("Failed to perform raw GET")?;
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            bail!("raw GET {} failed with {}", path, status)
+        }
+    }
+
     /// List all organizations visible to the authenticated user.
     /// GET /api/v2/organizations
     pub async fn list_organizations(&self) -> Result<Vec<CoderOrganization>> {
@@ -778,6 +795,16 @@ impl CoderClient {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default()
                                 .to_string(),
+                            organization_id: v
+                                .get("organization_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            active_version_id: v
+                                .get("active_version_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
                         })
                     })
                     .collect()
@@ -787,6 +814,401 @@ impl CoderClient {
             Ok(templates)
         } else {
             bail!("Failed to list templates: {}", resp.status())
+        }
+    }
+
+    /// Create a Coder organization. Hosted provisioning uses a
+    /// deterministic internal name derived from the Openflows organization id.
+    pub async fn create_organization(
+        &self,
+        req: &crate::types::CreateOrganizationRequest,
+    ) -> Result<CoderOrganization> {
+        let resp = self
+            .authenticated_request(reqwest::Method::POST, "/api/v2/organizations")
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create Coder organization")?;
+        if resp.status().is_success() {
+            let org: CoderOrganization = resp.json().await?;
+            if org.id.is_empty() {
+                bail!("Coder organization created without an id");
+            }
+            Ok(org)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to create Coder organization ({}): {}", status, body)
+        }
+    }
+
+    /// Fetch a single organization by id and verify the authenticated token can
+    /// see it. Returns `None` when the org is absent or not visible.
+    pub async fn get_organization(
+        &self,
+        org_id: &CoderOrganizationId,
+    ) -> Result<Option<CoderOrganization>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/organizations/{}", org_id.0),
+            )
+            .send()
+            .await
+            .context("Failed to get Coder organization")?;
+        if resp.status().is_success() {
+            let org: CoderOrganization = resp.json().await?;
+            if org.id != org_id.0 {
+                bail!(
+                    "Coder returned organization '{}' for requested '{}'",
+                    org.id,
+                    org_id.0
+                );
+            }
+            Ok(Some(org))
+        } else if resp.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get Coder organization ({}): {}", status, body)
+        }
+    }
+
+    /// List templates within an explicit organization. The org is always
+    /// supplied; hosted code never resolves the default organization.
+    pub async fn list_templates_in_org(
+        &self,
+        org_id: &CoderOrganizationId,
+    ) -> Result<Vec<CoderTemplate>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/organizations/{}/templates", org_id.0),
+            )
+            .send()
+            .await
+            .context("Failed to list Coder templates in org")?;
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "Failed to list Coder templates in org '{}' ({}): {}",
+                org_id.0,
+                status,
+                body
+            )
+        }
+    }
+
+    /// Fetch a template by id within an explicit organization, verifying the
+    /// returned resource belongs to that organization. Returns `None` when
+    /// absent or outside the org.
+    pub async fn get_template(
+        &self,
+        org_id: &CoderOrganizationId,
+        template_id: &CoderTemplateId,
+    ) -> Result<Option<CoderTemplate>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!(
+                    "/api/v2/organizations/{}/templates/{}",
+                    org_id.0, template_id.0
+                ),
+            )
+            .send()
+            .await
+            .context("Failed to get Coder template")?;
+        if resp.status().is_success() {
+            let tpl: CoderTemplate = resp.json().await?;
+            if !tpl.organization_id.is_empty() && tpl.organization_id != org_id.0 {
+                bail!(
+                    "Coder template '{}' belongs to org '{}', not '{}'",
+                    tpl.id,
+                    tpl.organization_id,
+                    org_id.0
+                );
+            }
+            Ok(Some(tpl))
+        } else if resp.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get Coder template ({}): {}", status, body)
+        }
+    }
+
+    /// List the versions of a template within an explicit organization.
+    pub async fn list_template_versions(
+        &self,
+        org_id: &CoderOrganizationId,
+        template_id: &CoderTemplateId,
+    ) -> Result<Vec<CoderTemplateVersion>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!(
+                    "/api/v2/organizations/{}/templates/{}/versions",
+                    org_id.0, template_id.0
+                ),
+            )
+            .send()
+            .await
+            .context("Failed to list Coder template versions")?;
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "Failed to list Coder template versions ({}): {}",
+                status,
+                body
+            )
+        }
+    }
+
+    /// Upload a template archive and create a template version in an explicit
+    /// organization. The version name is deterministic (the release id) so
+    /// publication is idempotent. Returns the created version (which carries the
+    /// import job id) or the import job id.
+    pub async fn create_template_version(
+        &self,
+        org_id: &CoderOrganizationId,
+        template_id: &CoderTemplateId,
+        version_name: &str,
+        archive: &[u8],
+    ) -> Result<CoderTemplateVersion> {
+        let url = format!(
+            "{}/api/v2/organizations/{}/templates/{}/versions",
+            self.base_url, org_id.0, template_id.0
+        );
+        let req = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/x-tar")
+            .query(&[("name", version_name)])
+            .body(archive.to_vec())
+            .send()
+            .await
+            .context("Failed to upload Coder template version")?;
+        if req.status().is_success() {
+            let version: CoderTemplateVersion = req.json().await?;
+            if version.id.is_empty() {
+                bail!("Coder template version created without an id");
+            }
+            Ok(version)
+        } else {
+            let status = req.status();
+            let body = req.text().await.unwrap_or_default();
+            bail!(
+                "Failed to create Coder template version ({}): {}",
+                status,
+                body
+            )
+        }
+    }
+
+    /// Fetch an import job by id within an explicit organization.
+    pub async fn get_import_job(
+        &self,
+        org_id: &CoderOrganizationId,
+        job_id: &str,
+    ) -> Result<Option<CoderImportJob>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/organizations/{}/imports/{}", org_id.0, job_id),
+            )
+            .send()
+            .await
+            .context("Failed to get Coder import job")?;
+        if resp.status().is_success() {
+            Ok(Some(resp.json().await?))
+        } else if resp.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get Coder import job ({}): {}", status, body)
+        }
+    }
+
+    /// Create a template within an explicit organization, optionally binding it
+    /// to an initial active version. Returns the created template.
+    pub async fn create_template(
+        &self,
+        org_id: &CoderOrganizationId,
+        req: &crate::types::CreateTemplateRequest,
+    ) -> Result<CoderTemplateCreated> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::POST,
+                &format!("/api/v2/organizations/{}/templates", org_id.0),
+            )
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create Coder template")?;
+        if resp.status().is_success() {
+            let created: CoderTemplateCreated = resp.json().await?;
+            if created.id.is_empty() {
+                bail!("Coder template created without an id");
+            }
+            Ok(created)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to create Coder template ({}): {}", status, body)
+        }
+    }
+
+    /// Create an organization-scoped provisioner key. The returned secret is
+    /// treated as a credential and is returned only once.
+    pub async fn create_provisioner_key(
+        &self,
+        org_id: &CoderOrganizationId,
+        name: &str,
+    ) -> Result<CoderProvisionerKey> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::POST,
+                &format!("/api/v2/organizations/{}/provisionerkeys", org_id.0),
+            )
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .context("Failed to create Coder provisioner key")?;
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "Failed to create Coder provisioner key ({}): {}",
+                status,
+                body
+            )
+        }
+    }
+
+    /// List provisioner daemons registered in an explicit organization, used to
+    /// verify a provisioner's heartbeat/readiness before marking the org ready.
+    pub async fn list_provisioner_daemons(
+        &self,
+        org_id: &CoderOrganizationId,
+    ) -> Result<Vec<CoderProvisionerDaemon>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/organizations/{}/provisionerdaemons", org_id.0),
+            )
+            .send()
+            .await
+            .context("Failed to list Coder provisioner daemons")?;
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "Failed to list Coder provisioner daemons ({}): {}",
+                status,
+                body
+            )
+        }
+    }
+
+    /// List chat models scoped to an explicit organization (never the default
+    /// org). Used by the readiness reconciliation to verify org-scoped model
+    /// availability and Agents/chat capability.
+    pub async fn list_chat_models_in_org(
+        &self,
+        org_id: &CoderOrganizationId,
+    ) -> Result<Vec<crate::types::ModelInfo>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/organizations/{}/chats/models", org_id.0),
+            )
+            .send()
+            .await
+            .context("Failed to list Coder chat models in org")?;
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            Ok(parse_chat_models_body(&body))
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "Failed to list Coder chat models in org ({}): {}",
+                status,
+                body
+            )
+        }
+    }
+
+    /// Create a workspace with explicit organization, template, version, and
+    /// owner. Never falls back to the default org or current user.
+    pub async fn create_workspace_explicit(
+        &self,
+        owner_user_id: &str,
+        req: &crate::types::CreateWorkspaceRequestExplicit,
+    ) -> Result<CoderWorkspaceDetail> {
+        let payload = serde_json::json!({
+            "organization_id": req.organization_id,
+            "template_id": req.template_id,
+            "template_version_id": req.template_version_id,
+            "name": req.name,
+            "rich_parameter_values": req.rich_parameter_values.as_deref().unwrap_or_default(),
+        });
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::POST,
+                &format!("/api/v2/users/{}/workspaces", owner_user_id),
+            )
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to create workspace with explicit scope")?;
+        if resp.status().is_success() {
+            let ws: CoderWorkspaceDetail = resp.json().await?;
+            if !ws.organization_id.is_empty() && ws.organization_id != req.organization_id {
+                bail!(
+                    "Coder returned workspace in org '{}', expected '{}'",
+                    ws.organization_id,
+                    req.organization_id
+                );
+            }
+            Ok(ws)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to create workspace ({}): {}", status, body)
+        }
+    }
+
+    /// Fetch a Coder user detail including organization membership, used to
+    /// verify a machine owner belongs only to its mapped organization.
+    pub async fn get_user_detail(&self, user_id: &str) -> Result<Option<CoderUserDetail>> {
+        let resp = self
+            .authenticated_request(reqwest::Method::GET, &format!("/api/v2/users/{}", user_id))
+            .send()
+            .await
+            .context("Failed to get Coder user detail")?;
+        if resp.status().is_success() {
+            Ok(Some(resp.json().await?))
+        } else if resp.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get Coder user detail ({}): {}", status, body)
         }
     }
 

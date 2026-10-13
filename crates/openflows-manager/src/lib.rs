@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod coder;
 pub mod config;
 pub mod connections;
 pub mod db;
@@ -14,12 +15,15 @@ pub mod organizations;
 pub mod outbox;
 pub mod pages;
 pub mod pagination;
+pub mod provisioning;
 pub mod rate_limit;
+pub mod releases;
 pub mod repositories;
 pub mod routes;
 pub mod runtime;
 pub mod secrets;
 pub mod server;
+pub mod templates;
 
 pub use config::{ManagerConfig, Mode};
 pub use db::Db;
