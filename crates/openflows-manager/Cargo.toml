@@ -1,6 +1,7 @@
 # Cargo manifest for the OpenFlows Manager service crate.
 [package]
 name = "openflows-manager"
+default-run = "openflows-manager"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"

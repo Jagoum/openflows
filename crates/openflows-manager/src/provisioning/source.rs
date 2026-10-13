@@ -473,6 +473,15 @@ impl ReleaseCache {
         let Ok(manifest) = TemplateManifest::parse(&manifest_json) else {
             return Ok(None);
         };
+        if manifest
+            .to_canonical_json()
+            .ok()
+            .map(|bytes| sha256_hex(&bytes))
+            .as_deref()
+            != Some(digest)
+        {
+            return Ok(None);
+        }
         let mut archives = BTreeMap::new();
         for role in manifest.roles.keys() {
             let archive_path = entry_dir.join(role.archive_name());
@@ -480,6 +489,9 @@ impl ReleaseCache {
                 return Ok(None);
             };
             archives.insert(*role, bytes);
+        }
+        if build_artifacts_from_cache(&manifest, archives.clone()).is_err() {
+            return Ok(None);
         }
         Ok(Some(CachedRelease {
             manifest_json,
@@ -522,6 +534,14 @@ impl ReleaseCache {
         }
 
         std::fs::create_dir_all(self.entries_dir())?;
+        // Serialize publication, repair, and eviction across Manager processes.
+        // The OS releases this lock if a writer crashes.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join(".writer.lock"))?;
+        lock.lock()?;
         let temp_dir = self.entries_dir().join(format!(
             ".tmp-{digest}-{}-{}",
             std::process::id(),
@@ -539,7 +559,12 @@ impl ReleaseCache {
         let entry_dir = self.entry_dir(digest);
         match std::fs::rename(&temp_dir, &entry_dir) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
                 if self.load(digest)?.is_some() {
                     let _ = std::fs::remove_dir_all(&temp_dir);
                 } else if entry_dir.join(CACHE_ENTRY_MARKER).is_file() {
@@ -631,7 +656,11 @@ impl ReleaseCache {
                 continue;
             }
             total = total.saturating_sub(dir_size(&oldest));
-            std::fs::remove_dir_all(&oldest)?;
+            if let Err(error) = std::fs::remove_dir_all(&oldest) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
             entries.remove(0);
         }
         Ok(())
@@ -865,11 +894,21 @@ mod tests {
             .route(
                 "/slow",
                 get(|| async {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    "slow"
+                    axum::body::Body::from_stream(futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Ok::<_, std::io::Error>("slow")
+                    }))
                 }),
             )
-            .route("/large", get(|| async { vec![b'x'; 32] }))
+            .route(
+                "/large",
+                get(|| async {
+                    axum::body::Body::from_stream(futures_util::stream::iter([
+                        Ok::<_, std::io::Error>(vec![b'x'; 12]),
+                        Ok(vec![b'x'; 12]),
+                    ]))
+                }),
+            )
             .route(
                 "/private",
                 get(|request: Request| async move {
@@ -1281,5 +1320,57 @@ mod tests {
             rebuilt.archives.get(&Role::Nexus),
             artifacts.archives.get(&Role::Nexus)
         );
+    }
+
+    #[test]
+    fn cache_repairs_corrupt_archives_and_preserves_valid_entries() {
+        let (artifacts, manifest_json, _, _dir) = build_test_release();
+        let digest = sha256_hex(&manifest_json);
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ReleaseCache::new(dir.path().into(), 8, 1024 * 1024);
+        cache.store(&digest, &artifacts, "test").unwrap();
+        std::fs::write(
+            cache.entry_dir(&digest).join(Role::Nexus.archive_name()),
+            b"corrupt",
+        )
+        .unwrap();
+        assert!(cache.load(&digest).unwrap().is_none());
+        cache.store(&digest, &artifacts, "test").unwrap();
+        cache.store(&digest, &artifacts, "test").unwrap();
+        assert_eq!(
+            cache.load(&digest).unwrap().unwrap().archives,
+            artifacts.archives
+        );
+    }
+
+    #[test]
+    fn concurrent_cache_writers_publish_and_evict_successfully() {
+        let (artifacts, _, _, _dir) = build_test_release();
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let mut artifacts = artifacts.clone();
+                artifacts.manifest.release = format!("2026.10.{}", index / 2);
+                let digest = sha256_hex(&artifacts.manifest.to_canonical_json().unwrap());
+                let barrier = &barrier;
+                let path = dir.path();
+                scope.spawn(move || {
+                    let cache = ReleaseCache::new(path.into(), 1, 1024 * 1024);
+                    barrier.wait();
+                    cache.store(&digest, &artifacts, "test").unwrap();
+                });
+            }
+        });
+        let cache = ReleaseCache::new(dir.path().into(), 1, 1024 * 1024);
+        let entries: Vec<_> = std::fs::read_dir(cache.entries_dir()).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+        let digest = entries[0]
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        assert!(cache.load(&digest).unwrap().is_some());
     }
 }
