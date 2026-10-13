@@ -106,35 +106,34 @@ impl OrgProvisionWorker {
         }
     }
 
-    /// Claim and process up to 4 `org.provision` operations once.
+    /// Claim and process one `org.provision` operation once.
     pub async fn run_once(&self) -> Result<(), ManagerError> {
         let owner = format!("org-provision-worker-{}", std::process::id());
-        for _ in 0..4 {
-            let Some(guard) =
-                operations::claim_kind(&self.pool, &owner, Some("org.provision")).await?
-            else {
-                break;
-            };
-            let process = self.provision(&guard);
-            tokio::pin!(process);
-            let result = loop {
-                tokio::select! {
-                    result = &mut process => break result,
-                    _ = tokio::time::sleep(
-                        operations::HEARTBEAT_INTERVAL
-                            .to_std()
-                            .unwrap_or(Duration::from_secs(10)),
-                    ) => {
-                        if !guard.heartbeat().await? {
-                            return Err(ManagerError::Service(anyhow::anyhow!(
-                                "org provision worker lost its lease"
-                            )));
-                        }
-                    }
+        let Some(guard) = operations::claim_kind(&self.pool, &owner, Some("org.provision")).await?
+        else {
+            return Ok(());
+        };
+        let heartbeat_guard = guard.clone();
+        let heartbeat = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                operations::HEARTBEAT_INTERVAL
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(10)),
+            );
+            loop {
+                interval.tick().await;
+                if !heartbeat_guard.heartbeat().await? {
+                    return Err(ManagerError::Service(anyhow::anyhow!(
+                        "org provision worker lost its lease"
+                    )));
                 }
-            };
-            self.finish(&guard, result).await?;
-        }
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), ManagerError>(())
+        });
+        let result = self.provision(&guard).await;
+        heartbeat.abort();
+        self.finish(&guard, result).await?;
         Ok(())
     }
 
@@ -163,6 +162,7 @@ impl OrgProvisionWorker {
             Some(a) => a.clone(),
             None => {
                 self.record_not_ready(
+                    guard,
                     org_id,
                     err::RELEASE_NOT_CONFIGURED,
                     "no approved release configured",
@@ -177,7 +177,7 @@ impl OrgProvisionWorker {
         let release_id = match self.release_id {
             Some(r) => r,
             None => {
-                self.record_not_ready(org_id, err::RELEASE_NOT_CONFIGURED, "no release id")
+                self.record_not_ready(guard, org_id, err::RELEASE_NOT_CONFIGURED, "no release id")
                     .await?;
                 return Ok(OrgProvisionOutcome::NotReady(
                     org_id,
@@ -194,6 +194,7 @@ impl OrgProvisionWorker {
             .unwrap_or(false);
         if !release_approved {
             self.record_not_ready(
+                guard,
                 org_id,
                 err::RELEASE_NOT_CONFIGURED,
                 "release is not approved",
@@ -216,8 +217,13 @@ impl OrgProvisionWorker {
             } else {
                 err::CODER_CAPABILITIES_UNMET
             };
-            self.record_not_ready(org_id, code, "Coder version or license prerequisite unmet")
-                .await?;
+            self.record_not_ready(
+                guard,
+                org_id,
+                code,
+                "Coder version or license prerequisite unmet",
+            )
+            .await?;
             return Ok(OrgProvisionOutcome::NotReady(org_id, code));
         }
 
@@ -241,7 +247,7 @@ impl OrgProvisionWorker {
             {
                 Ok(org) => org,
                 Err(e) => {
-                    self.record_not_ready(org_id, err::CODER_ORG_FAILED, &e.to_string())
+                    self.record_not_ready(guard, org_id, err::CODER_ORG_FAILED, &e.to_string())
                         .await?;
                     return Ok(OrgProvisionOutcome::NotReady(org_id, err::CODER_ORG_FAILED));
                 }
@@ -272,7 +278,7 @@ impl OrgProvisionWorker {
             self.release_repo
                 .set_provisioner_status(org_id, "unavailable")
                 .await?;
-            self.record_not_ready(org_id, err::PROVISIONER_NOT_READY, &e.to_string())
+            self.record_not_ready(guard, org_id, err::PROVISIONER_NOT_READY, &e.to_string())
                 .await?;
             return Ok(OrgProvisionOutcome::NotReady(
                 org_id,
@@ -293,8 +299,13 @@ impl OrgProvisionWorker {
             .publish_for_org(org_id, release_id, self.adapter.as_ref(), &artifacts)
             .await
         {
+            let terminal = matches!(&e, ManagerError::Api(api) if api.code == err::IMPORT_FAILED);
             let code = err::IMPORT_FAILED;
-            self.record_not_ready(org_id, code, &e.to_string()).await?;
+            self.record_not_ready(guard, org_id, code, &e.to_string())
+                .await?;
+            if terminal {
+                return Ok(OrgProvisionOutcome::Failed(org_id, code, false));
+            }
             return Ok(OrgProvisionOutcome::NotReady(org_id, code));
         }
 
@@ -309,6 +320,7 @@ impl OrgProvisionWorker {
             .unwrap_or(false);
         if !models_ok {
             self.record_not_ready(
+                guard,
                 org_id,
                 err::MODEL_CAPABILITY_UNAVAILABLE,
                 "no org-scoped model / Agents-chat capability",
@@ -426,15 +438,19 @@ impl OrgProvisionWorker {
 
     async fn record_not_ready(
         &self,
+        guard: &LeaseGuard,
         org_id: OrganizationId,
         code: &str,
         message: &str,
     ) -> Result<(), ManagerError> {
-        let scope = crate::db::tx::OrgScope::new(org_id);
-        let _ = self
-            .orgs
-            .set_last_readiness_error(scope, org_id, Some(code))
-            .await;
+        let mut tx = self.pool.begin().await?;
+        if guard.lock_in_tx(&mut tx).await? {
+            sqlx::query("UPDATE organizations SET last_readiness_error = $1, updated_at = now() WHERE id = $2 AND status = 'provisioning'")
+                .bind(code).bind(org_id.0).execute(&mut *tx).await?;
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
         tracing::warn!(org_id = %org_id.0, code, message, "organization not ready");
         Ok(())
     }
