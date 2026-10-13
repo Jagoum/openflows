@@ -399,9 +399,10 @@ async fn failed_import_prevents_ready() {
     let outcome = h.worker.provision(&guard).await.unwrap();
     assert_eq!(
         outcome,
-        openflows_manager::provisioning::OrgProvisionOutcome::NotReady(
+        openflows_manager::provisioning::OrgProvisionOutcome::Failed(
             org,
-            openflows_manager::provisioning::err::IMPORT_FAILED
+            openflows_manager::provisioning::err::IMPORT_FAILED,
+            false
         )
     );
     // The organization must NOT become ready.

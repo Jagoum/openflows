@@ -238,9 +238,20 @@ impl ReleaseService {
         }
         self.publish_for_org(organization_id, release_id, adapter, artifacts)
             .await?;
-        self.repo
-            .bind_org_release(organization_id, release_id)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        let approved: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM template_releases WHERE id = $1 AND status = 'approved' FOR UPDATE",
+        )
+        .bind(release_id.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if approved.is_none() {
+            return Err(ManagerError::Conflict(
+                "release was retired while it was being published".into(),
+            ));
+        }
+        ReleaseRepository::bind_org_release_in_tx(&mut tx, organization_id, release_id).await?;
+        tx.commit().await?;
         Ok(())
     }
 

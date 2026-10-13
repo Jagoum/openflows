@@ -114,7 +114,8 @@ impl OrgProvisionWorker {
             return Ok(());
         };
         let heartbeat_guard = guard.clone();
-        let heartbeat = tokio::spawn(async move {
+        let mut heartbeat = tokio::task::JoinSet::new();
+        heartbeat.spawn(async move {
             let mut interval = tokio::time::interval(
                 operations::HEARTBEAT_INTERVAL
                     .to_std()
@@ -132,7 +133,7 @@ impl OrgProvisionWorker {
             Ok::<(), ManagerError>(())
         });
         let result = self.provision(&guard).await;
-        heartbeat.abort();
+        heartbeat.abort_all();
         self.finish(&guard, result).await?;
         Ok(())
     }
