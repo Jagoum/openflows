@@ -49,10 +49,20 @@ fn check(repo: &Path, argv: &[&str]) -> (Sandbox, Output) {
 #[test]
 fn prose_assertion_establishes_content_at_candidate_without_rust() {
     let home = tempfile::tempdir().unwrap();
-    // Load an executor environment with ordinary content tools but no Rust.
+    // Isolate executable lookup after login-shell initialization. System tool
+    // directories may contain Cargo, so expose only the content check's tool.
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let grep = Command::new("bash")
+        .args(["-c", "type -P grep"])
+        .output()
+        .unwrap();
+    assert!(grep.status.success());
+    let grep = std::fs::canonicalize(String::from_utf8(grep.stdout).unwrap().trim()).unwrap();
+    std::os::unix::fs::symlink(grep, bin.join("grep")).unwrap();
     std::fs::write(
         home.path().join(".bash_profile"),
-        "export PATH=/usr/bin:/bin\n",
+        "export PATH=\"$HOME/bin\"\n",
     )
     .unwrap();
     for content in [

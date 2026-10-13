@@ -281,3 +281,103 @@ impl OrchestrationResolver {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use provisioner::{CommandOutput, DirEntry, Provisioner, WorkspaceTransport};
+    use std::path::{Path, PathBuf};
+
+    // Exercise real provisioning reads/copies, with a local fixture replacing SSH.
+    struct LocalWorkspace(PathBuf);
+
+    #[async_trait]
+    impl WorkspaceTransport for LocalWorkspace {
+        async fn read_file(&self, path: &str) -> Result<String> {
+            Ok(std::fs::read_to_string(self.0.join(path))?)
+        }
+        async fn write_file(&self, path: &str, content: &str) -> Result<()> {
+            let target = self.0.join(path);
+            std::fs::create_dir_all(target.parent().unwrap())?;
+            Ok(std::fs::write(target, content)?)
+        }
+        async fn copy_file(&self, source: &Path, target: &str) -> Result<()> {
+            self.write_file(target, &std::fs::read_to_string(source)?)
+                .await
+        }
+        async fn create_dir_all(&self, path: &str) -> Result<()> {
+            Ok(std::fs::create_dir_all(self.0.join(path))?)
+        }
+        async fn path_exists(&self, path: &str) -> bool {
+            self.0.join(path).exists()
+        }
+        async fn execute(&self, _command: &str) -> Result<CommandOutput> {
+            anyhow::bail!("bundle provisioning should not execute commands")
+        }
+        async fn list_directory(&self, _path: &str) -> Result<Vec<DirEntry>> {
+            anyhow::bail!("bundle provisioning should not list workspace directories")
+        }
+        async fn symlink_or_copy(&self, source: &Path, target: &str) -> Result<()> {
+            self.copy_file(source, target).await
+        }
+        async fn remove_dir_all(&self, path: &str) -> Result<()> {
+            Ok(std::fs::remove_dir_all(self.0.join(path))?)
+        }
+    }
+
+    #[tokio::test]
+    async fn materialized_bundle_provisions_all_required_sentinel_skills() {
+        let installation = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        // No source checkout/candidate fallback: only the embedded bundle exists.
+        let resolver = OrchestrationResolver {
+            candidates: vec![],
+            orchestrator_dir: installation.path().to_path_buf(),
+        };
+        let orchestration = resolver.ensure_orchestration_dir().unwrap();
+        let registry = config::Registry::load(resolver.registry_path()).unwrap();
+        let sentinel = registry.get("sentinel").unwrap();
+        assert!(sentinel
+            .skills
+            .iter()
+            .any(|name| name == "sentinel-testing"));
+        // Catch future required-skill omissions for every enabled role as well.
+        for role in registry.team.iter().filter(|role| role.enabled) {
+            for skill in &role.skills {
+                assert!(
+                    orchestration
+                        .join("plugin/skills")
+                        .join(skill)
+                        .join("SKILL.md")
+                        .is_file(),
+                    "{} requires unbundled skill {skill}",
+                    role.id
+                );
+            }
+        }
+        let transport = LocalWorkspace(workspace.path().to_path_buf());
+        Provisioner::new(installation.path())
+            .provision_role(&transport, "sentinel", &registry)
+            .await
+            .unwrap();
+        for skill in &sentinel.skills {
+            let bundled = std::fs::read_to_string(
+                orchestration
+                    .join("plugin/skills")
+                    .join(skill)
+                    .join("SKILL.md"),
+            )
+            .unwrap();
+            let delivered = transport
+                .read_file(&format!(".agents/skills/{skill}/SKILL.md"))
+                .await
+                .unwrap();
+            assert_eq!(delivered, bundled, "complete skill must reach SENTINEL");
+        }
+        assert_eq!(
+            transport.read_file("AGENTS.md").await.unwrap(),
+            std::fs::read_to_string(orchestration.join("agent/agents/sentinel.agent.md")).unwrap()
+        );
+    }
+}

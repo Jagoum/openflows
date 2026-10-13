@@ -42,5 +42,6 @@ clap            = { version = "4", features = ["derive"] }
   reqwest     = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 mockito = "1"
 tempfile = "3"
