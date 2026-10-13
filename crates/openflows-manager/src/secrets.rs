@@ -4,7 +4,7 @@
 //! key, OAuth client secret, webhook secret, Coder operator token, and
 //! installation-token references) behind a [`SecretProvider`] trait rather than
 //! in plaintext database columns or application code. The concrete backend is a
-//! deployment decision (D2 in compatibility-report.md); WP-01 provides the
+//! deployment decision (D2 in compatibility-report.md); the manager provides the
 //! trait and an isolated in-memory test implementation, and the selected
 //! production adapter is supplied later via `OPENFLOWS_SECRET_PROVIDER`.
 //!

@@ -45,9 +45,9 @@ impl ReadinessCheck for StoreReadiness {
 ///
 /// Constructed only when the Manager has a control-plane database (hosted mode,
 /// or local development with an explicit database). Repositories and services
-/// expose organization-scoped operations. In addition to the WP-01
+/// expose organization-scoped operations. In addition to the core
 /// repositories, this holds the human-authentication and organization services
-/// added by WP-02.
+/// added by the authorization layer.
 #[derive(Clone)]
 pub struct ManagerServices {
     pub db: Db,
@@ -74,10 +74,18 @@ pub struct ManagerServices {
     pub app_signer: std::sync::Arc<dyn crate::connections::AppSigner>,
     pub app_api: std::sync::Arc<dyn crate::connections::GithubAppApi>,
     pub webhook_secret: Option<Vec<u8>>,
-    // WP-04 runtime authentication and GitHub credential broker.
+    // Runtime authentication and GitHub credential broker.
     pub runtime_repo: crate::runtime::RuntimeRepository,
     pub runtime_credentials: crate::runtime::RuntimeCredentialService,
     pub broker: crate::runtime::CredentialBroker,
+    // Coder adapter and template releases.
+    pub release_repo: crate::templates::repository::ReleaseRepository,
+    pub release_service: crate::templates::service::ReleaseService,
+    pub release_approvals: crate::releases::ReleaseApprovalService,
+    /// Durable organization-provisioning worker, present when a Coder adapter
+    /// and operator-configured release are available. `None` in pure
+    /// local/test mode (tests build one directly with a mock adapter).
+    pub org_provision: Option<crate::provisioning::OrgProvisionWorker>,
 }
 
 /// The secret-provider adapter name for the isolated in-memory provider.
@@ -177,7 +185,7 @@ impl ManagerServices {
         )
     }
 
-    /// Build services with an explicit App signer and App API (WP-03). Used by
+    /// Build services with an explicit App signer and App API. Used by
     /// tests and by real configuration resolution.
     #[allow(clippy::too_many_arguments)]
     pub fn from_db_with_app(
@@ -294,7 +302,7 @@ impl ManagerServices {
             runtime_repo.clone(),
         );
 
-        // WP-04 runtime authentication and GitHub credential broker.
+        // Runtime authentication and GitHub credential broker.
         let runtime_credentials =
             crate::runtime::RuntimeCredentialService::new(runtime_repo.clone());
         let broker = crate::runtime::CredentialBroker::new(
@@ -303,6 +311,16 @@ impl ManagerServices {
             app_signer.clone(),
             app_id,
             auth_config.clone(),
+        );
+
+        // Template release infrastructure.
+        let release_repo = crate::templates::repository::ReleaseRepository::new(pool.clone());
+        let release_service =
+            crate::templates::service::ReleaseService::new(pool.clone(), release_repo.clone());
+        let release_approvals = crate::releases::ReleaseApprovalService::new(
+            pool.clone(),
+            release_service.clone(),
+            release_repo.clone(),
         );
 
         ManagerServices {
@@ -331,6 +349,10 @@ impl ManagerServices {
             runtime_repo,
             runtime_credentials,
             broker,
+            release_repo,
+            release_service,
+            release_approvals,
+            org_provision: None,
         }
     }
 
@@ -392,7 +414,7 @@ impl ManagerServices {
             None => None,
         };
 
-        Ok(Self::from_db_with_app_config(
+        let services = Self::from_db_with_app_config(
             db,
             auth_config,
             github,
@@ -401,7 +423,66 @@ impl ManagerServices {
             app_api,
             webhook_secret,
             config.github_app.clone(),
-        ))
+        );
+        services.with_org_provision(config, provider).await
+    }
+
+    /// Build and attach the durable organization-provisioning worker using the
+    /// configured Coder adapter and operator-configured release.
+    ///
+    /// When the Coder adapter configuration (URL + operator token ref) is
+    /// absent (pure local/test mode) this returns `self` unchanged with
+    /// `org_provision: None`. When configured, it resolves the platform Coder
+    /// operator token through the secret provider (never logged/persisted),
+    /// imports the operator-configured release, and attaches the worker. A
+    /// broken release source or operator token is a startup error (fail closed),
+    /// so organizations never silently become ready.
+    pub async fn with_org_provision(
+        mut self,
+        config: &crate::config::ManagerConfig,
+        provider: &dyn crate::secrets::SecretProvider,
+    ) -> Result<Self, ManagerError> {
+        let Some(url) = &config.coder_url else {
+            return Ok(self);
+        };
+        let Some(ref_name) = &config.coder_operator_token_ref else {
+            return Ok(self);
+        };
+        let token_bytes = provider.get(ref_name).await.map_err(|e| {
+            ManagerError::Config(format!("failed to resolve Coder operator token: {e}"))
+        })?;
+        let token = String::from_utf8(token_bytes)
+            .map_err(|_| ManagerError::Config("Coder operator token is not UTF-8".into()))?;
+
+        let adapter =
+            crate::coder::RealCoderAdapter::from_parts(url, &token, &config.coder_version_baseline);
+        let provider =
+            crate::provisioning::ReleaseProvider::from_env().map_err(ManagerError::from)?;
+        let artifacts = provider.load().map_err(ManagerError::from)?;
+        let (release_id, _digest) = self
+            .release_service
+            .import_release(artifacts.clone(), "operator-configured")
+            .await?;
+        // A release supplied through the trusted operator configuration is the
+        // platform-selected release for this deployment. Customer-facing
+        // promotion still requires the platform-operator approval service.
+        self.release_repo
+            .approve_configured_release(release_id)
+            .await?;
+
+        let worker = crate::provisioning::OrgProvisionWorker::new(
+            self.db.pool().clone(),
+            self.organizations.clone(),
+            self.release_service.clone(),
+            self.release_repo.clone(),
+            std::sync::Arc::new(adapter),
+            Some(std::sync::Arc::new(artifacts)),
+            Some(release_id),
+            config.provisioner_backend.clone(),
+            config.coder_version_baseline.clone(),
+        );
+        self.org_provision = Some(worker);
+        Ok(self)
     }
 
     pub fn from_db(db: Db) -> Self {
@@ -749,11 +830,22 @@ pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ManagerError> {
-    let worker = state
+    let connection_worker = state
         .services()
         .map(|services| services.connection_worker.clone());
-    let worker_loop = async move {
-        match worker {
+    let connection_loop = async move {
+        match connection_worker {
+            Some(worker) => worker.run_forever().await,
+            None => std::future::pending().await,
+        }
+    };
+    // Durable organization-provisioning worker (startup recovery resumes
+    // unfinished org.provision operations). `None` in pure local/test mode.
+    let org_provision = state
+        .services()
+        .and_then(|services| services.org_provision.clone());
+    let org_provision_loop = async move {
+        match org_provision {
             Some(worker) => worker.run_forever().await,
             None => std::future::pending().await,
         }
@@ -765,7 +857,8 @@ pub async fn serve(
     .with_graceful_shutdown(shutdown);
     tokio::select! {
         result = async { server.await } => result?,
-        result = worker_loop => result?,
+        result = connection_loop => result?,
+        result = org_provision_loop => result?,
     }
     Ok(())
 }

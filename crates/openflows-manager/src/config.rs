@@ -2,7 +2,7 @@
 //!
 //! All Manager settings are defined here and loaded once at startup, following
 //! the same envconfig pattern as the `config` crate. This module owns the
-//! deployment mode (`local` vs `hosted`) and enforces the WP-01 requirement
+//! deployment mode (`local` vs `hosted`) and enforces the manager requirements
 //! that hosted configuration failures must not silently fall back to local
 //! behavior: when hosted mode is selected, the required hosted settings must
 //! be present or startup fails.
@@ -88,6 +88,25 @@ pub const MASTER_KEY_BYTES: usize = 32;
 
 /// Default webhook body-size limit: 2 MiB.
 pub const DEFAULT_WEBHOOK_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Coder adapter and template release configuration.
+// ---------------------------------------------------------------------------
+/// The Coder server URL the manager's platform adapter talks to.
+pub const CODER_URL_ENV: &str = "CODER_URL";
+/// Secret-provider reference for the platform-only Coder operator token. The
+/// token is resolved inside the trusted adapter and never exposed through
+/// browser responses, logs, errors, audit/outbox payloads, or template
+/// parameters.
+pub const CODER_OPERATOR_TOKEN_REF_ENV: &str = "OPENFLOWS_CODER_OPERATOR_TOKEN_REF";
+/// The pinned Coder version baseline for readiness (e.g. `v2.37.3`).
+pub const CODER_VERSION_BASELINE_ENV: &str = "OPENFLOWS_CODER_VERSION_BASELINE";
+/// The operator-configured provisioner backend adapter name.
+pub const PROVISIONER_BACKEND_ENV: &str = "OPENFLOWS_PROVISIONER_BACKEND";
+/// Default Coder version baseline.
+pub const DEFAULT_CODER_VERSION_BASELINE: &str = "v2.37.3";
+/// Default provisioner backend (operator input; validated, not fabricated).
+pub const DEFAULT_PROVISIONER_BACKEND: &str = "docker";
 
 use crate::auth::crypto::EnvelopeCipher;
 use crate::error::ManagerError;
@@ -270,7 +289,7 @@ fn webhook_body_limit_from_env() -> usize {
 }
 
 /// Centralized GitHub App configuration for the installation connection
-/// lifecycle (WP-03): App JWT signing, installation metadata lookups, and
+/// lifecycle: App JWT signing, installation metadata lookups, and
 /// webhook signature verification. These reference secrets through the secret
 /// provider; the private key and webhook secret are never plaintext config.
 #[derive(Debug, Clone)]
@@ -322,7 +341,7 @@ pub struct ManagerConfig {
     pub http_addr: String,
     /// Centralized GitHub user-authorization settings.
     pub auth: AuthConfig,
-    /// Centralized GitHub App installation-connection settings (WP-03).
+    /// Centralized GitHub App installation-connection settings.
     pub github_app: GithubAppConfig,
     /// Secret-provider reference for the GitHub App client secret (OAuth
     /// exchange). Required in hosted mode.
@@ -330,6 +349,14 @@ pub struct ManagerConfig {
     /// Secret-provider reference for the envelope master key. Required in
     /// hosted mode; local/tests use the dev key when absent.
     pub crypto_master_key_ref: Option<String>,
+    /// Coder server URL the platform adapter uses.
+    pub coder_url: Option<String>,
+    /// Secret-provider reference for the platform-only Coder operator token.
+    pub coder_operator_token_ref: Option<String>,
+    /// The pinned Coder version baseline for readiness.
+    pub coder_version_baseline: String,
+    /// The operator-configured provisioner backend adapter.
+    pub provisioner_backend: String,
 }
 
 impl ManagerConfig {
@@ -357,6 +384,18 @@ impl ManagerConfig {
         let crypto_master_key_ref = std::env::var(CRYPTO_MASTER_KEY_REF_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty());
+
+        // Coder adapter configuration.
+        let coder_url = std::env::var(CODER_URL_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let coder_operator_token_ref = std::env::var(CODER_OPERATOR_TOKEN_REF_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let coder_version_baseline = std::env::var(CODER_VERSION_BASELINE_ENV)
+            .unwrap_or_else(|_| DEFAULT_CODER_VERSION_BASELINE.to_string());
+        let provisioner_backend = std::env::var(PROVISIONER_BACKEND_ENV)
+            .unwrap_or_else(|_| DEFAULT_PROVISIONER_BACKEND.to_string());
 
         let auth = auth_from_env(mode == Mode::Hosted, crypto_master_key_ref.clone())?;
 
@@ -398,6 +437,11 @@ impl ManagerConfig {
                         "hosted mode requires {GITHUB_WEBHOOK_SECRET_REF_ENV}"
                     ));
                 }
+                let coder_url =
+                    coder_url.ok_or_else(|| format!("hosted mode requires {CODER_URL_ENV}"))?;
+                let coder_operator_token_ref = coder_operator_token_ref.ok_or_else(|| {
+                    format!("hosted mode requires {CODER_OPERATOR_TOKEN_REF_ENV}")
+                })?;
                 Ok(ManagerConfig {
                     mode,
                     database_url: Some(database_url),
@@ -407,6 +451,10 @@ impl ManagerConfig {
                     github_app,
                     github_client_secret_ref: Some(github_client_secret_ref),
                     crypto_master_key_ref: Some(crypto_master_key_ref),
+                    coder_url: Some(coder_url),
+                    coder_operator_token_ref: Some(coder_operator_token_ref),
+                    coder_version_baseline,
+                    provisioner_backend,
                 })
             }
             Mode::Local => Ok(ManagerConfig {
@@ -418,6 +466,10 @@ impl ManagerConfig {
                 github_app: github_app_from_env(),
                 github_client_secret_ref,
                 crypto_master_key_ref,
+                coder_url,
+                coder_operator_token_ref,
+                coder_version_baseline,
+                provisioner_backend,
             }),
         }
     }
@@ -445,6 +497,10 @@ pub fn local_test_config() -> ManagerConfig {
         },
         github_client_secret_ref: None,
         crypto_master_key_ref: None,
+        coder_url: None,
+        coder_operator_token_ref: None,
+        coder_version_baseline: DEFAULT_CODER_VERSION_BASELINE.to_string(),
+        provisioner_backend: DEFAULT_PROVISIONER_BACKEND.to_string(),
         github_app: GithubAppConfig {
             app_id: None,
             app_slug: None,
@@ -502,6 +558,10 @@ mod tests {
         GITHUB_PRIVATE_KEY_REF_ENV,
         GITHUB_WEBHOOK_SECRET_REF_ENV,
         WEBHOOK_BODY_LIMIT_ENV,
+        CODER_URL_ENV,
+        CODER_OPERATOR_TOKEN_REF_ENV,
+        CODER_VERSION_BASELINE_ENV,
+        PROVISIONER_BACKEND_ENV,
     ];
 
     /// Set the env required for a hosted-mode config that should validate.
@@ -517,6 +577,8 @@ mod tests {
         std::env::set_var(GITHUB_APP_SLUG_ENV, "openflows-app");
         std::env::set_var(GITHUB_PRIVATE_KEY_REF_ENV, "ref:github-private-key");
         std::env::set_var(GITHUB_WEBHOOK_SECRET_REF_ENV, "ref:github-webhook-secret");
+        std::env::set_var(CODER_URL_ENV, "https://coder.example.com");
+        std::env::set_var(CODER_OPERATOR_TOKEN_REF_ENV, "ref:coder-operator-token");
     }
 
     #[test]

@@ -139,6 +139,16 @@ pub async fn create_in_tx(
 /// claim is atomic (`FOR UPDATE SKIP LOCKED`) so concurrent workers never
 /// receive the same operation. Returns `None` when no operation is available.
 pub async fn claim(pool: &PgPool, owner: &str) -> Result<Option<LeaseGuard>, ManagerError> {
+    claim_kind(pool, owner, None).await
+}
+
+/// Claim only operations of `kind` when provided. Specialized workers must use
+/// this filter so they cannot consume another worker's operation.
+pub async fn claim_kind(
+    pool: &PgPool,
+    owner: &str,
+    kind: Option<&str>,
+) -> Result<Option<LeaseGuard>, ManagerError> {
     let token = uuid::Uuid::new_v4();
     let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
         "UPDATE operations
@@ -154,6 +164,7 @@ pub async fn claim(pool: &PgPool, owner: &str) -> Result<Option<LeaseGuard>, Man
                  WHERE state IN ('queued', 'running', 'retryable_failed')
                    AND (lease_expires_at IS NULL OR lease_expires_at < now())
                    AND (retry_at IS NULL OR retry_at <= now())
+                   AND ($3::text IS NULL OR kind = $3)
                  ORDER BY created_at
                  LIMIT 1
                  FOR UPDATE SKIP LOCKED
@@ -162,6 +173,7 @@ pub async fn claim(pool: &PgPool, owner: &str) -> Result<Option<LeaseGuard>, Man
     )
     .bind(owner)
     .bind(token)
+    .bind(kind)
     .fetch_optional(pool)
     .await
     .map_err(ManagerError::from)?;
@@ -176,6 +188,46 @@ pub async fn claim(pool: &PgPool, owner: &str) -> Result<Option<LeaseGuard>, Man
 }
 
 impl LeaseGuard {
+    /// Lock the lease row inside a resource transaction. Callers must keep
+    /// this transaction short and never perform external calls while holding it.
+    pub async fn lock_in_tx(&self, tx: &mut PgConnection) -> Result<bool, ManagerError> {
+        let id: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM operations WHERE id = $1 AND organization_id = $2
+             AND lease_owner = $3 AND lease_token = $4 AND state = 'running'
+             AND lease_expires_at > clock_timestamp() FOR UPDATE",
+        )
+        .bind(self.operation_id.0)
+        .bind(self.organization_id.0)
+        .bind(&self.owner)
+        .bind(self.token)
+        .fetch_optional(tx)
+        .await?;
+        Ok(id.is_some())
+    }
+
+    /// Complete in the transaction that persists the final resource state.
+    pub async fn complete_in_tx(
+        &self,
+        tx: &mut PgConnection,
+        result: Value,
+    ) -> Result<bool, ManagerError> {
+        let affected = sqlx::query(
+            "UPDATE operations SET state = 'succeeded',
+            lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+            sanitized_result = $1, error_code = NULL, retry_at = NULL, updated_at = now()
+            WHERE id = $2 AND lease_owner = $3 AND lease_token = $4
+            AND state = 'running' AND lease_expires_at > clock_timestamp()",
+        )
+        .bind(result)
+        .bind(self.operation_id.0)
+        .bind(&self.owner)
+        .bind(self.token)
+        .execute(tx)
+        .await?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
     /// The worker that currently owns this lease.
     pub fn owner(&self) -> &str {
         &self.owner

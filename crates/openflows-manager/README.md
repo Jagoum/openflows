@@ -15,6 +15,20 @@ See [runtime credentials and the GitHub credential broker](../../docs/architectu
 
 ## Validation
 
+review fixes add migration `0012_current_organization_release.sql`.
+Publication history is retained in `organization_release_bindings`; the single
+current selection lives in `organization_current_releases`. Existing bindings
+are backfilled by most recent creation time, with release ID breaking ties.
+Successful organization readiness, release selection, and operation completion
+are now committed together. Startup preserves retired releases.
+
+The current real Coder adapter expects an operator-managed provisioner daemon
+using the key name `openflows-provisioner-<coder-organization-id>`. Only `idle`
+or `busy` daemons with that key qualify as online. Readiness does not create or
+discard provisioner credentials. Automatic backend deployment and the real
+template upload API remain unfinished work; passing fixture tests does
+not establish live Coder compatibility.
+
 Ordinary tests require no PostgreSQL server:
 
 ```sh

@@ -15,6 +15,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
 config = { version = "0.2.0", path = "../config" }
+coder-client = { version = "0.1.0", path = "../coder-client" }
 pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
 axum = { version = "0.8", features = ["http1", "json"] }
 tower-http = { version = "0.6", features = ["trace"] }
@@ -32,6 +33,9 @@ url = { workspace = true }
 reqwest = { workspace = true }
 jsonwebtoken = { workspace = true }
 hmac = "0.12"
+tar = "0.4"
+flate2 = "1"
+hex = "0.4"
 
 [features]
 default = []
@@ -47,3 +51,4 @@ sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+tempfile = { workspace = true }
