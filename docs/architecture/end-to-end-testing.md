@@ -2,7 +2,7 @@
 
 The goal is to prove that a new OpenFlows build can take an issue, provision agents, produce a correct change, verify the exact commit, obtain the required approvals, merge that change, and clean up. A passing test must include independent evidence of the resulting code and repository history. An agent saying it completed the task is insufficient.
 
-This is the target architecture. PRs #400, #401, and #403 implement its first three increments; the complete issue-to-merge suite remains to be built. Tests reduce regression risk for the scenarios they cover; they cannot guarantee that every possible change is safe.
+PRs #400, #401, #403, and #404 established service tests, delegated verification, external-service fixtures, and production bootstrap. The connected system scenario combines these boundaries into one issue-to-merge journey. The recovery, onboarding, and live scenarios below remain future work. Tests reduce regression risk for the scenarios they cover; they cannot guarantee that every possible change is safe.
 
 ## What the existing pull requests do
 
@@ -20,7 +20,7 @@ This is the target architecture. PRs #400, #401, and #403 implement its first th
 | Build and unit tests | Rust workspace | Every PR and merge candidate | Existing |
 | Service integration | Real Redis and PostgreSQL | Every PR and merge candidate | Covered by #400 and existing manager tests |
 | Worker integration | Real Coder, Terraform, SSH, workers, Redis, A2A | Every PR and merge candidate | Covered in part by #400 and #401 |
-| Complete deterministic system E2E | Real OpenFlows and Coder; local GitHub and model fixtures; real Git | Every PR and merge candidate once established | Next implementation |
+| Connected deterministic system E2E | Real OpenFlows and Coder; local GitHub and model fixtures; real Git | Every PR and merge candidate | One complete scenario; recovery/rework cases remain |
 | Live external E2E | Production templates, linked GitHub authentication, disposable GitHub repo, real model provider | Nightly and before release | Future implementation |
 | Manager and onboarding E2E | Manager HTTP API, PostgreSQL, tenant configuration, Coder; browser journey where applicable | Relevant PRs initially; mandatory once stable | Future implementation; current manager integration is a foundation |
 
@@ -151,13 +151,21 @@ The full deterministic E2E milestone is complete only when an issue submitted th
 
 The [system fixtures](../../tests/e2e/system/README.md) implement the local scripted model provider, limited GitHub API adapter, real Git remote, and independent exact-commit acceptance runner. Their mandatory contract job checks the production OpenFlows GitHub client and verifies actual acceptance failure, stale evidence rejection, and Git merging. The model contract checks normal and streamed tool responses and matching tool results.
 
-This is delivery step 3 infrastructure, not the complete system milestone. The production controller, real Coder chats and signed hooks, public human approval, and workspace cleanup across the complete journey remain delivery step 4. The fixture contract driver deliberately controls Git/API calls and must not be presented as proof that agents or the controller performed them.
+The fixture contract driver deliberately controls Git/API calls and tests those adapters in isolation. The separate connected scenario uses real controller-created Coder chats and signed hooks; only the human and independent CI actions are supplied by its driver.
 
 ## Production bootstrap coverage
 
 The first step 4 scenario runs the public tenant CLI against a fresh Coder deployment. It uploads all five production Terraform templates, provisions Nexus, clones the real fixture repository, checks the Rust controller's health, and makes a real Coder chat execute a workspace command. It also checks that unchanged bootstrap reuses template versions, changed Terraform settings produce new versions, and workspace deletion succeeds. Logs are collected before deletion.
 
-This check catches regressions in fresh tenant configuration, template upload and configuration forwarding, Nexus startup, repository cloning, and Coder command execution. It does not yet prove issue discovery, FORGE/SENTINEL chats, signed hook delivery, human approval, or VESSEL merging. Those remain the next part of delivery step 4.
+This check catches regressions in fresh tenant configuration, template upload and configuration forwarding, Nexus startup, repository cloning, and Coder command execution. It does not yet prove issue discovery, FORGE/SENTINEL chats, signed hook delivery, human approval, or VESSEL merging. Those are covered together by the connected scenario below.
+
+## Connected issue-to-merge coverage
+
+Run `bash tests/e2e/system/bootstrap.sh system`. The fresh tenant discovers an issue through the local GitHub API, provisions FORGE and SENTINEL with production templates, and uses actual Coder chats and phase hooks to plan, implement, commit, verify through A2A, and open/review a PR. The driver approves through the public operator CLI; actual VESSEL requests a real squash merge. Independent acceptance checks both the candidate and merged commit. The controller must mark the ticket merged and delete both role workspaces.
+
+The scenario observes no merge attempts while human approval is missing or CI is pending. It also checks the verification executor, temporary checkout, tested head, unchanged default branch before approval, merged tree and parent, hook delivery, and cleanup. Evidence is uploaded by the required `Connected issue-to-merge E2E` job, which feeds `OpenFlows Merge Gate`.
+
+The scripted model supplies repeatable tool choices; it does not test reasoning quality. The GitHub adapter exercises real Git but does not replace a live authentication or branch-protection test. Existing focused suites retain failed acceptance, stale approval, and rejected CI cases. Whole-journey recovery, rejection/rework, and tenant-concurrency scenarios still need expansion.
 
 ## Implementation references
 

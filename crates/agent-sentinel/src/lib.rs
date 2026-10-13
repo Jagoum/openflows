@@ -207,7 +207,11 @@ impl Node for SentinelNode {
         for ticket in &tickets {
             let worker_id = match &ticket.status {
                 TicketStatus::InProgress { worker_id } => worker_id.clone(),
-                TicketStatus::Assigned { worker_id } => worker_id.clone(),
+                TicketStatus::Assigned { worker_id }
+                | TicketStatus::AwaitingHuman { worker_id, .. } => worker_id.clone(),
+                TicketStatus::Completed { worker_id, outcome } if outcome == "pr_opened" => {
+                    worker_id.clone()
+                }
                 _ => continue,
             };
 
@@ -401,6 +405,55 @@ mod tests {
 
     fn node() -> SentinelNode {
         SentinelNode::new("sentinel.agent.md")
+    }
+
+    #[tokio::test]
+    async fn completed_pr_ticket_delivers_review_after_human_approval() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                KEY_TICKETS,
+                json!([{
+                    "id": "T-42", "title": "Fix answer", "body": "Return 42", "priority": 0,
+                    "branch": "forge-1/T-42", "status": {
+                        "type": "completed", "worker_id": "forge-1", "outcome": "pr_opened"
+                    }
+                }]),
+            )
+            .await;
+        let decision = Decision {
+            pr_number: Some(42),
+            round: 3,
+            actor: "sentinel".into(),
+            approved: true,
+            report: "Verified candidate".into(),
+            revision: 1,
+            head: Some("abc".into()),
+        };
+        let state = Lifecycle {
+            phase: Phase::Submit,
+            revision: 1,
+            review_round: 3,
+            head: Some("abc".into()),
+            pr_number: Some(42),
+            pr_decision: Some(decision.clone()),
+            pr_delivery: Some(decision.clone()),
+            pr_human: Some(Decision {
+                actor: "human".into(),
+                ..decision
+            }),
+            ..Default::default()
+        };
+        store.set("ticket:T-42:status", json!(state)).await;
+        let reviewer = node();
+        let prepared = reviewer.prep(&store).await.unwrap();
+        assert_eq!(prepared["reviewable"].as_array().unwrap().len(), 1);
+        let result = reviewer.exec(prepared).await.unwrap();
+        let action = reviewer.post(&store, result).await.unwrap();
+        assert_eq!(action.as_str(), ACTION_REVIEW_APPROVE);
+        let delivered = store.lifecycle("T-42").await.unwrap();
+        assert!(delivered.pr_delivery.is_none());
+        assert!(delivered.pr_human.as_ref().unwrap().approved);
     }
 
     #[test]

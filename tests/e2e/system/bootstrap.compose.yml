@@ -41,7 +41,7 @@ services:
       retries: 30
   model:
     image: ${OPENFLOWS_SYSTEM_FIXTURE_IMAGE:?required}
-    command: [python3, fixtures.py, --service, model, --root, /tmp/model, --scenario, /opt/fixtures/bootstrap-model.json, --host, 0.0.0.0, --port, "8080", --ready-file, /tmp/ready.json]
+    command: [python3, fixtures.py, --service, model, --root, /tmp/model, --scenario, "${OPENFLOWS_E2E_MODEL_SCENARIO:-/opt/fixtures/bootstrap-model.json}", --host, 0.0.0.0, --port, "8080", --ready-file, /tmp/ready.json]
     healthcheck:
       test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"]
       interval: 2s

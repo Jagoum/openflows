@@ -77,11 +77,15 @@ class Repository:
             raise ValueError('Expected an exact commit SHA')
         git('--git-dir', str(self.bare), 'cat-file', '-e', f'{sha}^{{commit}}')
 
-    def merge(self, base, head_branch, candidate, expected_base, title):
+    def merge(self, base, head_branch, candidate, expected_base, title, method='merge'):
         worktree = self.root / 'merge-checkout'
         git('--git-dir', str(self.bare), 'worktree', 'add', '--detach', str(worktree), expected_base)
         try:
-            git('merge', '--no-ff', '-m', title, candidate, cwd=worktree)
+            if method == 'squash':
+                git('merge', '--squash', candidate, cwd=worktree)
+                git('commit', '-m', title, cwd=worktree)
+            else:
+                git('merge', '--no-ff', '-m', title, candidate, cwd=worktree)
             merged = git('rev-parse', 'HEAD', cwd=worktree)
             # One ref transaction verifies the head and compares the base before
             # updating it. A push during the merge cannot authorize a stale head.

@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Tests production tenant bootstrap and Coder command execution in an isolated stack.
-# Saves diagnostics and removes run-owned resources; full issue-to-merge coverage follows.
+# Runs production bootstrap or the connected issue-to-merge journey in an isolated stack.
+# Saves diagnostics before deleting run-owned resources.
 
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
-project="openflows-bootstrap-$(date +%s)-$$"
-artifacts="$PWD/target/ci-artifacts/production-bootstrap/$project"
+scenario="${1:-bootstrap}"
+case "$scenario" in
+    bootstrap) category=production-bootstrap; driver=production_bootstrap.py; model=bootstrap-model.json ;;
+    system) category=connected-system; driver=connected_system.py; model=system-model.json ;;
+    *) printf 'Unknown E2E scenario: %s\n' "$scenario" >&2; exit 2 ;;
+esac
+project="openflows-${scenario}-$(date +%s)-$$"
+artifacts="$PWD/target/ci-artifacts/$category/$project"
 mkdir -p "$artifacts"
 scratch=$(mktemp -d)
 export OPENFLOWS_SYSTEM_FIXTURE_IMAGE="$project-fixtures:ci"
+export OPENFLOWS_E2E_MODEL_SCENARIO="/opt/fixtures/$model"
 compose=(docker compose --env-file /dev/null -p "$project" -f "$PWD/tests/e2e/compose.yml" -f "$PWD/tests/e2e/system/bootstrap.compose.yml")
 remove_resource() {
     local kind="$1" name="$2" filter remaining
@@ -36,10 +43,13 @@ cleanup() {
     while IFS= read -r id; do
         [ -n "$id" ] || continue
         docker logs "$id" >"$artifacts/container-$id.log" 2>&1 || true
+        docker cp "$id:/home/coder/.local/state/openflows/verify.log" "$artifacts/verify-$id.log" 2>/dev/null || true
         docker exec "$id" cat /tmp/openflows-controller.log >"$artifacts/controller-$id.log" 2>&1 || true
         docker cp "$id:/tmp/oauth/oauth-requests.jsonl" "$artifacts/oauth-requests.jsonl" 2>/dev/null || true
         docker cp "$id:/tmp/model/model-requests.jsonl" "$artifacts/model-requests.jsonl" 2>/dev/null || true
         docker cp "$id:/tmp/github/github-requests.jsonl" "$artifacts/github-requests.jsonl" 2>/dev/null || true
+        docker cp "$id:/tmp/github/ci-artifacts" "$artifacts/ci" 2>/dev/null || true
+        docker cp "$id:/tmp/github/repo.git" "$artifacts/repo.git" 2>/dev/null || true
         docker inspect "$id" --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' >>"$scratch/volumes" || true
         docker rm -f "$id" >>"$artifacts/cleanup.log" 2>&1 || result=1
     done < <(docker ps -aq --filter "network=${project}_default")
@@ -87,9 +97,11 @@ export TF_VAR_github_api_base=http://github-fixture:8080
 export TF_VAR_github_git_base="$GITHUB_GIT_BASE"
 export OPENFLOWS_E2E_OAUTH_URL="http://$("${compose[@]}" port oauth 8080)"
 export OPENFLOWS_E2E_ARTIFACTS="$artifacts"
+export OPENFLOWS_E2E_GITHUB_URL="http://$("${compose[@]}" port github-fixture 8080)"
+export OPENFLOWS_E2E_GITHUB_CONTAINER="$("${compose[@]}" ps -q github-fixture)"
 # Keep the prefixed Nexus workspace name within Coder's 32-character limit.
 export OPENFLOWS_E2E_TENANT="ci-$(printf '%s' "$project" | sha256sum | cut -c1-12)"
-driver="$PWD/tests/e2e/system/production_bootstrap.py"
+driver="$PWD/tests/e2e/system/$driver"
 # Avoid loading the developer's .env or persisted bootstrap credentials.
 cd "$scratch"
-timeout 900 python3 "$driver" 2>&1 | tee "$artifacts/test.log"
+timeout 1500 python3 "$driver" 2>&1 | tee "$artifacts/test.log"
