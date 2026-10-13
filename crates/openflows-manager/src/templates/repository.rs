@@ -1,9 +1,9 @@
 //! Persistence for template releases, per-organization publication, and
-//! organization provisioners (WP-05).
+//! organization provisioners.
 //!
-//! Reuses the WP-01 schema (`template_releases`, `template_release_roles`,
+//! Reuses the existing schema (`template_releases`, `template_release_roles`,
 //! `organization_template_versions`, `organization_provisioners`) plus the
-//! WP-05 `organization_release_bindings`. All reads are organization-scoped.
+//! organization release bindings. All reads are organization-scoped.
 
 use crate::error::ManagerError;
 use crate::id::{OrganizationId, ProvisionerId, ReleaseId};
@@ -319,6 +319,17 @@ impl ReleaseRepository {
         organization_id: OrganizationId,
         release_id: ReleaseId,
     ) -> Result<(), ManagerError> {
+        let mut tx = self.pool.begin().await?;
+        Self::bind_org_release_in_tx(&mut tx, organization_id, release_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn bind_org_release_in_tx(
+        tx: &mut sqlx::PgConnection,
+        organization_id: OrganizationId,
+        release_id: ReleaseId,
+    ) -> Result<(), ManagerError> {
         sqlx::query(
             "INSERT INTO organization_release_bindings (organization_id, release_id)
              VALUES ($1, $2)
@@ -326,9 +337,18 @@ impl ReleaseRepository {
         )
         .bind(organization_id.0)
         .bind(release_id.0)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(ManagerError::from)?;
+        sqlx::query(
+            "INSERT INTO organization_current_releases (organization_id, release_id)
+            VALUES ($1, $2) ON CONFLICT (organization_id)
+            DO UPDATE SET release_id = EXCLUDED.release_id",
+        )
+        .bind(organization_id.0)
+        .bind(release_id.0)
+        .execute(&mut *tx)
+        .await?;
         Ok(())
     }
 
@@ -338,7 +358,7 @@ impl ReleaseRepository {
         organization_id: OrganizationId,
     ) -> Result<Option<ReleaseId>, ManagerError> {
         let row: Option<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT release_id FROM organization_release_bindings
+            "SELECT release_id FROM organization_current_releases
               WHERE organization_id = $1",
         )
         .bind(organization_id.0)
@@ -346,6 +366,18 @@ impl ReleaseRepository {
         .await
         .map_err(ManagerError::from)?;
         Ok(row.map(|(id,)| ReleaseId::from_uuid(id)))
+    }
+
+    /// Trusted startup may approve a newly staged configured release, but
+    /// never undo an operator's retirement or overwrite approval metadata.
+    pub async fn approve_configured_release(
+        &self,
+        release_id: ReleaseId,
+    ) -> Result<(), ManagerError> {
+        sqlx::query("UPDATE template_releases SET status = 'approved', approved_at = now(), updated_at = now()
+            WHERE id = $1 AND status = 'staged'")
+            .bind(release_id.0).execute(&self.pool).await?;
+        Ok(())
     }
 
     /// Insert or update an organization provisioner record.
@@ -360,12 +392,12 @@ impl ReleaseRepository {
         sqlx::query(
             "INSERT INTO organization_provisioners
                 (id, organization_id, coder_provisioner_ref, secret_ref, status, last_heartbeat_at)
-             VALUES ($1, $2, $3, $4, $5, now())
+             VALUES ($1, $2, $3, $4, $5, CASE WHEN $5 = 'ready' THEN now() ELSE NULL END)
              ON CONFLICT (id) DO UPDATE SET
                  coder_provisioner_ref = EXCLUDED.coder_provisioner_ref,
-                 secret_ref = EXCLUDED.secret_ref,
+                 secret_ref = COALESCE(EXCLUDED.secret_ref, organization_provisioners.secret_ref),
                  status = EXCLUDED.status,
-                 last_heartbeat_at = now(),
+                 last_heartbeat_at = CASE WHEN EXCLUDED.status = 'ready' THEN now() ELSE organization_provisioners.last_heartbeat_at END,
                  updated_at = now()",
         )
         .bind(id.0)
@@ -387,7 +419,7 @@ impl ReleaseRepository {
     ) -> Result<bool, ManagerError> {
         let affected = sqlx::query(
             "UPDATE organization_provisioners
-                SET status = $1, last_heartbeat_at = now(), updated_at = now()
+                SET status = $1, last_heartbeat_at = CASE WHEN $1 = 'ready' THEN now() ELSE last_heartbeat_at END, updated_at = now()
               WHERE organization_id = $2",
         )
         .bind(status)

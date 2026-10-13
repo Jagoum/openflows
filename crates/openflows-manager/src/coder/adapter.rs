@@ -100,7 +100,7 @@ impl CoderAdapter for RealCoderAdapter {
     async fn verify_capabilities(&self) -> Result<CoderCapabilities, ManagerError> {
         // Version: `GET /api/v2/buildinfo` is unauthenticated. We compare the
         // reported version prefix against the pinned baseline. Because live
-        // deployment access is an operator gate (WP-00), a failure here maps to
+        // deployment access is an operator gate, a failure here maps to
         // an explicit not-ready state, never a privileged fallback.
         let buildinfo: Result<serde_json::Value, _> = {
             let resp = self
@@ -175,13 +175,10 @@ impl CoderAdapter for RealCoderAdapter {
         org: &CoderOrganizationId,
         backend: &str,
     ) -> Result<(), ManagerError> {
-        // Deterministic provisioner key name derived from the org id so retries
-        // reuse the same key rather than minting unbounded keys.
+        // Until the backend deployment adapter is configured, the operator
+        // provisions this key and daemon. Readiness must not mint and discard
+        // a new credential on each retry.
         let key_name = format!("openflows-provisioner-{}", org.0);
-        self.client
-            .create_provisioner_key(org, &key_name)
-            .await
-            .map_err(ManagerError::from)?;
 
         // Poll provisioner daemons until one reports ready, bounded. The
         // `backend` names the operator-configured adapter; the daemon must have
@@ -193,7 +190,7 @@ impl CoderAdapter for RealCoderAdapter {
                 .list_provisioner_daemons(org)
                 .await
                 .map_err(ManagerError::from)?;
-            if daemons.iter().any(|d| d.status == "ready") {
+            if daemons.iter().any(|d| daemon_is_online(d, &key_name)) {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -308,9 +305,13 @@ impl CoderAdapter for RealCoderAdapter {
                 .as_ref()
                 .map(|j| j.id.clone())
                 .unwrap_or_default();
-            if !job_id.is_empty() {
-                self.await_import(org, &job_id).await?;
+            if job_id.is_empty() {
+                return Err(ManagerError::api(
+                    "IMPORT_JOB_UNKNOWN",
+                    "existing template version did not report an import job",
+                ));
             }
+            self.await_import(org, &job_id).await?;
             return Ok(TemplatePublicationResult {
                 published: PublishedTemplate {
                     template_id: template_id.clone(),
@@ -364,6 +365,11 @@ impl CoderAdapter for RealCoderAdapter {
         // has Agents/chat capability and a configured model.
         Ok(!models.is_empty())
     }
+}
+
+fn daemon_is_online(daemon: &coder_client::CoderProvisionerDaemon, key_name: &str) -> bool {
+    daemon.key_name.as_deref() == Some(key_name)
+        && matches!(daemon.status.as_deref(), Some("idle" | "busy"))
 }
 
 impl RealCoderAdapter {

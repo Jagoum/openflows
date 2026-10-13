@@ -2,7 +2,7 @@
 //!
 //! It models the same resource state machine as a real Coder deployment
 //! (organizations, templates, versions, import jobs, provisioners, models) so
-//! the WP-05 acceptance behaviors can be exercised without a licensed
+//! the provisioning acceptance behaviors can be exercised without a licensed
 //! deployment: cross-org name isolation, failed-import preventing readiness,
 //! duplicate-publication retry convergence, and version-pin survival. It never
 //! fabricates credentials or licenses; capability flags are explicit test
@@ -48,6 +48,7 @@ struct MockTemplate {
     id: String,
     org_id: String,
     name: String,
+    active_version_id: Option<String>,
 }
 
 /// Configuration knobs a test sets to drive failure and success scenarios.
@@ -100,6 +101,29 @@ impl Default for MockCoderAdapter {
 }
 
 impl MockCoderAdapter {
+    pub fn set_active_version(&self, template_id: &str, version_id: &str) {
+        let mut state = self.state.lock().unwrap();
+        assert!(state
+            .template_versions
+            .get(template_id)
+            .unwrap()
+            .iter()
+            .any(|v| v.version_id == version_id));
+        state
+            .templates
+            .get_mut(template_id)
+            .unwrap()
+            .active_version_id = Some(version_id.to_string());
+    }
+
+    pub fn active_version(&self, template_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .templates
+            .get(template_id)
+            .and_then(|t| t.active_version_id.clone())
+    }
     pub fn new(config: MockCoderConfig) -> Self {
         MockCoderAdapter {
             state: Arc::new(Mutex::new(State::default())),
@@ -217,6 +241,7 @@ impl CoderAdapter for MockCoderAdapter {
                         id: id.clone(),
                         org_id: org.0.clone(),
                         name: template_name.to_string(),
+                        active_version_id: None,
                     };
                     state.templates.insert(id.clone(), t);
                     state
@@ -273,6 +298,10 @@ impl CoderAdapter for MockCoderAdapter {
                 .entry(template_id.clone())
                 .or_default()
                 .push(v);
+            let template = state.templates.get_mut(&template_id).unwrap();
+            if template.active_version_id.is_none() {
+                template.active_version_id = Some(version_id.clone());
+            }
         }
 
         if import_status != "succeeded" {

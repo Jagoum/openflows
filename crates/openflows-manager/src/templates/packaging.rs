@@ -169,6 +169,13 @@ impl TemplateManifest {
             );
         }
 
+        for role in [Role::Nexus, Role::Forge, Role::Sentinel, Role::Vessel] {
+            if !required_roles.contains(&role) {
+                return Err(ManagerError::InvalidInput(format!(
+                    "manifest must require baseline role '{role}'"
+                )));
+            }
+        }
         // Every required role must have an entry.
         for role in &required_roles {
             if !roles.contains_key(role) {
@@ -366,6 +373,11 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
                 ));
             }
             out.push(rel.to_path_buf());
+        } else {
+            return Err(ManagerError::InvalidInput(format!(
+                "unsupported template source entry '{}'",
+                rel.display()
+            )));
         }
     }
     Ok(())
@@ -409,6 +421,30 @@ pub fn manifest_json(manifest: &TemplateManifest) -> Result<Vec<u8>, ManagerErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_or_incomplete_required_roles_are_rejected() {
+        for required in [
+            serde_json::json!([]),
+            serde_json::json!(["nexus", "forge", "sentinel"]),
+        ] {
+            let roles: serde_json::Map<String, serde_json::Value> = Role::ALL.iter().map(|r| (
+                r.as_str().to_string(), serde_json::json!({"archive":r.archive_name(), "sha256":"a".repeat(64), "parameter_schema_version":1})
+            )).collect();
+            let manifest = serde_json::json!({"schema_version":1,"release":"test","required_roles":required,"roles":roles});
+            assert!(TemplateManifest::parse(&serde_json::to_vec(&manifest).unwrap()).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_symlink_is_rejected_with_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.tf"), "resource {}").unwrap();
+        std::os::unix::fs::symlink("main.tf", dir.path().join("linked.tf")).unwrap();
+        let error = build_deterministic_archive(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("linked.tf"));
+    }
 
     #[test]
     fn identical_inputs_produce_identical_archives() {

@@ -42,6 +42,7 @@ impl ReleaseService {
     ) -> Result<(ReleaseId, String), ManagerError> {
         // Validate manifest structure.
         let manifest = &artifacts.manifest;
+        TemplateManifest::parse(&manifest.to_canonical_json()?)?;
         let digest = manifest.manifest_sha256()?;
 
         // Reject if this exact digest is already imported (immutable identity).
@@ -66,9 +67,20 @@ impl ReleaseService {
         }
 
         let release_id = ReleaseId::new();
-        self.repo
+        if let Err(error) = self
+            .repo
             .insert_release(release_id, manifest, artifact_uri, &digest)
-            .await?;
+            .await
+        {
+            // A competing manager may have committed the same immutable
+            // release while we validated it. Conflicting versions still fail.
+            if matches!(error, ManagerError::Conflict(_)) {
+                if let Some((existing, _)) = self.repo.get_release_by_digest(&digest).await? {
+                    return Ok((ReleaseId::from_uuid(existing.id), digest));
+                }
+            }
+            return Err(error);
+        }
         Ok((release_id, digest))
     }
 
@@ -83,11 +95,18 @@ impl ReleaseService {
         adapter: &dyn CoderAdapter,
         artifacts: &ReleaseArtifacts,
     ) -> Result<Vec<Role>, ManagerError> {
-        let (_, roles) = self
+        let (release, roles) = self
             .repo
             .get_release(release_id)
             .await?
             .ok_or_else(|| ManagerError::not_found("template release"))?;
+
+        TemplateManifest::parse(&artifacts.manifest.to_canonical_json()?)?;
+        if artifacts.manifest.manifest_sha256()? != release.manifest_sha256 {
+            return Err(ManagerError::InvalidInput(
+                "manifest does not match persisted release".into(),
+            ));
+        }
 
         // The artifact bytes must be exactly the immutable release recorded in
         // the database. Never publish independently supplied bytes under an
@@ -109,7 +128,7 @@ impl ReleaseService {
         }
 
         // Resolve the mapped Coder organization once.
-        let coder_org = organization_coder_org(adapter, organization_id).await?;
+        let coder_org = organization_coder_org(&self.pool, organization_id).await?;
 
         let mut published_roles = Vec::new();
         for role in &artifacts.manifest.required_roles {
@@ -217,11 +236,10 @@ impl ReleaseService {
                 "only an approved release can be promoted".into(),
             ));
         }
-        // Persist the organization binding, then publish roles.
+        self.publish_for_org(organization_id, release_id, adapter, artifacts)
+            .await?;
         self.repo
             .bind_org_release(organization_id, release_id)
-            .await?;
-        self.publish_for_org(organization_id, release_id, adapter, artifacts)
             .await?;
         Ok(())
     }
@@ -257,17 +275,26 @@ impl ReleaseService {
     }
 }
 
-/// Resolve the Coder organization id for an Openflows organization by ensuring
-/// it exists. For hosted provisioning the adapter owns the mapping; this helper
-/// keeps the service decoupled from the adapter's internals.
+/// Publication uses the durable mapping; only provisioning may create it.
 async fn organization_coder_org(
-    adapter: &dyn CoderAdapter,
+    pool: &PgPool,
     organization_id: OrganizationId,
 ) -> Result<coder_client::CoderOrganizationId, ManagerError> {
-    let internal_name = internal_org_name(organization_id);
-    adapter
-        .ensure_organization(&internal_name, &internal_name)
-        .await
+    let mapping: Option<Option<String>> =
+        sqlx::query_scalar("SELECT coder_organization_id FROM organizations WHERE id = $1")
+            .bind(organization_id.0)
+            .fetch_optional(pool)
+            .await?;
+    mapping
+        .flatten()
+        .filter(|id| !id.is_empty())
+        .map(coder_client::CoderOrganizationId::new)
+        .ok_or_else(|| {
+            ManagerError::api(
+                "CODER_ORG_UNMAPPED",
+                "organization requires provisioning reconciliation",
+            )
+        })
 }
 
 /// The deterministic internal Coder organization name derived from an

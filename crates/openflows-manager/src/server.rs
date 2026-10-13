@@ -45,9 +45,9 @@ impl ReadinessCheck for StoreReadiness {
 ///
 /// Constructed only when the Manager has a control-plane database (hosted mode,
 /// or local development with an explicit database). Repositories and services
-/// expose organization-scoped operations. In addition to the WP-01
+/// expose organization-scoped operations. In addition to the core
 /// repositories, this holds the human-authentication and organization services
-/// added by WP-02.
+/// added by the authorization layer.
 #[derive(Clone)]
 pub struct ManagerServices {
     pub db: Db,
@@ -74,11 +74,11 @@ pub struct ManagerServices {
     pub app_signer: std::sync::Arc<dyn crate::connections::AppSigner>,
     pub app_api: std::sync::Arc<dyn crate::connections::GithubAppApi>,
     pub webhook_secret: Option<Vec<u8>>,
-    // WP-04 runtime authentication and GitHub credential broker.
+    // Runtime authentication and GitHub credential broker.
     pub runtime_repo: crate::runtime::RuntimeRepository,
     pub runtime_credentials: crate::runtime::RuntimeCredentialService,
     pub broker: crate::runtime::CredentialBroker,
-    // WP-05 Coder adapter and template releases.
+    // Coder adapter and template releases.
     pub release_repo: crate::templates::repository::ReleaseRepository,
     pub release_service: crate::templates::service::ReleaseService,
     pub release_approvals: crate::releases::ReleaseApprovalService,
@@ -185,7 +185,7 @@ impl ManagerServices {
         )
     }
 
-    /// Build services with an explicit App signer and App API (WP-03). Used by
+    /// Build services with an explicit App signer and App API. Used by
     /// tests and by real configuration resolution.
     #[allow(clippy::too_many_arguments)]
     pub fn from_db_with_app(
@@ -302,7 +302,7 @@ impl ManagerServices {
             runtime_repo.clone(),
         );
 
-        // WP-04 runtime authentication and GitHub credential broker.
+        // Runtime authentication and GitHub credential broker.
         let runtime_credentials =
             crate::runtime::RuntimeCredentialService::new(runtime_repo.clone());
         let broker = crate::runtime::CredentialBroker::new(
@@ -313,7 +313,7 @@ impl ManagerServices {
             auth_config.clone(),
         );
 
-        // WP-05 template release infrastructure.
+        // Template release infrastructure.
         let release_repo = crate::templates::repository::ReleaseRepository::new(pool.clone());
         let release_service =
             crate::templates::service::ReleaseService::new(pool.clone(), release_repo.clone());
@@ -467,7 +467,7 @@ impl ManagerServices {
         // platform-selected release for this deployment. Customer-facing
         // promotion still requires the platform-operator approval service.
         self.release_repo
-            .set_release_status(release_id, "approved", None)
+            .approve_configured_release(release_id)
             .await?;
 
         let worker = crate::provisioning::OrgProvisionWorker::new(
@@ -839,7 +839,7 @@ pub async fn serve(
             None => std::future::pending().await,
         }
     };
-    // WP-05 durable organization-provisioning worker (startup recovery resumes
+    // Durable organization-provisioning worker (startup recovery resumes
     // unfinished org.provision operations). `None` in pure local/test mode.
     let org_provision = state
         .services()

@@ -1,6 +1,6 @@
 //! Durable organization-provisioning worker.
 //!
-//! Claims leased `org.provision` operations and runs the WP-05 readiness
+//! Claims leased `org.provision` operations and runs the organization readiness
 //! reconciliation. It keeps external Coder calls outside database
 //! transactions, persists progress step-by-step, fences stale lease holders,
 //! and never marks a suspended/deleted organization ready. A failed import,
@@ -109,14 +109,12 @@ impl OrgProvisionWorker {
     /// Claim and process up to 4 `org.provision` operations once.
     pub async fn run_once(&self) -> Result<(), ManagerError> {
         let owner = format!("org-provision-worker-{}", std::process::id());
-        let mut claimed = Vec::new();
         for _ in 0..4 {
-            match operations::claim_kind(&self.pool, &owner, Some("org.provision")).await? {
-                Some(guard) => claimed.push(guard),
-                None => break,
-            }
-        }
-        for guard in claimed {
+            let Some(guard) =
+                operations::claim_kind(&self.pool, &owner, Some("org.provision")).await?
+            else {
+                break;
+            };
             let process = self.provision(&guard);
             tokio::pin!(process);
             let result = loop {
@@ -143,7 +141,6 @@ impl OrgProvisionWorker {
     /// Execute one provisioning attempt for a leased operation.
     pub async fn provision(&self, guard: &LeaseGuard) -> Result<OrgProvisionOutcome, ManagerError> {
         let org_id = guard.organization_id;
-        let _ = guard;
 
         // 1. Re-read the organization. If it is no longer provisioning (e.g.
         //    suspended/deleted during a previous attempt), do not resurrect it.
@@ -209,6 +206,9 @@ impl OrgProvisionWorker {
         }
 
         // 3. Capabilities.
+        if !guard.set_step(step::VERIFY_CAPABILITIES).await? {
+            return Ok(OrgProvisionOutcome::StaleLease);
+        }
         let caps = self.adapter.verify_capabilities().await?;
         if !caps.version_ok || !caps.license_ok {
             let code = if !caps.version_ok {
@@ -222,17 +222,29 @@ impl OrgProvisionWorker {
         }
 
         // 4. Ensure the dedicated Coder organization and persist its mapping.
+        if !guard.set_step(step::ENSURE_ORG).await? {
+            return Ok(OrgProvisionOutcome::StaleLease);
+        }
         let internal_name = internal_org_name(org_id);
-        let coder_org = match self
-            .adapter
-            .ensure_organization(&internal_name, &internal_name)
-            .await
-        {
-            Ok(org) => org,
-            Err(e) => {
-                self.record_not_ready(org_id, err::CODER_ORG_FAILED, &e.to_string())
-                    .await?;
-                return Ok(OrgProvisionOutcome::NotReady(org_id, err::CODER_ORG_FAILED));
+        let mapped: Option<String> =
+            sqlx::query_scalar("SELECT coder_organization_id FROM organizations WHERE id = $1")
+                .bind(org_id.0)
+                .fetch_one(&self.pool)
+                .await?;
+        let coder_org = if let Some(id) = mapped {
+            coder_client::CoderOrganizationId::new(id)
+        } else {
+            match self
+                .adapter
+                .ensure_organization(&internal_name, &internal_name)
+                .await
+            {
+                Ok(org) => org,
+                Err(e) => {
+                    self.record_not_ready(org_id, err::CODER_ORG_FAILED, &e.to_string())
+                        .await?;
+                    return Ok(OrgProvisionOutcome::NotReady(org_id, err::CODER_ORG_FAILED));
+                }
             }
         };
         self.orgs
@@ -240,6 +252,18 @@ impl OrgProvisionWorker {
             .await?;
 
         // 5. Ensure the provisioner (heartbeat verified).
+        if !guard.set_step(step::ENSURE_PROVISIONER).await? {
+            return Ok(OrgProvisionOutcome::StaleLease);
+        }
+        self.release_repo
+            .upsert_provisioner(
+                crate::id::ProvisionerId::from_uuid(org_id.0),
+                org_id,
+                &format!("openflows-provisioner-{}", coder_org.0),
+                None,
+                "provisioning",
+            )
+            .await?;
         if let Err(e) = self
             .adapter
             .ensure_provisioner_ready(&coder_org, &self.provisioner_backend)
@@ -261,6 +285,9 @@ impl OrgProvisionWorker {
 
         // 6. Publish the required template roles. A failed or timed-out import
         //    prevents readiness.
+        if !guard.set_step(step::PUBLISH_TEMPLATES).await? {
+            return Ok(OrgProvisionOutcome::StaleLease);
+        }
         if let Err(e) = self
             .releases
             .publish_for_org(org_id, release_id, self.adapter.as_ref(), &artifacts)
@@ -272,6 +299,9 @@ impl OrgProvisionWorker {
         }
 
         // 7. Verify org-scoped model/chat capability.
+        if !guard.set_step(step::VERIFY_MODELS).await? {
+            return Ok(OrgProvisionOutcome::StaleLease);
+        }
         let models_ok = self
             .adapter
             .verify_org_models(&coder_org)
@@ -290,27 +320,52 @@ impl OrgProvisionWorker {
             ));
         }
 
-        // 8. Re-check the org is still provisioning before marking ready (the
-        //    org may have been suspended/deleted while we worked upstream).
-        if self.org_status(org_id).await? != Some("provisioning".to_string()) {
-            self.record_not_ready(org_id, err::ORG_STATE_CHANGED, "organization state changed")
+        if !guard.set_step(step::MARK_READY).await? {
+            return Ok(OrgProvisionOutcome::StaleLease);
+        }
+        // Readiness, release selection and operation completion commit together.
+        // Lock the organization first so suspension/deletion cannot race this write.
+        let mut tx = self.pool.begin().await?;
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM organizations WHERE id = $1 FOR UPDATE")
+                .bind(org_id.0)
+                .fetch_one(&mut *tx)
                 .await?;
+        if status != "provisioning" {
             return Ok(OrgProvisionOutcome::NotReady(
                 org_id,
                 err::ORG_STATE_CHANGED,
             ));
         }
-
-        // 9. Mark ready.
-        self.orgs
-            .set_status(crate::db::tx::OrgScope::new(org_id), org_id, "ready")
-            .await?;
-        self.orgs
-            .set_model_capability_ok(crate::db::tx::OrgScope::new(org_id), org_id, true)
-            .await?;
-        self.release_repo
-            .bind_org_release(org_id, release_id)
-            .await?;
+        if !guard.lock_in_tx(&mut tx).await? {
+            return Ok(OrgProvisionOutcome::StaleLease);
+        }
+        let approved: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM template_releases WHERE id = $1 AND status = 'approved' FOR SHARE",
+        )
+        .bind(release_id.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if approved.is_none() {
+            return Ok(OrgProvisionOutcome::NotReady(
+                org_id,
+                err::RELEASE_NOT_CONFIGURED,
+            ));
+        }
+        sqlx::query("UPDATE organizations SET status = 'ready', model_capability_ok = true,
+            provisioner_status = 'ready', last_readiness_error = NULL, updated_at = now() WHERE id = $1")
+            .bind(org_id.0).execute(&mut *tx).await?;
+        ReleaseRepository::bind_org_release_in_tx(&mut tx, org_id, release_id).await?;
+        if !guard
+            .complete_in_tx(
+                &mut tx,
+                serde_json::json!({"status":"ready", "organization_id":org_id.to_string()}),
+            )
+            .await?
+        {
+            return Ok(OrgProvisionOutcome::StaleLease);
+        }
+        tx.commit().await?;
         tracing::info!(org_id = %org_id.0, "organization marked ready");
         Ok(OrgProvisionOutcome::Ready(org_id))
     }
@@ -321,18 +376,13 @@ impl OrgProvisionWorker {
         outcome: Result<OrgProvisionOutcome, ManagerError>,
     ) -> Result<(), ManagerError> {
         match outcome {
-            Ok(OrgProvisionOutcome::Ready(org_id)) => {
-                let ok = guard
-                    .complete(Some(serde_json::json!({"status": "ready", "organization_id": org_id.to_string()})))
-                    .await?;
-                if !ok {
-                    tracing::warn!("org provision worker lost its lease before completing");
-                }
-            }
+            Ok(OrgProvisionOutcome::Ready(_)) => {} // Completed atomically in provision().
             Ok(OrgProvisionOutcome::NotReady(org_id, code)) => {
                 // Not-ready is a retryable failure: prerequisites may later be
                 // met (e.g. provisioner or model becomes available).
-                let ok = guard.fail(true, Some(code)).await?;
+                let ok = guard
+                    .fail(code != err::ORG_STATE_CHANGED, Some(code))
+                    .await?;
                 if ok {
                     self.orgs
                         .set_last_readiness_error(

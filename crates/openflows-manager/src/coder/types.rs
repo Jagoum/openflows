@@ -1,4 +1,4 @@
-//! Types for the WP-05 Coder adapter.
+//! Types for the Coder adapter.
 
 /// The result of verifying a Coder deployment's capabilities during
 /// organization readiness reconciliation. All three must hold for an

@@ -1,4 +1,4 @@
-//! WP-04 runtime authentication and GitHub credential broker tests.
+//! Runtime authentication and GitHub credential broker tests.
 //!
 //! Uses HTTP fixtures (a controllable `GithubAppApi` implementation) and
 //! isolated PostgreSQL databases. Covers runtime authentication, restricted

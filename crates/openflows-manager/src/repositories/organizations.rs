@@ -233,7 +233,7 @@ impl OrganizationsRepository {
     }
 
     /// Record whether the organization's org-scoped model/Agents-chat capability
-    /// was verified (WP-05 readiness).
+    /// was verified for organization readiness.
     pub async fn set_model_capability_ok(
         &self,
         scope: OrgScope,

@@ -2,7 +2,7 @@
 //!
 //! All Manager settings are defined here and loaded once at startup, following
 //! the same envconfig pattern as the `config` crate. This module owns the
-//! deployment mode (`local` vs `hosted`) and enforces the WP-01 requirement
+//! deployment mode (`local` vs `hosted`) and enforces the manager requirements
 //! that hosted configuration failures must not silently fall back to local
 //! behavior: when hosted mode is selected, the required hosted settings must
 //! be present or startup fails.
@@ -90,7 +90,7 @@ pub const MASTER_KEY_BYTES: usize = 32;
 pub const DEFAULT_WEBHOOK_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// WP-05: Coder adapter and template release configuration.
+// Coder adapter and template release configuration.
 // ---------------------------------------------------------------------------
 /// The Coder server URL the manager's platform adapter talks to.
 pub const CODER_URL_ENV: &str = "CODER_URL";
@@ -289,7 +289,7 @@ fn webhook_body_limit_from_env() -> usize {
 }
 
 /// Centralized GitHub App configuration for the installation connection
-/// lifecycle (WP-03): App JWT signing, installation metadata lookups, and
+/// lifecycle: App JWT signing, installation metadata lookups, and
 /// webhook signature verification. These reference secrets through the secret
 /// provider; the private key and webhook secret are never plaintext config.
 #[derive(Debug, Clone)]
@@ -341,7 +341,7 @@ pub struct ManagerConfig {
     pub http_addr: String,
     /// Centralized GitHub user-authorization settings.
     pub auth: AuthConfig,
-    /// Centralized GitHub App installation-connection settings (WP-03).
+    /// Centralized GitHub App installation-connection settings.
     pub github_app: GithubAppConfig,
     /// Secret-provider reference for the GitHub App client secret (OAuth
     /// exchange). Required in hosted mode.
@@ -349,7 +349,7 @@ pub struct ManagerConfig {
     /// Secret-provider reference for the envelope master key. Required in
     /// hosted mode; local/tests use the dev key when absent.
     pub crypto_master_key_ref: Option<String>,
-    /// Coder server URL the platform adapter uses (WP-05).
+    /// Coder server URL the platform adapter uses.
     pub coder_url: Option<String>,
     /// Secret-provider reference for the platform-only Coder operator token.
     pub coder_operator_token_ref: Option<String>,
@@ -385,7 +385,7 @@ impl ManagerConfig {
             .ok()
             .filter(|v| !v.trim().is_empty());
 
-        // WP-05 Coder adapter configuration.
+        // Coder adapter configuration.
         let coder_url = std::env::var(CODER_URL_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty());

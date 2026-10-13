@@ -1,4 +1,4 @@
-//! WP-05 durable organization provisioning and readiness reconciliation.
+//! Durable organization provisioning and readiness reconciliation.
 //!
 //! [`OrgProvisionWorker`] claims `org.provision` operations and executes the
 //! readiness steps (capabilities, Coder organization, provisioner, template

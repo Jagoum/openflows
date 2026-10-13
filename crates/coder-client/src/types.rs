@@ -33,7 +33,7 @@ pub struct CoderUser {
 
 /// A typed Coder organization identifier (opaque upstream string).
 ///
-/// WP-05 requires hosted Coder operations to carry an explicit, typed
+/// Hosted Coder operations must carry an explicit, typed
 /// organization id and never fall back to the default organization or global
 /// administrator. These newtypes make that scoping explicit at the type level.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -219,11 +219,11 @@ pub struct CoderProvisionerDaemon {
     #[serde(default)]
     pub id: String,
     #[serde(default, rename = "key_name")]
-    pub key_name: String,
+    pub key_name: Option<String>,
     #[serde(default)]
-    pub status: String,
+    pub status: Option<String>,
     #[serde(default, rename = "last_seen_at")]
-    pub last_seen_at: String,
+    pub last_seen_at: Option<String>,
     #[serde(default)]
     pub name: String,
 }
@@ -239,7 +239,7 @@ pub struct CoderTemplateCreated {
 
 /// The request body for `POST /api/v2/organizations/{org}/templates/{template}/versions`.
 ///
-/// WP-05 requires explicit organization, template, and a deterministic version
+/// Hosted operations require explicit organization, template, and a deterministic version
 /// name so publication is idempotent and never inferred from timestamps.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateTemplateVersionRequest {
@@ -311,7 +311,7 @@ pub struct CreateWorkspaceRequest {
 
 /// Request to create a workspace with explicit organization/owner/version.
 ///
-/// WP-05 hosted paths require `organization_id`, `template_version_id`, and an
+/// Hosted paths require `organization_id`, `template_version_id`, and an
 /// explicit owner; they never fall back to the default organization or current
 /// user.
 #[derive(Debug, Clone, Serialize)]

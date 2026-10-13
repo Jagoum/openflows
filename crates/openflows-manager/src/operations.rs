@@ -188,6 +188,46 @@ pub async fn claim_kind(
 }
 
 impl LeaseGuard {
+    /// Lock the lease row inside a resource transaction. Callers must keep
+    /// this transaction short and never perform external calls while holding it.
+    pub async fn lock_in_tx(&self, tx: &mut PgConnection) -> Result<bool, ManagerError> {
+        let id: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM operations WHERE id = $1 AND organization_id = $2
+             AND lease_owner = $3 AND lease_token = $4 AND state = 'running'
+             AND lease_expires_at > clock_timestamp() FOR UPDATE",
+        )
+        .bind(self.operation_id.0)
+        .bind(self.organization_id.0)
+        .bind(&self.owner)
+        .bind(self.token)
+        .fetch_optional(tx)
+        .await?;
+        Ok(id.is_some())
+    }
+
+    /// Complete in the transaction that persists the final resource state.
+    pub async fn complete_in_tx(
+        &self,
+        tx: &mut PgConnection,
+        result: Value,
+    ) -> Result<bool, ManagerError> {
+        let affected = sqlx::query(
+            "UPDATE operations SET state = 'succeeded',
+            lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+            sanitized_result = $1, error_code = NULL, retry_at = NULL, updated_at = now()
+            WHERE id = $2 AND lease_owner = $3 AND lease_token = $4
+            AND state = 'running' AND lease_expires_at > clock_timestamp()",
+        )
+        .bind(result)
+        .bind(self.operation_id.0)
+        .bind(&self.owner)
+        .bind(self.token)
+        .execute(tx)
+        .await?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
     /// The worker that currently owns this lease.
     pub fn owner(&self) -> &str {
         &self.owner

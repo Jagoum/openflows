@@ -804,7 +804,7 @@ impl CoderClient {
         }
     }
 
-    /// Create a Coder organization. WP-05 hosted provisioning uses a
+    /// Create a Coder organization. Hosted provisioning uses a
     /// deterministic internal name derived from the Openflows organization id.
     pub async fn create_organization(
         &self,

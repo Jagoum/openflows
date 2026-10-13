@@ -5,7 +5,7 @@
 //! browser/CLI sessions and from human API credentials. A credential is stored
 //! only as a cryptographic hash; the raw secret is returned to the trusted
 //! caller exactly once at issuance. Issuance, rotation, and revocation are
-//! internal services — the WP-05/06 provisioning APIs that will call them are
+//! internal services — the provisioning APIs that call them are
 //! not yet available, so there is deliberately no unauthenticated bootstrap
 //! endpoint and no shared global runtime password.
 
@@ -34,7 +34,7 @@ impl RuntimeCredentialService {
 
     /// Issue a fresh runtime credential for a workspace. This is an internal
     /// provisioning boundary: it is not exposed as an unauthenticated endpoint
-    /// and must only be called by trusted provisioning/manager code (WP-05/06).
+    /// and must only be called by trusted provisioning/manager code.
     /// The raw secret is returned exactly once; only its hash is persisted.
     pub async fn issue_for_workspace(
         &self,

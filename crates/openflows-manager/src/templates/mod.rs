@@ -1,4 +1,4 @@
-//! WP-05 template release packaging, validation, persistence, and publication.
+//! Template release packaging, validation, persistence, and publication.
 //!
 //! A release is a set of five deterministic role archives plus an immutable,
 //! versioned manifest whose digest is the release identity (never a mutable

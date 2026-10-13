@@ -1,6 +1,6 @@
-//! WP-05 acceptance tests: Coder adapter and template releases.
+//! Provisioning acceptance tests: Coder adapter and template releases.
 //!
-//! These exercise the four WP-05 acceptance criteria plus the supporting
+//! These exercise the provisioning acceptance criteria plus the supporting
 //! readiness and security behaviors against an isolated PostgreSQL database and
 //! a deterministic in-memory Coder adapter:
 //!
@@ -14,7 +14,7 @@
 //! customer users cannot approve/promote releases, and secrets do not appear
 //! in persisted operational records.
 //!
-//! Run with: `cargo test --test wp05_provisioning -- --ignored`
+//! Run with: `cargo test --test provisioning -- --ignored`
 
 mod common;
 
@@ -33,6 +33,89 @@ use openflows_manager::templates::repository::ReleaseRepository;
 use openflows_manager::templates::service::{internal_org_name, ReleaseArtifacts, ReleaseService};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// A deterministic barrier around one external call, so the tests can inspect
+/// queued work and invalidate authorization while provisioning is in flight.
+struct PausedAdapter {
+    inner: Arc<MockCoderAdapter>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    at_models: bool,
+}
+
+#[async_trait::async_trait]
+impl openflows_manager::coder::CoderAdapter for PausedAdapter {
+    async fn verify_capabilities(
+        &self,
+    ) -> Result<
+        openflows_manager::coder::types::CoderCapabilities,
+        openflows_manager::error::ManagerError,
+    > {
+        if !self.at_models {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.verify_capabilities().await
+    }
+    async fn ensure_organization(
+        &self,
+        name: &str,
+        display: &str,
+    ) -> Result<coder_client::CoderOrganizationId, openflows_manager::error::ManagerError> {
+        self.inner.ensure_organization(name, display).await
+    }
+    async fn ensure_provisioner_ready(
+        &self,
+        org: &coder_client::CoderOrganizationId,
+        backend: &str,
+    ) -> Result<(), openflows_manager::error::ManagerError> {
+        self.inner.ensure_provisioner_ready(org, backend).await
+    }
+    async fn ensure_template_version(
+        &self,
+        org: &coder_client::CoderOrganizationId,
+        name: &str,
+        version: &str,
+        archive: &[u8],
+    ) -> Result<
+        openflows_manager::coder::TemplatePublicationResult,
+        openflows_manager::error::ManagerError,
+    > {
+        self.inner
+            .ensure_template_version(org, name, version, archive)
+            .await
+    }
+    async fn verify_org_models(
+        &self,
+        org: &coder_client::CoderOrganizationId,
+    ) -> Result<bool, openflows_manager::error::ManagerError> {
+        if self.at_models {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.verify_org_models(org).await
+    }
+}
+
+fn pause_worker(
+    h: &WorkerHarness,
+    at_models: bool,
+) -> (
+    OrgProvisionWorker,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut worker = h.worker.clone();
+    worker.adapter = Arc::new(PausedAdapter {
+        inner: h.adapter.clone(),
+        entered: entered.clone(),
+        release: release.clone(),
+        at_models,
+    });
+    (worker, entered, release)
+}
 
 /// Build deterministic release artifacts (manifest + role archives) in a temp
 /// directory.
@@ -405,6 +488,29 @@ async fn version_pins_survive_republication() {
     );
 
     let pinned = published_version_id(&h.pool, org, "nexus").await.unwrap();
+    let template = published_template_id(&h.pool, org, "nexus").await.unwrap();
+    let mut next = (*h.artifacts).clone();
+    next.manifest.release = "2026.10.1".into();
+    let (next_id, _) = h
+        .releases
+        .import_release(next.clone(), "test")
+        .await
+        .unwrap();
+    h.releases
+        .publish_for_org(org, next_id, h.adapter.as_ref(), &next)
+        .await
+        .unwrap();
+    let next_version = h
+        .releases
+        .repo
+        .get_org_template_version(org, next_id, Role::Nexus)
+        .await
+        .unwrap()
+        .unwrap()
+        .coder_version_id
+        .unwrap();
+    assert_ne!(pinned, next_version);
+    h.adapter.set_active_version(&template, &next_version);
 
     // Republication (e.g. after a restart or a pointer change upstream) must
     // rediscover the exact same version by stable identity rather than moving
@@ -414,14 +520,22 @@ async fn version_pins_survive_republication() {
         .await
         .unwrap();
     assert_eq!(
-        published_version_id(&h.pool, org, "nexus").await.unwrap(),
+        h.releases
+            .repo
+            .get_org_template_version(org, h.release_id, Role::Nexus)
+            .await
+            .unwrap()
+            .unwrap()
+            .coder_version_id
+            .unwrap(),
         pinned
     );
-    // And it converged (Reconciled, not Created): still exactly one version.
+    assert_eq!(h.adapter.active_version(&template), Some(next_version));
+    // Republishing the old release neither changes the active pointer nor appends a version.
     assert_eq!(
         h.adapter
             .version_count(&coder_org_for(org), "openflows-nexus"),
-        1
+        2
     );
 }
 
@@ -640,6 +754,11 @@ async fn stale_lease_holder_cannot_finalize_operation() {
     );
     let failed = guard_a.fail(false, Some("X")).await.unwrap();
     assert!(!failed, "a stale lease holder must not fail the operation");
+    assert_eq!(
+        h.worker.provision(&guard_a).await.unwrap(),
+        openflows_manager::provisioning::OrgProvisionOutcome::StaleLease
+    );
+    assert_eq!(org_status(&h.pool, org).await, "provisioning");
 
     let state: String = sqlx::query_scalar("SELECT state FROM operations WHERE organization_id=$1")
         .bind(org.0)
@@ -650,4 +769,322 @@ async fn stale_lease_holder_cannot_finalize_operation() {
         state, "running",
         "operation must remain running for the real holder"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn concurrent_release_imports_converge_and_version_conflicts_fail() {
+    let h = harness(MockCoderConfig::default()).await;
+    let mut next = (*h.artifacts).clone();
+    next.manifest.release = "concurrent-release".into();
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let releases = h.releases.clone();
+        let artifacts = next.clone();
+        tasks.push(tokio::spawn(async move {
+            releases.import_release(artifacts, "test").await.unwrap().0
+        }));
+    }
+    let mut ids = Vec::new();
+    for task in tasks {
+        ids.push(task.await.unwrap());
+    }
+    assert!(ids.iter().all(|id| *id == ids[0]));
+    next.manifest
+        .roles
+        .get_mut(&Role::Nexus)
+        .unwrap()
+        .parameter_schema_version = 2;
+    assert!(h.releases.import_release(next, "test").await.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn configured_release_restart_preserves_retirement_and_approval_metadata() {
+    let h = harness(MockCoderConfig::default()).await;
+    let repo = &h.releases.repo;
+    let operator = uuid::Uuid::new_v4();
+    repo.set_release_status(h.release_id, "approved", Some(operator))
+        .await
+        .unwrap();
+    let approved_at = repo
+        .get_release(h.release_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .0
+        .approved_at;
+    repo.approve_configured_release(h.release_id).await.unwrap();
+    assert_eq!(
+        repo.get_release(h.release_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .approved_at,
+        approved_at
+    );
+    repo.set_release_status(h.release_id, "retired", None)
+        .await
+        .unwrap();
+    let (same_id, _) = h
+        .releases
+        .import_release((*h.artifacts).clone(), "test")
+        .await
+        .unwrap();
+    repo.approve_configured_release(same_id).await.unwrap();
+    let row = repo.get_release(same_id).await.unwrap().unwrap().0;
+    assert_eq!(row.status, "retired");
+    assert_eq!(row.approved_by, Some(operator));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn promotion_validates_manifest_and_only_switches_current_release_after_success() {
+    let h = harness(MockCoderConfig::default()).await;
+    let owner = insert_user(&h.pool, "owner").await;
+    let (org, guard) = provision_org(&h.pool, "promote", owner).await;
+    h.worker.provision(&guard).await.unwrap();
+    let mut next = (*h.artifacts).clone();
+    next.manifest.release = "next".into();
+    let (next_id, _) = h
+        .releases
+        .import_release(next.clone(), "test")
+        .await
+        .unwrap();
+    h.releases
+        .repo
+        .set_release_status(next_id, "approved", None)
+        .await
+        .unwrap();
+    // Valid archive bytes with a different manifest must be rejected.
+    assert!(h
+        .releases
+        .promote_to_org(org, next_id, h.adapter.as_ref(), &h.artifacts)
+        .await
+        .is_err());
+    assert_eq!(
+        h.releases.repo.get_org_binding(org).await.unwrap(),
+        Some(h.release_id)
+    );
+    // Failed imports must also preserve the old current binding.
+    let failed = MockCoderAdapter::new(MockCoderConfig {
+        import_status_override: Some("failed".into()),
+        ..Default::default()
+    });
+    assert!(h
+        .releases
+        .promote_to_org(org, next_id, &failed, &next)
+        .await
+        .is_err());
+    assert_eq!(
+        h.releases.repo.get_org_binding(org).await.unwrap(),
+        Some(h.release_id)
+    );
+    h.releases
+        .promote_to_org(org, next_id, h.adapter.as_ref(), &next)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.releases.repo.get_org_binding(org).await.unwrap(),
+        Some(next_id)
+    );
+    let history: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM organization_release_bindings WHERE organization_id = $1",
+    )
+    .bind(org.0)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(history, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn publication_uses_persisted_mapping_and_rejects_unmapped_organizations() {
+    let h = harness(MockCoderConfig::default()).await;
+    let owner = insert_user(&h.pool, "owner").await;
+    let (org, _) = provision_org(&h.pool, "mapped", owner).await;
+    assert!(h
+        .releases
+        .publish_for_org(org, h.release_id, h.adapter.as_ref(), &h.artifacts)
+        .await
+        .is_err());
+    h.orgs
+        .set_coder_organization_id(OrgScope::new(org), org, "saved-coder-id")
+        .await
+        .unwrap();
+    h.releases
+        .publish_for_org(org, h.release_id, h.adapter.as_ref(), &h.artifacts)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.adapter.version_count(
+            &coder_client::CoderOrganizationId::new("saved-coder-id"),
+            "openflows-nexus"
+        ),
+        1
+    );
+    assert_eq!(
+        h.adapter
+            .version_count(&coder_org_for(org), "openflows-nexus"),
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn readiness_completion_rolls_back_and_retry_clears_error() {
+    let h = harness(MockCoderConfig::default()).await;
+    let owner = insert_user(&h.pool, "owner").await;
+    let (org, guard) = provision_org(&h.pool, "atomic", owner).await;
+    h.orgs
+        .set_last_readiness_error(OrgScope::new(org), org, Some("OLD_ERROR"))
+        .await
+        .unwrap();
+    // Reject the final binding after the readiness UPDATE, proving all final
+    // writes roll back together when the database fails halfway through.
+    sqlx::query("ALTER TABLE organization_current_releases ADD CONSTRAINT reject_test_binding CHECK (false)")
+        .execute(&h.pool).await.unwrap();
+    assert!(h.worker.provision(&guard).await.is_err());
+    assert_eq!(org_status(&h.pool, org).await, "provisioning");
+    assert_eq!(
+        readiness_error(&h.pool, org).await.as_deref(),
+        Some("OLD_ERROR")
+    );
+    assert_eq!(
+        operations::get_scoped(&h.pool, org, guard.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "running"
+    );
+    assert!(h
+        .releases
+        .repo
+        .get_org_binding(org)
+        .await
+        .unwrap()
+        .is_none());
+    sqlx::query("ALTER TABLE organization_current_releases DROP CONSTRAINT reject_test_binding")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    h.worker.provision(&guard).await.unwrap();
+    assert_eq!(org_status(&h.pool, org).await, "ready");
+    assert_eq!(readiness_error(&h.pool, org).await, None);
+    let operation = operations::get_scoped(&h.pool, org, guard.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.state, "succeeded");
+    assert_eq!(operation.current_step.as_deref(), Some("mark_ready"));
+    let provisioner = h.releases.repo.get_provisioner(org).await.unwrap().unwrap();
+    assert_eq!(provisioner.status, "ready");
+    assert!(provisioner.last_heartbeat_at.is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn unavailable_provisioner_is_recorded_without_fabricated_heartbeat() {
+    let h = harness(MockCoderConfig {
+        provisioner_ready: false,
+        ..Default::default()
+    })
+    .await;
+    let owner = insert_user(&h.pool, "owner").await;
+    let (org, guard) = provision_org(&h.pool, "unavailable", owner).await;
+    h.worker.provision(&guard).await.unwrap();
+    let provisioner = h.releases.repo.get_provisioner(org).await.unwrap().unwrap();
+    assert_eq!(provisioner.status, "unavailable");
+    assert!(provisioner.last_heartbeat_at.is_none());
+    assert_eq!(
+        operations::get_scoped(&h.pool, org, guard.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_step
+            .as_deref(),
+        Some("ensure_provisioner")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn worker_claims_only_the_operation_it_can_process_now() {
+    let h = harness(MockCoderConfig::default()).await;
+    let owner = insert_user(&h.pool, "owner").await;
+    let (first, _) = provision_org(&h.pool, "first", owner).await;
+    let (second, _) = provision_org(&h.pool, "second", owner).await;
+    sqlx::query("UPDATE operations SET state = 'queued', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, attempt_count = 0")
+        .execute(&h.pool).await.unwrap();
+    let (worker, entered, _) = pause_worker(&h, false);
+    let task = tokio::spawn(async move { worker.run_once().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    let rows: Vec<(uuid::Uuid, String, i32, Option<String>)> = sqlx::query_as("SELECT organization_id, state, attempt_count, current_step FROM operations ORDER BY created_at")
+        .fetch_all(&h.pool).await.unwrap();
+    assert_eq!(
+        rows[0],
+        (
+            first.0,
+            "running".into(),
+            1,
+            Some("verify_capabilities".into())
+        )
+    );
+    assert_eq!(rows[1], (second.0, "queued".into(), 0, None));
+    let other = operations::claim_kind(&h.pool, "other-worker", Some("org.provision"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(other.organization_id, second);
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn suspension_or_lost_lease_during_final_external_call_prevents_readiness() {
+    for suspend in [true, false] {
+        let h = harness(MockCoderConfig::default()).await;
+        let owner = insert_user(&h.pool, "owner").await;
+        let (org, guard) = provision_org(&h.pool, "inflight", owner).await;
+        let (worker, entered, release) = pause_worker(&h, true);
+        let task = tokio::spawn(async move { worker.provision(&guard).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        if suspend {
+            h.orgs
+                .set_status(OrgScope::new(org), org, "suspended")
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("UPDATE operations SET lease_token = NULL WHERE organization_id = $1")
+                .bind(org.0)
+                .execute(&h.pool)
+                .await
+                .unwrap();
+        }
+        release.notify_one();
+        let outcome = task.await.unwrap().unwrap();
+        assert!(!matches!(
+            outcome,
+            openflows_manager::provisioning::OrgProvisionOutcome::Ready(_)
+        ));
+        assert_eq!(
+            org_status(&h.pool, org).await,
+            if suspend { "suspended" } else { "provisioning" }
+        );
+        assert!(h
+            .releases
+            .repo
+            .get_org_binding(org)
+            .await
+            .unwrap()
+            .is_none());
+    }
 }

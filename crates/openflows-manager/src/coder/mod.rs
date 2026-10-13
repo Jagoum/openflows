@@ -1,4 +1,4 @@
-//! WP-05 Coder adapter layer.
+//! Coder adapter layer.
 //!
 //! Provides a testable [`CoderAdapter`] trait and a real implementation backed
 //! by `coder-client`. Every hosted operation is explicitly scoped to a Coder
