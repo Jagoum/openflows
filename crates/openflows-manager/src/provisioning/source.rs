@@ -21,6 +21,7 @@ use futures_util::StreamExt;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use url::Url;
 
 use super::release_provider::{ReleaseProvider, ReleaseProviderError};
 
@@ -175,10 +176,7 @@ impl HostedReleaseSource {
     }
 
     async fn fetch_and_verify(&self, reference: &str) -> Result<ResolvedRelease, ManagerError> {
-        let info_url = format!(
-            "{}/repos/{}/releases/tags/{}",
-            self.config.api_base, self.config.repository, self.config.tag
-        );
+        let info_url = github_release_metadata_url(&self.config)?;
         let info_bytes = self
             .fetcher
             .get_bytes(&info_url, self.config.max_download_bytes, self.timeout())
@@ -278,6 +276,21 @@ impl HostedReleaseSource {
     fn timeout(&self) -> Duration {
         Duration::from_secs(self.config.timeout_secs)
     }
+}
+
+fn github_release_metadata_url(config: &HostedReleaseConfig) -> Result<String, ManagerError> {
+    let (owner, repository) = config.repository.split_once('/').ok_or_else(|| {
+        ManagerError::Config("GitHub template repository must be owner/repository".into())
+    })?;
+    let mut url = Url::parse(&config.api_base)
+        .map_err(|e| ManagerError::Config(format!("invalid GitHub API base URL: {e}")))?;
+    {
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            ManagerError::Config("GitHub API base URL cannot be a cannot-be-a-base URL".into())
+        })?;
+        segments.extend(["repos", owner, repository, "releases", "tags", &config.tag]);
+    }
+    Ok(url.into())
 }
 
 /// Reassemble validated artifacts from a cached manifest and archive bytes.
@@ -417,6 +430,8 @@ pub struct ReleaseCache {
 }
 
 const CACHE_ENTRY_MARKER: &str = ".openflows-release-entry";
+const CACHE_TEMP_PREFIX: &str = ".tmp-";
+const CACHE_TEMP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl ReleaseCache {
     /// Build a cache rooted at `dir` with the given bounds.
@@ -442,6 +457,7 @@ impl ReleaseCache {
 
     /// Load a complete verified release entry for `digest`, if present.
     pub fn load(&self, digest: &str) -> std::io::Result<Option<CachedRelease>> {
+        self.cleanup_temporary_entries()?;
         let entry_dir = self.entry_dir(digest);
         if !entry_dir.join(CACHE_ENTRY_MARKER).is_file() {
             return Ok(None);
@@ -521,17 +537,26 @@ impl ReleaseCache {
             return Err(error);
         }
         let entry_dir = self.entry_dir(digest);
-        if entry_dir.exists() {
-            if !entry_dir.join(CACHE_ENTRY_MARKER).is_file() {
-                let _ = std::fs::remove_dir_all(&temp_dir);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "cache entry path is occupied by an unmanaged directory",
-                ));
+        match std::fs::rename(&temp_dir, &entry_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if self.load(digest)?.is_some() {
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                } else if entry_dir.join(CACHE_ENTRY_MARKER).is_file() {
+                    std::fs::remove_dir_all(&entry_dir)?;
+                    std::fs::rename(&temp_dir, &entry_dir)?;
+                } else {
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "cache entry path is occupied by an unmanaged directory",
+                    ));
+                }
             }
-            let _ = std::fs::remove_dir_all(&temp_dir);
-        } else {
-            std::fs::rename(&temp_dir, &entry_dir)?;
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                return Err(error);
+            }
         }
         self.enforce_bounds(digest)
     }
@@ -571,6 +596,13 @@ impl ReleaseCache {
         }
         for entry in std::fs::read_dir(entries_dir)? {
             let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(CACHE_TEMP_PREFIX)
+            {
+                continue;
+            }
             if !entry.path().is_dir() || !entry.path().join(CACHE_ENTRY_MARKER).is_file() {
                 continue;
             }
@@ -604,6 +636,34 @@ impl ReleaseCache {
         }
         Ok(())
     }
+
+    fn cleanup_temporary_entries(&self) -> std::io::Result<()> {
+        let entries_dir = self.entries_dir();
+        if !entries_dir.is_dir() {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now();
+        for entry in std::fs::read_dir(entries_dir)? {
+            let entry = entry?;
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(CACHE_TEMP_PREFIX)
+            {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > CACHE_TEMP_TTL);
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A cached, previously verified release.
@@ -629,6 +689,7 @@ fn dir_size(dir: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::templates::packaging::{build_deterministic_archive, RoleManifestEntry};
+    use axum::{extract::Request, http::StatusCode, response::IntoResponse, routing::get, Router};
     use std::collections::BTreeMap;
 
     // -----------------------------------------------------------------------
@@ -778,6 +839,70 @@ mod tests {
 
     fn release_dir(config: &HostedReleaseConfig) -> String {
         format!("{}/download", config.api_base)
+    }
+
+    async fn spawn_http_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[test]
+    fn metadata_url_encodes_tag_as_a_path_segment() {
+        let mut config = hosted_config("a".repeat(64), PathBuf::from("/tmp/cache"));
+        config.tag = "release#2026.10.0".into();
+        let url = github_release_metadata_url(&config).unwrap();
+        assert!(url.ends_with("/releases/tags/release%232026.10.0"));
+        assert!(Url::parse(&url).unwrap().fragment().is_none());
+    }
+
+    #[tokio::test]
+    async fn real_fetcher_enforces_timeout_size_and_bearer_auth() {
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    "slow"
+                }),
+            )
+            .route("/large", get(|| async { vec![b'x'; 32] }))
+            .route(
+                "/private",
+                get(|request: Request| async move {
+                    if request.headers().get("authorization")
+                        == Some(&axum::http::HeaderValue::from_static("Bearer secret"))
+                    {
+                        StatusCode::OK.into_response()
+                    } else {
+                        StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }),
+            );
+        let (base, server) = spawn_http_server(app).await;
+        let fetcher = ReqwestReleaseFetcher::new(Some("secret".into()));
+
+        let timeout_error = fetcher
+            .get_bytes(&format!("{base}/slow"), 1024, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(timeout_error.to_string().contains("failed"));
+
+        let size_error = fetcher
+            .get_bytes(&format!("{base}/large"), 16, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(size_error.to_string().contains("exceeds"));
+
+        let authorized = fetcher
+            .get_bytes(&format!("{base}/private"), 1024, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(authorized.is_empty());
+        server.abort();
     }
 
     // -----------------------------------------------------------------------

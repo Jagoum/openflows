@@ -268,6 +268,7 @@ impl HostedReleaseConfig {
             .ok_or_else(|| {
                 format!("hosted release source requires {TEMPLATE_MANIFEST_SHA256_ENV}")
             })?;
+        let manifest_sha256 = manifest_sha256.to_ascii_lowercase();
         if manifest_sha256.len() != 64 || !manifest_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!(
                 "{TEMPLATE_MANIFEST_SHA256_ENV} must be a 64-character SHA-256 hex digest"
@@ -1011,6 +1012,12 @@ mod tests {
                 assert_eq!(h.tag, "2026.10.0");
                 assert_eq!(h.manifest_sha256.len(), 64);
             }
+            other => panic!("expected github source, got {other:?}"),
+        }
+
+        std::env::set_var(TEMPLATE_MANIFEST_SHA256_ENV, "A".repeat(64));
+        match ReleaseSourceConfig::from_env().unwrap() {
+            ReleaseSourceConfig::Github(h) => assert_eq!(h.manifest_sha256, "a".repeat(64)),
             other => panic!("expected github source, got {other:?}"),
         }
     }
