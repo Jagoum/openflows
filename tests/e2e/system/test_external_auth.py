@@ -1,14 +1,4 @@
-# Tests the disposable OAuth provider through its actual HTTP interface.
-# Runs a local fixture server in a fresh temporary directory for each test.
-# Starts a device authorization request using the configured disposable client.
-# Checks that token exchange is blocked while human approval is pending.
-# Checks that an unrelated credential cannot approve the device.
-# Approves the pending device using the explicit disposable operator credential.
-# Confirms that an approved device can obtain the expected disposable token.
-# Confirms that the same device code cannot be exchanged a second time.
-# Uses only Python's standard library and the existing fixture test helpers.
-# Temporary servers and files are cleaned up by the shared test fixture lifecycle.
-# This verifies the local contract; the production-bootstrap test exercises Coder.
+# HTTP contract tests for device approval, token exchange, and replay rejection.
 
 """The disposable OAuth provider must require an explicit human device approval."""
 import unittest

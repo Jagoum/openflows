@@ -1,15 +1,3 @@
-# Drives the production-bootstrap scenario through public HTTP and CLI interfaces.
-# Creates the first account only on a fresh disposable Coder server.
-# Links that account through Coder's normal device-flow API after approval.
-# Configures a local model provider through Coder's actual provider API.
-# Runs openflows tenant add with a fleet of one FORGE and SENTINEL pair.
-# That Rust command uploads all five bundled production Terraform templates.
-# Checks the provisioned Nexus workspace and its real controller health endpoint.
-# Creates a real Coder chat that executes a shell command inside the workspace.
-# Inspects actual tool results instead of accepting the model's completion claim.
-# Keeps logs and evidence before requesting workspace deletion through Coder.
-# This is the startup tracer; the complete issue-to-merge journey follows later.
-
 """Exercise the public tenant CLI, production Terraform/bootstrap, and real Coder chat.
 
 This tracer establishes workspace startup; it is not the full issue-to-merge test.

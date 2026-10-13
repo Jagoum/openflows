@@ -1,14 +1,5 @@
-# Tests the bootstrap driver's diagnostic behavior when a chat cannot complete.
-# Runs a local HTTP server with the Coder endpoints used by the driver.
-# Sends actual HTTP requests through the driver's normal request helper.
-# Returns an explicit failed chat and its failed command result.
-# Checks that the original chat error still reaches the test caller.
-# Checks that chat state and messages are saved before teardown.
-# Exercises the timeout path without waiting for the full scenario deadline.
-# Exercises unavailable state and message endpoints independently.
-# Keeps diagnostic files and server state inside a temporary directory.
-# These are driver tests; the container scenario exercises actual Coder.
-# No production server, account, workspace, or credentials are used here.
+# Driver tests for preserving failed-chat diagnostics over local HTTP.
+# The production-bootstrap container scenario exercises actual Coder.
 
 import importlib.util
 import json

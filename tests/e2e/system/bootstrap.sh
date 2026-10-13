@@ -1,17 +1,7 @@
 #!/usr/bin/env bash
-# Runs the first production-bootstrap E2E scenario from a fresh checkout.
-# Builds the actual OpenFlows controller and harness from this revision.
-# Creates a private Docker stack with real Coder, PostgreSQL, and Redis.
-# Starts local HTTP fixtures for OAuth, GitHub, and the model provider.
-# Uses the five bundled production Terraform templates during tenant setup.
-# Provides an isolated OpenFlows directory and Coder CLI configuration.
-# Calls the public tenant CLI with one FORGE and SENTINEL pair.
-# Checks that the real Nexus controller and Coder chat can run commands.
-# Saves service journals and workspace logs for diagnosing failures.
-# Removes resources on this run's private network when the scenario exits.
-# This bootstrap scenario does not yet prove the entire issue-to-merge flow.
+# Tests production tenant bootstrap and Coder command execution in an isolated stack.
+# Saves diagnostics and removes run-owned resources; full issue-to-merge coverage follows.
 
-# Public tenant bootstrap against fresh services and the bundled production templates.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 project="openflows-bootstrap-$(date +%s)-$$"

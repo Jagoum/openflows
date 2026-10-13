@@ -1,15 +1,3 @@
-# Implements a small disposable OAuth device-flow provider for container E2E.
-# Coder starts device authorization through this provider's HTTP interface.
-# A device receives a short-lived code and waits for explicit operator approval.
-# Unapproved devices cannot exchange their code for an access token.
-# Only the disposable operator credential can approve a pending device.
-# Expired or already exchanged device codes cannot be reused.
-# The issued token identifies a disposable account rather than a real user.
-# The user endpoint lets Coder validate that account through its normal API.
-# Coder stores the resulting link and injects its token through Terraform.
-# This exercises Coder linking and token injection without production secrets.
-# It does not certify that GitHub's real OAuth service or App installation works.
-
 """Local device-flow provider for linking a disposable account through Coder's API.
 
 This exercises Coder's linking and Terraform token injection, not GitHub OAuth.

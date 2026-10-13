@@ -123,4 +123,4 @@ Chat state and messages are collected in a `finally` block on success, failure, 
 
 Python implements the disposable HTTP providers and the test driver. Its standard library provides HTTP servers, JSON, subprocess execution, and bounded waits, so these helpers need no additional Python packages. Coder still executes real tools, Git still commits and merges real changes, and the OpenFlows controller and harness remain the Rust binaries compiled from the candidate revision. Production workspace creation and startup use the bundled Terraform and shell scripts.
 
-Each newly added source file starts with at least ten explanatory comment lines covering its purpose, the real interfaces it exercises, and its limits. JSON cannot contain comments, so scenario files use an ignored `_description` field for the same introduction.
+File introductions are brief; detailed coverage and limits are documented here. JSON scenarios use an ignored `_description` field.
