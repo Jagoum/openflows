@@ -276,8 +276,7 @@ impl OrgProvisionWorker {
             .ensure_provisioner_ready(&coder_org, &self.provisioner_backend)
             .await
         {
-            self.release_repo
-                .set_provisioner_status(org_id, "unavailable")
+            self.set_provisioner_status_fenced(guard, org_id, "unavailable")
                 .await?;
             self.record_not_ready(guard, org_id, err::PROVISIONER_NOT_READY, &e.to_string())
                 .await?;
@@ -286,8 +285,7 @@ impl OrgProvisionWorker {
                 err::PROVISIONER_NOT_READY,
             ));
         }
-        self.release_repo
-            .set_provisioner_status(org_id, "ready")
+        self.set_provisioner_status_fenced(guard, org_id, "ready")
             .await?;
 
         // 6. Publish the required template roles. A failed or timed-out import
@@ -453,6 +451,34 @@ impl OrgProvisionWorker {
             tx.rollback().await?;
         }
         tracing::warn!(org_id = %org_id.0, code, message, "organization not ready");
+        Ok(())
+    }
+
+    async fn set_provisioner_status_fenced(
+        &self,
+        guard: &LeaseGuard,
+        org_id: OrganizationId,
+        status: &str,
+    ) -> Result<(), ManagerError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
+            .bind(org_id.0)
+            .fetch_one(&mut *tx)
+            .await?;
+        if guard.lock_in_tx(&mut tx).await? {
+            sqlx::query(
+                "UPDATE organization_provisioners SET status = $1,
+                    last_heartbeat_at = CASE WHEN $1 = 'ready' THEN now() ELSE last_heartbeat_at END,
+                    updated_at = now() WHERE organization_id = $2",
+            )
+            .bind(status)
+            .bind(org_id.0)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
         Ok(())
     }
 }

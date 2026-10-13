@@ -239,6 +239,12 @@ impl ReleaseService {
         self.publish_for_org(organization_id, release_id, adapter, artifacts)
             .await?;
         let mut tx = self.pool.begin().await?;
+        // Keep the lock order identical to the readiness worker: organization
+        // first, then release. This prevents promotion/readiness deadlocks.
+        sqlx::query("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
+            .bind(organization_id.0)
+            .fetch_one(&mut *tx)
+            .await?;
         let approved: Option<uuid::Uuid> = sqlx::query_scalar(
             "SELECT id FROM template_releases WHERE id = $1 AND status = 'approved' FOR UPDATE",
         )
