@@ -11,7 +11,7 @@ use sqlx::PgPool;
 
 /// The role archives of a release as resolved from the operator-configured
 /// artifact source (a role -> packaged archive bytes mapping).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReleaseArtifacts {
     pub manifest: TemplateManifest,
     /// role -> deterministic archive bytes
