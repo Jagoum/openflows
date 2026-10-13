@@ -320,7 +320,7 @@ impl RuntimeRepository {
     /// Record a credential lease after a successful token exchange and after
     /// the authorization/generation recheck. The token value is stored only as
     /// an encrypted secret-provider reference when reuse/revocation requires it
-    /// (i.e. always for WP-04, so cleanup can trace and discard it); the raw
+    /// (i.e. always for runtime credentials, so cleanup can trace and discard it); the raw
     /// value never appears in an ordinary table.
     pub async fn insert_lease(
         &self,

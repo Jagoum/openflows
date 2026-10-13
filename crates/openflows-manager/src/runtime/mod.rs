@@ -1,4 +1,4 @@
-//! WP-04 runtime authentication and the GitHub credential broker.
+//! Runtime authentication and the GitHub credential broker.
 //!
 //! This module introduces a runtime principal distinct from human browser/CLI
 //! sessions and human API credentials. A workspace runtime credential is a
