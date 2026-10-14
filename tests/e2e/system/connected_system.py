@@ -183,16 +183,22 @@ def run():
             check=True, timeout=30)
         github('/pulls/' + str(pr['number']) + '/reviews',
             {'event': 'APPROVE', 'commit_id': head, 'body': 'Human approval of the verified candidate'})
+        bootstrap.wait('Approved SENTINEL review delivery did not complete',
+            lambda: not lifecycle(nexus).get('pr_delivery'), seconds=90)
         pending_start = len(journal())
+        pending_log_start = len(bootstrap.ssh(nexus, 'cat /tmp/openflows-controller.log').splitlines())
         def polled_pending_ci():
             assert not github('/pulls/' + str(pr['number']))['merged'], 'Merged while CI was pending'
             assert_no_merge_attempt()
-            return any(entry['method'] == 'GET' and entry['path'] == f'/repos/test/repo/commits/{head}/check-suites' and
+            polled = any(entry['method'] == 'GET' and entry['path'] == f'/repos/test/repo/commits/{head}/check-suites' and
                 any(check['status'] == 'in_progress' for check in entry['response'].get('check_suites', []))
                 for entry in journal()[pending_start:])
-        bootstrap.wait('VESSEL did not observe pending CI', polled_pending_ci, seconds=90)
-        bootstrap.wait('Approved SENTINEL review delivery did not complete',
-            lambda: not lifecycle(nexus).get('pr_delivery'), seconds=90)
+            log = re.sub(r'\x1b\[[0-9;]*m', '', bootstrap.ssh(nexus, 'cat /tmp/openflows-controller.log'))
+            waiting = any('Waiting for CI before merge' in line and f'head={head}' in line and
+                f"pr={pr['number']}" in line for line in log.splitlines()[pending_log_start:])
+            assert_no_merge_attempt()
+            return polled and waiting
+        bootstrap.wait('VESSEL did not wait for pending CI after review delivery', polled_pending_ci, seconds=90)
         print('Human approval and pending CI each prevented premature merging; running trusted acceptance.', flush=True)
         ci(head)
         merged_pr = bootstrap.wait('Actual VESSEL did not merge the approved and tested candidate',
