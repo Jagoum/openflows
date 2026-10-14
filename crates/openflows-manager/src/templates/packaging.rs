@@ -312,6 +312,11 @@ pub fn validate_archive(archive: &[u8]) -> Result<(), ManagerError> {
                 "template archive contains an unsafe path (traversal or absolute)".into(),
             ));
         }
+        if path.file_name().is_some_and(|name| name == "registry.json") {
+            return Err(ManagerError::InvalidInput(
+                "template archive contains excluded registry.json".into(),
+            ));
+        }
     }
     Ok(())
 }

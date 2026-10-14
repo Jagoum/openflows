@@ -40,6 +40,7 @@ pub const TEMPLATE_MANIFEST_SHA256_ENV: &str = "OPENFLOWS_TEMPLATE_MANIFEST_SHA2
 pub const RELEASE_NAME_ENV: &str = "OPENFLOWS_RELEASE_NAME";
 
 /// Loads the operator-configured release artifacts.
+#[derive(Clone)]
 pub struct ReleaseProvider {
     source_dir: PathBuf,
     manifest_path: Option<PathBuf>,
@@ -130,6 +131,11 @@ impl ReleaseProvider {
     /// provided. Used to reject a changed artifact source at startup.
     pub fn pinned_manifest_sha256(&self) -> Option<&str> {
         self.manifest_sha256.as_deref()
+    }
+
+    /// The local source directory this provider reads from.
+    pub fn source_dir(&self) -> &PathBuf {
+        &self.source_dir
     }
 
     fn load_manifest(&self) -> Result<TemplateManifest, ReleaseProviderError> {

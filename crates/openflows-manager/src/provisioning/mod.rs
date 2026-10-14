@@ -5,11 +5,14 @@
 //! publication, model/chat capability) before marking an organization ready.
 //! It is durable and recoverable: progress is persisted, stale lease holders
 //! are fenced, and a suspended/deleted organization is never resurrected to
-//! ready. The operator-configured release artifacts come from
-//! [`ReleaseProvider`], never from customer-supplied URLs.
+//! ready. The operator-configured release artifacts come from a
+//! [`ReleaseSource`] (local filesystem or a pinned hosted GitHub release),
+//! never from customer-supplied URLs.
 
 pub mod release_provider;
+pub mod source;
 pub mod worker;
 
 pub use release_provider::{ReleaseProvider, ReleaseProviderError};
+pub use source::{ReleaseCache, ReleaseSource, ResolvedRelease};
 pub use worker::{err, OrgProvisionOutcome, OrgProvisionWorker};
