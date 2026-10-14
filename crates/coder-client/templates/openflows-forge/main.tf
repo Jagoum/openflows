@@ -258,12 +258,21 @@ resource "coder_agent" "main" {
     sudo chmod 600 /root/.git-credentials
     log "Configured git credentials for GitHub push auth"
 
+    # gh supports GitHub and HTTPS enterprise hosts; custom HTTP APIs use REST.
+    GITHUB_CLI_HOST=""
+    case "$GITHUB_API_BASE" in
+      https://api.github.com|https://api.github.com/) GITHUB_CLI_HOST=github.com ;;
+      https://*) GITHUB_CLI_HOST=$(python3 -c 'import os; from urllib.parse import urlsplit; print(urlsplit(os.environ["GITHUB_API_BASE"]).netloc)') ;;
+      http://*) log "GitHub CLI requires HTTPS; using the configured REST API for this host" ;;
+      *) log "FATAL: GitHub API base must use HTTP or HTTPS"; exit 1 ;;
+    esac
+
     # Install the GitHub CLI so the agent can open PRs with `gh pr create`
     # instead of hand-rolling the REST API. gh is best-effort, NOT a hard
     # startup dependency: the git credential helper above is the real push
     # mechanism, so a workspace with a valid repo seed still starts even if gh
     # cannot be installed (the agent can open the PR via REST/UI instead).
-    if ! command -v gh >/dev/null 2>&1; then
+    if [ -n "$GITHUB_CLI_HOST" ] && ! command -v gh >/dev/null 2>&1; then
       # Ubuntu base image (codercom/enterprise-base): prefer the official
       # GitHub apt repo (always current), fall back to the distro package.
       sudo mkdir -p -m 0755 /etc/apt/keyrings 2>/dev/null || true
@@ -277,19 +286,19 @@ resource "coder_agent" "main" {
       sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
     fi
 
-    if command -v gh >/dev/null 2>&1; then
+    if [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
       # Authenticate gh persistently as the inherited identity for BOTH the
       # `coder` user and `root` (the sudo'd clone below uses root's $HOME).
       # --hostname + --git-protocol make the stored credential explicit and
       # deterministic (non-interactive). The token travels through stdin for
       # the root login too — never embedded in a command-line argument that
       # another process could read. Failures are fatal, never swallowed.
-      printf '%s' "$GIT_TOKEN" | gh auth login --hostname github.com --git-protocol https --with-token \
+      printf '%s' "$GIT_TOKEN" | gh auth login --hostname "$GITHUB_CLI_HOST" --git-protocol https --with-token \
         || { log "FATAL: gh auth login failed for user coder"; exit 1; }
-      printf '%s' "$GIT_TOKEN" | sudo -H bash -c 'IFS= read -r tok || [ -n "$tok" ] || exit 1; printf "%s" "$tok" | gh auth login --hostname github.com --git-protocol https --with-token' \
+      printf '%s' "$GIT_TOKEN" | sudo -H bash -c 'IFS= read -r tok || [ -n "$tok" ] || exit 1; printf "%s" "$tok" | gh auth login --hostname "$1" --git-protocol https --with-token' _ "$GITHUB_CLI_HOST" \
         || { log "FATAL: gh auth login failed for user root"; exit 1; }
     else
-      log "WARNING: GitHub CLI (gh) unavailable — agent should push via git and open the PR through the REST API or GitHub UI"
+      log "GitHub CLI unavailable for this host — use git push and the configured REST API to open PRs"
     fi
 
     # Resolve the expected account from the inherited token via the GitHub API
@@ -303,10 +312,10 @@ resource "coder_agent" "main" {
       exit 1
     fi
 
-    if command -v gh >/dev/null 2>&1; then
+    if [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
       # Verify the authed gh identity actually matches the inherited account, so
       # gh/git act as the controller-spawner — never a dummy or mismatched login.
-      AUTHED_LOGIN=$(gh api user --jq .login) \
+      AUTHED_LOGIN=$(gh api --hostname "$GITHUB_CLI_HOST" user --jq .login) \
         || { log "FATAL: could not query the authed gh identity"; exit 1; }
       if [ "$AUTHED_LOGIN" != "$EXPECTED_LOGIN" ]; then
         log "FATAL: gh authed as '$AUTHED_LOGIN' but the inherited token resolves to '$EXPECTED_LOGIN' — identity mismatch"

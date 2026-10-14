@@ -1008,13 +1008,12 @@ Before significant work, read the relevant skill file to understand the workflow
         // existing PR (CI fix / review rework), this is the PR's `head_branch` from
         // `pending_prs` so the freshly provisioned forge resumes the branch where the
         // work was already done instead of starting afresh on the default branch.
-        // When no PR exists yet, fall back to the conventional `{worker}/{ticket}`
-        // branch the forge creates on first work.
+        // With no PR, an empty branch asks the template to create the task branch.
         let pending_prs: Vec<Value> = store
             .get_typed::<Vec<Value>>(KEY_PENDING_PRS)
             .await
             .unwrap_or_default();
-        let branch = Self::resolve_workspace_branch(&pending_prs, worker_id, ticket_id);
+        let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
         let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
         store
             .set(
@@ -1308,9 +1307,8 @@ Before significant work, read the relevant skill file to understand the workflow
     /// Resolve the git branch a freshly provisioned forge workspace should check out.
     ///
     /// Prefers the PR's `head_branch` recorded in `pending_prs` for the ticket (so a
-    /// rework workspace resumes the branch where the work was already done), falling
-    /// back to the conventional `{worker}/{ticket}` branch for first-time work.
-    fn resolve_workspace_branch(pending_prs: &[Value], worker_id: &str, ticket_id: &str) -> String {
+    /// rework workspace resumes its commits). Empty means create a fresh task branch.
+    fn resolve_workspace_branch(pending_prs: &[Value], ticket_id: &str) -> String {
         pending_prs
             .iter()
             .find(|p| p.get("ticket_id").and_then(|v| v.as_str()) == Some(ticket_id))
@@ -1320,7 +1318,7 @@ Before significant work, read the relevant skill file to understand the workflow
                     .map(String::from)
             })
             .filter(|b| !b.is_empty())
-            .unwrap_or_else(|| format!("{}/{}", worker_id, ticket_id))
+            .unwrap_or_default()
     }
 
     /// Create a Coder Chat for a ticket assignment and store the chat ID in SharedStore.
@@ -4994,12 +4992,25 @@ impl Node for NexusNode {
             .set(KEY_MERGE_READY_PRS, json!(merge_ready_prs.clone()))
             .await;
         let open_prs = json!(merge_ready_prs);
+        let mut review_delivery_pending = false;
+        for ticket in tickets.iter().filter(|ticket| !ticket.status.is_terminal()) {
+            if store
+                .lifecycle(&ticket.id)
+                .await?
+                .deliverable_review()
+                .is_some()
+            {
+                review_delivery_pending = true;
+                break;
+            }
+        }
 
         Ok(json!({
             "tickets": tickets,
             "assignable_tickets": assignable_tickets,
             "worker_slots": store.get(KEY_WORKER_SLOTS).await.unwrap_or(json!({})),
             "open_prs": open_prs,
+            "review_delivery_pending": review_delivery_pending,
             "command_gate": command_gate,
             "repository": repository,
             "owner": owner,
@@ -5107,6 +5118,20 @@ impl Node for NexusNode {
                     issue_url: None,
                 }));
             }
+        }
+
+        // Deliver a ready review before VESSEL evaluates merge readiness.
+        if context["review_delivery_pending"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            return Ok(json!(AgentDecision {
+                action: "sentinel_spawned".to_string(),
+                notes: "Review delivery pending — route to SENTINEL".to_string(),
+                assign_to: None,
+                ticket_id: None,
+                issue_url: None,
+            }));
         }
 
         if !pending_prs.is_empty() {
@@ -5472,6 +5497,22 @@ fn directive_pr_number(directive: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ready_review_delivery_routes_before_pending_merges() {
+        let node = NexusNode::new("unused", "unused");
+        for (delivery_pending, expected) in [(true, "sentinel_spawned"), (false, ACTION_MERGE_PRS)]
+        {
+            let decision = node
+                .exec(json!({
+                    "open_prs": [{"number": 42}], "review_delivery_pending": delivery_pending,
+                    "worker_slots": {}, "assignable_tickets": [],
+                }))
+                .await
+                .unwrap();
+            assert_eq!(decision["action"], expected);
+        }
+    }
 
     #[tokio::test]
     async fn fleet_one_recovers_empty_slots_and_preserves_busy_workers() {
@@ -5892,7 +5933,7 @@ mod tests {
         let arr: Vec<Value> = serde_json::from_value(pending_prs).unwrap();
         // Rework of an existing PR reuses its real PR branch.
         assert_eq!(
-            NexusNode::resolve_workspace_branch(&arr, "forge-1", "T-034"),
+            NexusNode::resolve_workspace_branch(&arr, "T-034"),
             "forge-1/T-034"
         );
     }
@@ -5900,10 +5941,10 @@ mod tests {
     #[test]
     fn resolve_workspace_branch_falls_back_for_new_ticket() {
         let pending_prs: Vec<Value> = Vec::new();
-        // No PR yet — fall back to the conventional worker/ticket branch.
+        // An empty parameter tells the template to create the task branch.
         assert_eq!(
-            NexusNode::resolve_workspace_branch(&pending_prs, "forge-3", "T-099"),
-            "forge-3/T-099"
+            NexusNode::resolve_workspace_branch(&pending_prs, "T-099"),
+            ""
         );
     }
 
@@ -5913,10 +5954,7 @@ mod tests {
             {"number": 7, "ticket_id": "T-007", "head_branch": ""}
         ]);
         let arr: Vec<Value> = serde_json::from_value(pending_prs).unwrap();
-        assert_eq!(
-            NexusNode::resolve_workspace_branch(&arr, "forge-1", "T-007"),
-            "forge-1/T-007"
-        );
+        assert_eq!(NexusNode::resolve_workspace_branch(&arr, "T-007"), "");
     }
 
     #[test]
@@ -6252,8 +6290,10 @@ mod tests {
             .await;
         let node = NexusNode::new("missing-persona", "missing-registry");
         for _ in 0..3 {
-            node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket))
-                .await;
+            Box::pin(
+                node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket)),
+            )
+            .await;
             node.create_chat_for_assignment(&store, "sentinel-1", &ticket)
                 .await;
         }
