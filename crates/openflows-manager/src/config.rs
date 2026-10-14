@@ -108,6 +108,241 @@ pub const DEFAULT_CODER_VERSION_BASELINE: &str = "v2.37.3";
 /// Default provisioner backend (operator input; validated, not fabricated).
 pub const DEFAULT_PROVISIONER_BACKEND: &str = "docker";
 
+// ---------------------------------------------------------------------------
+// Template release source configuration.
+//
+// These settings select and pin the operator-configured template release
+// source. The source is operator configuration, never customer-supplied:
+// customer organizations can never provide arbitrary template URLs. A hosted
+// source is pinned to an immutable release tag plus the pinned manifest
+// SHA-256, so production releases are never resolved from mutable branch names
+// or `latest` timestamps.
+// ---------------------------------------------------------------------------
+/// Selects the template release source: `local` (default) or `github`.
+pub const RELEASE_SOURCE_ENV: &str = "OPENFLOWS_RELEASE_SOURCE";
+/// The pinned GitHub template repository as `owner/repo`.
+pub const TEMPLATE_REPOSITORY_ENV: &str = "OPENFLOWS_GITHUB_TEMPLATE_REPOSITORY";
+/// The immutable release tag to resolve. Never `latest` or a branch name.
+pub const TEMPLATE_RELEASE_TAG_ENV: &str = "OPENFLOWS_GITHUB_TEMPLATE_TAG";
+/// The pinned manifest SHA-256 digest that defines the release identity.
+pub const TEMPLATE_MANIFEST_SHA256_ENV: &str = "OPENFLOWS_TEMPLATE_MANIFEST_SHA256";
+/// Secret-provider reference for an optional private template repository token.
+pub const TEMPLATE_GITHUB_TOKEN_REF_ENV: &str = "OPENFLOWS_GITHUB_TEMPLATE_TOKEN_REF";
+/// Maximum accepted bytes for a downloaded release artifact (default 256 MiB).
+pub const RELEASE_MAX_DOWNLOAD_BYTES_ENV: &str = "OPENFLOWS_RELEASE_MAX_DOWNLOAD_BYTES";
+/// Per-request download timeout in seconds (default 30).
+pub const RELEASE_TIMEOUT_SECS_ENV: &str = "OPENFLOWS_RELEASE_TIMEOUT_SECS";
+/// Directory for the bounded verified-artifact cache (default
+/// `.openflows/release-cache`).
+pub const RELEASE_CACHE_DIR_ENV: &str = "OPENFLOWS_RELEASE_CACHE_DIR";
+
+/// Default maximum downloaded artifact size: 256 MiB.
+pub const DEFAULT_RELEASE_MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+/// Default per-request download timeout.
+pub const DEFAULT_RELEASE_TIMEOUT_SECS: u64 = 30;
+/// Default verified-artifact cache directory.
+pub const DEFAULT_RELEASE_CACHE_DIR: &str = ".openflows/release-cache";
+/// Maximum number of releases kept in the verified-artifact cache.
+pub const DEFAULT_RELEASE_CACHE_MAX_ENTRIES: usize = 8;
+
+/// The kind of template release source selected by the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseSourceKind {
+    /// Local filesystem source: the checked-in `crates/coder-client/templates`
+    /// directory (or an operator-configured directory). Preserved for
+    /// development and tests; requires no network.
+    Local,
+    /// Hosted source backed by immutable GitHub Releases.
+    Github,
+}
+
+impl ReleaseSourceKind {
+    /// Parse the `OPENFLOWS_RELEASE_SOURCE` value. An empty/absent value
+    /// defaults to `local`. Unknown values are rejected so a misconfigured
+    /// deployment fails loudly instead of silently using a local source.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim).unwrap_or("") {
+            "" | "local" => Ok(ReleaseSourceKind::Local),
+            "github" => Ok(ReleaseSourceKind::Github),
+            other => Err(format!(
+                "invalid {RELEASE_SOURCE_ENV} '{other}': expected 'local' or 'github'"
+            )),
+        }
+    }
+}
+
+/// Centralized, typed configuration for the template release source. The
+/// source is operator configuration (never customer-supplied), and all
+/// environment lookups happen here at startup rather than being scattered
+/// through handlers.
+#[derive(Debug, Clone)]
+pub enum ReleaseSourceConfig {
+    /// Local filesystem release source (development and tests). Uses the
+    /// existing operator-configured local directory and optional pinned
+    /// manifest digest.
+    Local,
+    /// Hosted release source pinned to an immutable GitHub release tag and a
+    /// pinned manifest SHA-256 digest.
+    Github(HostedReleaseConfig),
+}
+
+impl ReleaseSourceConfig {
+    /// Load the release source configuration from the environment. In hosted
+    /// mode the required pinned settings must be present or startup fails.
+    pub fn from_env() -> Result<Self, String> {
+        match ReleaseSourceKind::parse(std::env::var(RELEASE_SOURCE_ENV).ok().as_deref())? {
+            ReleaseSourceKind::Local => Ok(ReleaseSourceConfig::Local),
+            ReleaseSourceKind::Github => {
+                let hosted = HostedReleaseConfig::from_env()?;
+                Ok(ReleaseSourceConfig::Github(hosted))
+            }
+        }
+    }
+}
+
+/// Configuration for a hosted GitHub release source.
+#[derive(Debug, Clone)]
+pub struct HostedReleaseConfig {
+    /// The pinned GitHub template repository as `owner/repo`.
+    pub repository: String,
+    /// The immutable release tag to resolve. Never `latest` or a branch name.
+    pub tag: String,
+    /// The pinned manifest SHA-256 digest; the release identity.
+    pub manifest_sha256: String,
+    /// Optional secret-provider reference for private GitHub release assets.
+    pub github_token_ref: Option<String>,
+    /// The GitHub API base (defaults to https://api.github.com).
+    pub api_base: String,
+    /// Maximum accepted bytes for a downloaded artifact.
+    pub max_download_bytes: usize,
+    /// Per-request download timeout.
+    pub timeout_secs: u64,
+    /// Directory for the bounded verified-artifact cache.
+    pub cache_dir: std::path::PathBuf,
+}
+
+impl HostedReleaseConfig {
+    fn from_env() -> Result<Self, String> {
+        let repository = std::env::var(TEMPLATE_REPOSITORY_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| format!("hosted release source requires {TEMPLATE_REPOSITORY_ENV}"))?;
+        if !is_repository_name(&repository) {
+            return Err(format!(
+                "{TEMPLATE_REPOSITORY_ENV} must be in the form 'owner/repo'"
+            ));
+        }
+
+        let tag = std::env::var(TEMPLATE_RELEASE_TAG_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| format!("hosted release source requires {TEMPLATE_RELEASE_TAG_ENV}"))?;
+        // A release must be pinned to an immutable tag. Never resolve from the
+        // mutable `latest` endpoint, a branch name, or a ref path.
+        const MUTABLE_NAMES: &[&str] = &[
+            "latest",
+            "main",
+            "master",
+            "develop",
+            "dev",
+            "trunk",
+            "head",
+            "production",
+            "staging",
+        ];
+        let normalized = tag.to_ascii_lowercase();
+        if MUTABLE_NAMES.contains(&normalized.as_str())
+            || tag.contains('/')
+            || tag.contains('*')
+            || tag.contains('?')
+        {
+            return Err(format!(
+                "{TEMPLATE_RELEASE_TAG_ENV} must be an immutable release tag, not a mutable branch, ref path, or 'latest'"
+            ));
+        }
+
+        let manifest_sha256 = std::env::var(TEMPLATE_MANIFEST_SHA256_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| {
+                format!("hosted release source requires {TEMPLATE_MANIFEST_SHA256_ENV}")
+            })?;
+        let manifest_sha256 = manifest_sha256.to_ascii_lowercase();
+        if manifest_sha256.len() != 64 || !manifest_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "{TEMPLATE_MANIFEST_SHA256_ENV} must be a 64-character SHA-256 hex digest"
+            ));
+        }
+
+        let github_token_ref = std::env::var(TEMPLATE_GITHUB_TOKEN_REF_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+
+        let api_base = std::env::var(GITHUB_API_BASE_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "https://api.github.com".to_string());
+
+        let max_download_bytes = match std::env::var(RELEASE_MAX_DOWNLOAD_BYTES_ENV).ok() {
+            None => DEFAULT_RELEASE_MAX_DOWNLOAD_BYTES,
+            Some(v) => match v.trim().parse::<usize>() {
+                Ok(n) if n >= 1024 => n,
+                _ => {
+                    return Err(format!(
+                        "{RELEASE_MAX_DOWNLOAD_BYTES_ENV} must be a positive byte count"
+                    ))
+                }
+            },
+        };
+
+        let timeout_secs = match std::env::var(RELEASE_TIMEOUT_SECS_ENV).ok() {
+            None => DEFAULT_RELEASE_TIMEOUT_SECS,
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    return Err(format!(
+                        "{RELEASE_TIMEOUT_SECS_ENV} must be a positive number of seconds"
+                    ))
+                }
+            },
+        };
+
+        let cache_dir = std::env::var(RELEASE_CACHE_DIR_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_RELEASE_CACHE_DIR));
+
+        Ok(HostedReleaseConfig {
+            repository,
+            tag,
+            manifest_sha256,
+            github_token_ref,
+            api_base,
+            max_download_bytes,
+            timeout_secs,
+            cache_dir,
+        })
+    }
+}
+
+/// Validate a `owner/repo` GitHub repository reference.
+fn is_repository_name(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo_name = parts.next().unwrap_or_default();
+    parts.next().is_none()
+        && !owner.is_empty()
+        && !repo_name.is_empty()
+        && owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && repo_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 use crate::auth::crypto::EnvelopeCipher;
 use crate::error::ManagerError;
 
@@ -357,6 +592,8 @@ pub struct ManagerConfig {
     pub coder_version_baseline: String,
     /// The operator-configured provisioner backend adapter.
     pub provisioner_backend: String,
+    /// The operator-configured template release source.
+    pub release_source: ReleaseSourceConfig,
 }
 
 impl ManagerConfig {
@@ -396,6 +633,8 @@ impl ManagerConfig {
             .unwrap_or_else(|_| DEFAULT_CODER_VERSION_BASELINE.to_string());
         let provisioner_backend = std::env::var(PROVISIONER_BACKEND_ENV)
             .unwrap_or_else(|_| DEFAULT_PROVISIONER_BACKEND.to_string());
+
+        let release_source = ReleaseSourceConfig::from_env()?;
 
         let auth = auth_from_env(mode == Mode::Hosted, crypto_master_key_ref.clone())?;
 
@@ -455,6 +694,7 @@ impl ManagerConfig {
                     coder_operator_token_ref: Some(coder_operator_token_ref),
                     coder_version_baseline,
                     provisioner_backend,
+                    release_source,
                 })
             }
             Mode::Local => Ok(ManagerConfig {
@@ -470,6 +710,7 @@ impl ManagerConfig {
                 coder_operator_token_ref,
                 coder_version_baseline,
                 provisioner_backend,
+                release_source,
             }),
         }
     }
@@ -508,6 +749,7 @@ pub fn local_test_config() -> ManagerConfig {
             webhook_secret_ref: None,
             webhook_body_limit: DEFAULT_WEBHOOK_BODY_LIMIT,
         },
+        release_source: ReleaseSourceConfig::Local,
     }
 }
 
@@ -562,6 +804,15 @@ mod tests {
         CODER_OPERATOR_TOKEN_REF_ENV,
         CODER_VERSION_BASELINE_ENV,
         PROVISIONER_BACKEND_ENV,
+        RELEASE_SOURCE_ENV,
+        TEMPLATE_REPOSITORY_ENV,
+        TEMPLATE_RELEASE_TAG_ENV,
+        TEMPLATE_MANIFEST_SHA256_ENV,
+        TEMPLATE_GITHUB_TOKEN_REF_ENV,
+        GITHUB_API_BASE_ENV,
+        RELEASE_MAX_DOWNLOAD_BYTES_ENV,
+        RELEASE_TIMEOUT_SECS_ENV,
+        RELEASE_CACHE_DIR_ENV,
     ];
 
     /// Set the env required for a hosted-mode config that should validate.
@@ -697,5 +948,148 @@ mod tests {
             ManagerConfig::from_env().is_err(),
             "unknown mode must be rejected"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Release source selection and validation.
+    // -----------------------------------------------------------------------
+
+    fn set_github_release_env() {
+        std::env::set_var(RELEASE_SOURCE_ENV, "github");
+        std::env::set_var(
+            TEMPLATE_REPOSITORY_ENV,
+            "The-AgenticFlow/openflows-templates",
+        );
+        std::env::set_var(TEMPLATE_RELEASE_TAG_ENV, "2026.10.0");
+        std::env::set_var(TEMPLATE_MANIFEST_SHA256_ENV, "a".repeat(64));
+    }
+
+    #[test]
+    fn release_source_defaults_to_local() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::remove_var(RELEASE_SOURCE_ENV);
+        std::env::remove_var(TEMPLATE_REPOSITORY_ENV);
+
+        let cfg = ReleaseSourceConfig::from_env().unwrap();
+        assert!(matches!(cfg, ReleaseSourceConfig::Local));
+    }
+
+    #[test]
+    fn unknown_release_source_is_rejected() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(RELEASE_SOURCE_ENV, "s3");
+
+        assert!(ReleaseSourceConfig::from_env().is_err());
+    }
+
+    #[test]
+    fn github_source_requires_repository_tag_and_digest() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(RELEASE_SOURCE_ENV, "github");
+        std::env::remove_var(TEMPLATE_REPOSITORY_ENV);
+        std::env::remove_var(TEMPLATE_RELEASE_TAG_ENV);
+        std::env::remove_var(TEMPLATE_MANIFEST_SHA256_ENV);
+
+        assert!(ReleaseSourceConfig::from_env().is_err());
+
+        std::env::set_var(
+            TEMPLATE_REPOSITORY_ENV,
+            "The-AgenticFlow/openflows-templates",
+        );
+        assert!(ReleaseSourceConfig::from_env().is_err());
+
+        std::env::set_var(TEMPLATE_RELEASE_TAG_ENV, "2026.10.0");
+        assert!(ReleaseSourceConfig::from_env().is_err());
+
+        std::env::set_var(TEMPLATE_MANIFEST_SHA256_ENV, "a".repeat(64));
+        let cfg = ReleaseSourceConfig::from_env().unwrap();
+        match cfg {
+            ReleaseSourceConfig::Github(h) => {
+                assert_eq!(h.repository, "The-AgenticFlow/openflows-templates");
+                assert_eq!(h.tag, "2026.10.0");
+                assert_eq!(h.manifest_sha256.len(), 64);
+            }
+            other => panic!("expected github source, got {other:?}"),
+        }
+
+        std::env::set_var(TEMPLATE_MANIFEST_SHA256_ENV, "A".repeat(64));
+        match ReleaseSourceConfig::from_env().unwrap() {
+            ReleaseSourceConfig::Github(h) => assert_eq!(h.manifest_sha256, "a".repeat(64)),
+            other => panic!("expected github source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn github_source_rejects_mutable_branch_or_latest_tag() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(RELEASE_SOURCE_ENV, "github");
+        set_github_release_env();
+
+        for bad in ["latest", "main", "feature/x", "dev/feature?x"] {
+            std::env::set_var(TEMPLATE_RELEASE_TAG_ENV, bad);
+            assert!(
+                ReleaseSourceConfig::from_env().is_err(),
+                "tag '{bad}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn github_source_rejects_malformed_repository_and_digest() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(RELEASE_SOURCE_ENV, "github");
+        set_github_release_env();
+
+        std::env::set_var(TEMPLATE_REPOSITORY_ENV, "no-slash");
+        assert!(ReleaseSourceConfig::from_env().is_err());
+        std::env::set_var(TEMPLATE_REPOSITORY_ENV, "a/b/c");
+        assert!(ReleaseSourceConfig::from_env().is_err());
+
+        set_github_release_env();
+        std::env::set_var(TEMPLATE_MANIFEST_SHA256_ENV, "not-a-digest");
+        assert!(ReleaseSourceConfig::from_env().is_err());
+    }
+
+    #[test]
+    fn github_source_validates_size_and_timeout() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(RELEASE_SOURCE_ENV, "github");
+        set_github_release_env();
+
+        std::env::set_var(RELEASE_MAX_DOWNLOAD_BYTES_ENV, "0");
+        assert!(ReleaseSourceConfig::from_env().is_err());
+        set_github_release_env();
+        std::env::set_var(RELEASE_MAX_DOWNLOAD_BYTES_ENV, "1048576");
+        std::env::set_var(RELEASE_TIMEOUT_SECS_ENV, "0");
+        assert!(ReleaseSourceConfig::from_env().is_err());
+        set_github_release_env();
+        std::env::set_var(RELEASE_TIMEOUT_SECS_ENV, "15");
+        std::env::set_var(RELEASE_MAX_DOWNLOAD_BYTES_ENV, "1048576");
+        match ReleaseSourceConfig::from_env().unwrap() {
+            ReleaseSourceConfig::Github(h) => {
+                assert_eq!(h.max_download_bytes, 1048576);
+                assert_eq!(h.timeout_secs, 15);
+            }
+            other => panic!("expected github source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_mode_does_not_require_github_config() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::remove_var(RELEASE_SOURCE_ENV);
+        std::env::remove_var(TEMPLATE_REPOSITORY_ENV);
+        std::env::remove_var(TEMPLATE_RELEASE_TAG_ENV);
+        std::env::remove_var(TEMPLATE_MANIFEST_SHA256_ENV);
+
+        let cfg = ManagerConfig::from_env().unwrap();
+        assert!(matches!(cfg.release_source, ReleaseSourceConfig::Local));
     }
 }

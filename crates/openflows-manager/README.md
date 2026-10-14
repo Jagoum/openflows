@@ -1,26 +1,24 @@
-# Manager foundations and human authorization (WP-01 / WP-02)
+# Manager foundations and human authorization
 
-The manager owns the Openflows product database, separately from Coder. WP-02
-adds GitHub human sign-in, browser and CLI sessions, device approval, organization
-membership, and invitations. GitHub installation connections, Coder provisioning
-workers, and the complete hosted CLI remain later packages.
+The manager owns the Openflows product database, separately from Coder. It adds
+GitHub human sign-in, browser and CLI sessions, device approval, organization
+membership, and invitations. GitHub installation connections, Coder
+provisioning workers, and the complete hosted CLI remain later packages.
 
-See [the WP-02 review and handoff](WP02_REVIEW.md) for API contracts, setup,
-fixed defects, test evidence, and deployment prerequisites.
-
-WP-04 adds runtime authentication and the GitHub credential broker: a workspace
-runtime principal (distinct from human sessions) that obtains short-lived GitHub
-installation tokens scoped to its authorized repository and permission profile.
-See [runtime credentials and the GitHub credential broker](../../docs/architecture/runtime-credentials-broker.md).
+It also adds runtime authentication and the GitHub credential broker: a
+workspace runtime principal (distinct from human sessions) that obtains
+short-lived GitHub installation tokens scoped to its authorized repository and
+permission profile. See [runtime credentials and the GitHub credential
+broker](../../docs/architecture/runtime-credentials-broker.md).
 
 ## Validation
 
-review fixes add migration `0012_current_organization_release.sql`.
-Publication history is retained in `organization_release_bindings`; the single
-current selection lives in `organization_current_releases`. Existing bindings
-are backfilled by most recent creation time, with release ID breaking ties.
-Successful organization readiness, release selection, and operation completion
-are now committed together. Startup preserves retired releases.
+Migration `0012_current_organization_release.sql` adds the organization release
+selection. Publication history is retained in `organization_release_bindings`;
+the single current selection lives in `organization_current_releases`. Existing
+bindings are backfilled by most recent creation time, with release ID breaking
+ties. Successful organization readiness, release selection, and operation
+completion are now committed together. Startup preserves retired releases.
 
 The current real Coder adapter expects an operator-managed provisioner daemon
 using the key name `openflows-provisioner-<coder-organization-id>`. Only `idle`
@@ -85,9 +83,38 @@ their checksums. It enforces organization relationships and reserves tenant
 names/repositories and workspace role/slots until both desired and observed
 states are deleted. NULL workspace slots represent a singleton slot.
 
-## PR #390 review scope
+## Template release source
 
-The current PR head excludes the WP-00 Coder compatibility harness and wrapper.
-The three review comments about shell manifests, temporary credential files,
-and name-based Coder cleanup refer to files absent from this branch and its
-current PR diff. No fix to those absent tools is claimed by this change.
+Template releases come from an operator-configured source, never
+customer-supplied URLs (see
+[docs/implementation/centralized-deployment/06-hosted-template-releases.md](../../../docs/implementation/centralized-deployment/06-hosted-template-releases.md)):
+
+- **Local** (default): packages the checked-in `crates/coder-client/templates`
+  directory. For development and tests; requires no network.
+- **GitHub** (`OPENFLOWS_RELEASE_SOURCE=github`): resolves a pinned immutable
+  GitHub release, verifies the manifest and every role archive digest, rejects
+  unsafe archive contents, bounds download sizes, applies timeouts, and caches
+  verified artifacts on disk.
+
+All settings are centralized and typed in `config.rs`. The release is pinned to
+an immutable tag plus the manifest digest; never a mutable branch or `latest`.
+
+### Running the hosted source locally
+
+Publish a release with a `manifest.json` asset plus one archive per role (see
+the deployment doc for the layout), then run:
+
+```sh
+export OPENFLOWS_RELEASE_SOURCE=github
+export OPENFLOWS_GITHUB_TEMPLATE_REPOSITORY=The-AgenticFlow/openflows-templates
+export OPENFLOWS_GITHUB_TEMPLATE_TAG=2026.10.0
+export OPENFLOWS_TEMPLATE_MANIFEST_SHA256=<64-char manifest digest>
+export OPENFLOWS_RELEASE_CACHE_DIR=/tmp/openflows-release-cache
+cargo run -p openflows-manager
+```
+
+### Testing the release source
+
+```sh
+cargo test -p openflows-manager provisioning::source
+```

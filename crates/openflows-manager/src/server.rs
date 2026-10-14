@@ -456,12 +456,38 @@ impl ManagerServices {
 
         let adapter =
             crate::coder::RealCoderAdapter::from_parts(url, &token, &config.coder_version_baseline);
-        let provider =
-            crate::provisioning::ReleaseProvider::from_env().map_err(ManagerError::from)?;
-        let artifacts = provider.load().map_err(ManagerError::from)?;
+        let template_token = match &config.release_source {
+            crate::config::ReleaseSourceConfig::Github(hosted) => match &hosted.github_token_ref {
+                Some(ref_name) => Some(
+                    String::from_utf8(provider.get(ref_name).await.map_err(|e| {
+                        ManagerError::Config(format!(
+                            "failed to resolve GitHub template token: {e}"
+                        ))
+                    })?)
+                    .map_err(|_| {
+                        ManagerError::Config("GitHub template token is not UTF-8".into())
+                    })?,
+                ),
+                None => None,
+            },
+            crate::config::ReleaseSourceConfig::Local => None,
+        };
+        let source = crate::provisioning::ReleaseSource::from_config(
+            &config.release_source,
+            template_token,
+        )?;
+        let cache = match &config.release_source {
+            crate::config::ReleaseSourceConfig::Github(hosted) => {
+                crate::provisioning::ReleaseCache::from_config(hosted)
+            }
+            crate::config::ReleaseSourceConfig::Local => {
+                crate::provisioning::ReleaseCache::new(std::path::PathBuf::new(), 0, 0)
+            }
+        };
+        let resolved = source.resolve(&cache).await?;
         let (release_id, _digest) = self
             .release_service
-            .import_release(artifacts.clone(), "operator-configured")
+            .import_release(resolved.artifacts.clone(), &resolved.source_reference)
             .await?;
         // A release supplied through the trusted operator configuration is the
         // platform-selected release for this deployment. Customer-facing
@@ -476,7 +502,7 @@ impl ManagerServices {
             self.release_service.clone(),
             self.release_repo.clone(),
             std::sync::Arc::new(adapter),
-            Some(std::sync::Arc::new(artifacts)),
+            Some(std::sync::Arc::new(resolved.artifacts)),
             Some(release_id),
             config.provisioner_backend.clone(),
             config.coder_version_baseline.clone(),
