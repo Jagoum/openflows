@@ -1925,6 +1925,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "futures",
+ "futures-util",
  "hex",
  "hmac",
  "http",

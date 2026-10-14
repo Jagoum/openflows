@@ -1,6 +1,7 @@
 # Cargo manifest for the OpenFlows Manager service crate.
 [package]
 name = "openflows-manager"
+default-run = "openflows-manager"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -30,7 +31,9 @@ aes-gcm = "0.10"
 subtle = "2"
 http = "1"
 url = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+futures = { workspace = true }
+futures-util = { workspace = true }
 jsonwebtoken = { workspace = true }
 hmac = "0.12"
 tar = "0.4"
