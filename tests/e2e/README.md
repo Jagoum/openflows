@@ -2,7 +2,7 @@
 
 CI exercises OpenFlows against disposable Redis, PostgreSQL, and Coder containers before the final `OpenFlows Merge Gate` can pass. PRs into `develop` and `main`, pushes to those branches, and merge queue groups run the gate. Every mandatory dependency must explicitly succeed; failed, cancelled, and skipped jobs fail the gate.
 
-See the [complete E2E testing architecture](../../docs/architecture/end-to-end-testing.md) for the purpose of PRs #400 and #401, the target issue-to-merge system, and the remaining implementation stages.
+See the [complete E2E testing architecture](../../docs/architecture/end-to-end-testing.md) for the covered workflows, the issue-to-merge system, and the remaining test coverage.
 
 ## Run locally
 
