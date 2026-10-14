@@ -85,7 +85,7 @@ def wait_for_chat(chat_id, seconds=180):
         save_chat_diagnostics(chat_id)
 
 
-def run():
+def setup_tenant(model_name='bootstrap-canary'):
     global TOKEN
     def server_ready():
         try:
@@ -108,7 +108,7 @@ def run():
         'base_url': 'http://model:8080/v1', 'enabled': True, 'api_keys': ['ci-model-key']})
     organization = next(o for o in coder('/users/me/organizations') if o['is_default'])
     coder(f"/organizations/{organization['id']}/chats/models", {
-        'ai_provider_id': provider['id'], 'model': 'bootstrap-canary',
+        'ai_provider_id': provider['id'], 'model': model_name,
         'context_limit': 128000, 'is_default': True})
     with (ARTIFACTS / 'tenant-add.log').open('w') as log:
         print('Running the public tenant CLI with production templates.', flush=True)
@@ -130,6 +130,11 @@ def run():
             return False
     wait('production Nexus controller/bootstrap did not become ready', ready)
     print('Production Nexus workspace cloned the repository and started its controller.', flush=True)
+    return workspace, templates, organization, name
+
+
+def run():
+    workspace, templates, organization, name = setup_tenant()
     chat = coder('/chats', {'organization_id': organization['id'], 'workspace_id': workspace['id'],
         'content': [{'type': 'text', 'text': 'Execute the production bootstrap canary.'}]})
     messages = wait_for_chat(chat['id'])

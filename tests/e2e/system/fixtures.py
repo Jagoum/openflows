@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import re
 import signal
 import subprocess
 import threading
@@ -28,6 +29,48 @@ class ScriptedModel:
         self.previous_calls = {}
         self.cache = {}
 
+    @staticmethod
+    def text(value):
+        if isinstance(value, str):
+            try:
+                return ScriptedModel.text(json.loads(value))
+            except (ValueError, TypeError):
+                return value
+        if isinstance(value, dict):
+            for key in ('output', 'text', 'content'):
+                if key in value:
+                    return ScriptedModel.text(value[key])
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, list):
+            return '\n'.join(ScriptedModel.text(part) for part in value)
+        return str(value)
+
+    @staticmethod
+    def variables(messages):
+        values = {}
+        context = '\n'.join(ScriptedModel.text(m.get('content', '')) for m in messages)
+        plans = re.findall(r'/home/coder/\.coder/plans/PLAN-[0-9a-f-]{36}\.md', context)
+        if plans:
+            values['chat_plan'] = plans[-1]
+        for message in messages:
+            if message.get('role') != 'tool':
+                continue
+            for line in ScriptedModel.text(message.get('content', '')).splitlines():
+                if re.fullmatch(r'[A-Za-z0-9._/-]+/T-[0-9]+', line):
+                    values['branch'] = line
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    if '"phase"' in line and '"review_round"' in line:
+                        for key in ('revision', 'round', 'head'):
+                            values.pop(key, None)
+                    continue
+                if isinstance(item, dict) and 'phase' in item and 'review_round' in item:
+                    values.update(revision=item['revision'], round=item['review_round'], head=item.get('head'))
+                if isinstance(item, dict) and 'number' in item and 'head' in item:
+                    values['pr_number'] = item['number']
+        return values
+
     def complete(self, body):
         model = body.get('model')
         if model not in self.scripts:
@@ -35,15 +78,43 @@ class ScriptedModel:
         messages = body.get('messages')
         if not isinstance(messages, list) or not messages:
             raise Rejected(400, 'Messages are required')
+        script = self.scripts[model]
+        session = model
+        if isinstance(script, dict):
+            auxiliary = script.get('auxiliary', [])
+            if isinstance(auxiliary, dict):
+                auxiliary = [auxiliary]
+            for response in auxiliary:
+                if any(m.get('role') == 'system' and response['contains'] in
+                        self.text(m.get('content', '')) for m in messages):
+                    return {'id': 'chatcmpl-auxiliary', 'object': 'chat.completion', 'created': 0,
+                        'model': model, 'choices': [{'index': 0, 'message': {
+                            'role': 'assistant', 'content': response['text']}, 'finish_reason': 'stop'}],
+                        'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}}
+            users = [(i, m.get('content')) for i, m in enumerate(messages) if m.get('role') == 'user']
+            if script.get('turn_contains'):
+                users = [(i, content) for i, content in users if any(
+                    phrase in self.text(content) for phrase in script['turn_contains'])]
+            def matches(route):
+                phrases = route['contains'] if isinstance(route['contains'], list) else [route['contains']]
+                candidates = users[-1:] if script.get('turn_contains') else users
+                return any(phrase in self.text(content) for _, content in candidates for phrase in phrases)
+            routes = [(i, route) for i, route in enumerate(script['routes'])
+                if matches(route)]
+            if len(routes) != 1 or not users:
+                raise Rejected(400, 'Expected one explicit conversation route')
+            route_index, route = routes[0]
+            session = hashlib.sha256(json.dumps([model, route_index, users[0], users[-1]],
+                sort_keys=True).encode()).hexdigest()[:24]
+            script = route['steps']
         fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
         if fingerprint in self.cache:
             return self.cache[fingerprint]
-        index = self.positions.get(model, 0)
-        script = self.scripts[model]
+        index = self.positions.get(session, 0)
         if index >= len(script):
             raise Rejected(409, 'Scenario exhausted')
         step = script[index]
-        previous = self.previous_calls.get(model)
+        previous = self.previous_calls.get(session)
         if previous:
             results = [m for m in messages if m.get('role') == 'tool' and
                 m.get('tool_call_id') == previous]
@@ -51,7 +122,7 @@ class ScriptedModel:
                 raise Rejected(409, 'Expected the matching tool result')
             required = step.get('requires', {}).get('contains')
             content = results[0].get('content')
-            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            text = self.text(content)
             if required and required not in text:
                 raise Rejected(409, 'Tool result did not satisfy the scenario')
         message = {'role': 'assistant', 'content': step.get('text')}
@@ -62,7 +133,10 @@ class ScriptedModel:
             function = next((f for f in functions if f.get('name') == step['tool']), None)
             if function is None:
                 raise Rejected(400, 'Scripted tool was not advertised by the caller')
-            arguments = step['arguments']
+            values = self.variables(messages)
+            arguments = {name: re.sub(r'\{(chat_plan|revision|round|head|branch|pr_number)\}',
+                lambda match: str(values[match[1]]), value) if isinstance(value, str) else value
+                for name, value in step['arguments'].items()}
             schema = function.get('parameters', {})
             properties = schema.get('properties', {})
             if not set(schema.get('required', [])).issubset(arguments):
@@ -76,18 +150,18 @@ class ScriptedModel:
                 if expected and (not isinstance(value, expected) or
                     (isinstance(value, bool) and properties[name].get('type') in ('integer', 'number'))):
                     raise Rejected(400, 'Scripted argument has the wrong type')
-            call_id = f'call_{model}_{index}'
+            call_id = f'call_{session}_{index}'
             message['tool_calls'] = [{'id': call_id, 'type': 'function', 'function': {
                 'name': step['tool'], 'arguments': json.dumps(arguments)}}]
-            self.previous_calls[model] = call_id
+            self.previous_calls[session] = call_id
             reason = 'tool_calls'
         else:
-            self.previous_calls.pop(model, None)
-        response = {'id': f'chatcmpl-{model}-{index}', 'object': 'chat.completion',
+            self.previous_calls.pop(session, None)
+        response = {'id': f'chatcmpl-{session}-{index}', 'object': 'chat.completion',
             'created': 0, 'model': model, 'choices': [{'index': 0, 'message': message,
                 'finish_reason': reason}],
             'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}}
-        self.positions[model] = index + 1
+        self.positions[session] = index + 1
         self.cache[fingerprint] = response
         return response
 
@@ -172,7 +246,8 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.lock:
                     with self.server.journal.open('a') as journal:
                         journal.write(json.dumps({'method': self.command, 'path': path,
-                            'status': status, 'response': response}) + '\n')
+                            'status': status, 'response': response,
+                            'request': body if self.server.service == 'model' else None}) + '\n')
         if status == 200 and self.server.service == 'model' and body.get('stream'):
             self.send_stream(response)
         else:
