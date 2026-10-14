@@ -6,6 +6,11 @@ NEXUS testing dispatch and lifecycle hooks share strategy guidance, and the
 registry provisions `sentinel-testing` alongside the existing review skills.
 Neither dispatch nor the harness chooses checks by language or file extension.
 
+On startup and orchestration reset, existing registries gain the required
+`sentinel-testing` skill if their SENTINEL entry lacks it. The upgrade appends
+only that skill, preserves role toggles and other settings, and leaves an absent
+SENTINEL role absent. Repeated upgrades do not duplicate the entry.
+
 Before requesting execution, SENTINEL records a strategy in `review.md`: each
 criterion or regression risk, the observable evidence required, selected checks,
 necessary dependencies and reasons omitted broader checks are unnecessary.
