@@ -1228,7 +1228,7 @@ Before significant work, read the relevant skill file to understand the workflow
             .rsplit_once('-')
             .and_then(|(_, value)| value.parse::<i32>().ok());
         let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
-        let branch = Self::resolve_workspace_branch(&pending_prs, worker_id, ticket_id);
+        let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
         let idempotency_store_key = format!("runtime:worker-request:{worker_id}:{ticket_id}");
         let idempotency_key: String = store
             .get_typed(&idempotency_store_key)
