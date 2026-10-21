@@ -101,6 +101,8 @@ impl RedisIsolationBackend for FredRedisIsolation {
             "+ping".into(),
             "+publish".into(),
             "+subscribe".into(),
+            "+eval".into(),
+            "+evalsha".into(),
             "-keys".into(),
             "-scan".into(),
             "-acl".into(),

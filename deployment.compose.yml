@@ -48,6 +48,9 @@ services:
       CODER_OAUTH2_PROVIDER_ENABLE: "true"
       # v2.37 uses the experiment; newer versions use PROVIDER_ENABLE above.
       CODER_EXPERIMENTS: oauth2
+      CODER_CHAT_HOOK_URL: ${OPENFLOWS_HOOK_URL:-http://openflows-nexus:3001/experimental/hooks/chat}
+      CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:?Set CODER_CHAT_HOOK_SECRET to 32+ random bytes}
+      CODER_CHAT_HOOK_ENABLED: "true"
       CODER_PROVISIONER_DAEMONS: "1"
       TF_PLUGIN_CACHE_DIR: /root/.terraform.d/plugin-cache
     secrets: [coder_github_secret]

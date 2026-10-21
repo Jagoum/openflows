@@ -90,6 +90,14 @@ data "coder_parameter" "tenant" {
   type        = "string"
 }
 
+data "coder_parameter" "fleet_size" {
+  name        = "fleet_size"
+  description = "Requested number of Forge/Sentinel worker pairs"
+  default     = "1"
+  type        = "number"
+  mutable     = false
+}
+
 data "coder_parameter" "registry_json" {
   name        = "registry_json"
   description  = "Registry JSON injected into the Nexus workspace"
@@ -230,6 +238,7 @@ PY
       # control-plane calls. It is intentionally distinct from Coder user
       # credentials, which are never exported into the workspace.
       export OPENFLOWS_MANAGER_URL="$OF_MANAGER_URL"
+      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
       GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
       GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
     else
@@ -297,6 +306,7 @@ PY
     # delivery channel.
     if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
       export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    export OPENFLOWS_FLEET_SIZE="${data.coder_parameter.fleet_size.value}"
       export OPENFLOWS_REDIS_USERNAME="${data.coder_parameter.redis_username.value}"
       export OPENFLOWS_REDIS_NAMESPACE="${data.coder_parameter.redis_namespace.value}"
     fi
@@ -410,7 +420,7 @@ resource "docker_container" "workspace" {
     name = var.docker_network
     # Stable service name so forge/sentinel templates can default
     # A2A_RELAY_ADDR to openflows-nexus:3000 without knowing the workspace id.
-    aliases = ["openflows-nexus-${data.coder_parameter.tenant.value}"]
+    aliases = data.coder_parameter.hosted.value == "true" ? ["openflows-nexus-${data.coder_parameter.tenant.value}"] : ["openflows-nexus"]
   }
 
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]

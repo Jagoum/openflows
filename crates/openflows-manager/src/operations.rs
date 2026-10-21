@@ -204,12 +204,16 @@ pub async fn claim_kinds_with_org_slot(
 
     let candidates = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
         "SELECT id, organization_id
-           FROM operations
-          WHERE (state IN ('queued', 'running')
+           FROM (
+             SELECT DISTINCT ON (organization_id) id, organization_id, created_at
+               FROM operations
+              WHERE (state IN ('queued', 'running')
                  OR (state = 'retryable_failed' AND retry_at IS NOT NULL))
-            AND (lease_expires_at IS NULL OR lease_expires_at < now())
-            AND (retry_at IS NULL OR retry_at <= now())
-            AND kind = ANY($1::text[])
+                AND (lease_expires_at IS NULL OR lease_expires_at < now())
+                AND (retry_at IS NULL OR retry_at <= now())
+                AND kind = ANY($1::text[])
+              ORDER BY organization_id, created_at
+           ) candidates
           ORDER BY created_at
           LIMIT 64",
     )

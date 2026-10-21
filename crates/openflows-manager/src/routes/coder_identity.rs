@@ -283,29 +283,46 @@ pub async fn callback(
     let id = verified_user_id(&user)?;
     // Retain only the renewable credential, behind the configured secret
     // provider. The short-lived access token is never persisted or returned.
-    let secret_name = format!("coder-user-refresh-{}", principal.user_id.0);
-    let existing_ref: Option<String> = sqlx::query_scalar(
-        "SELECT coder_refresh_secret_ref FROM coder_user_links WHERE user_id=$1",
+    let existing: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT coder_url, coder_user_id, coder_refresh_secret_ref
+           FROM coder_user_links WHERE user_id=$1",
+    )
+    .bind(principal.user_id.0)
+    .fetch_optional(services.db.pool())
+    .await?;
+    if let Some((existing_url, existing_id, _)) = &existing {
+        if existing_url != &base || existing_id != &id {
+            return Err(ManagerError::Conflict(
+                "Coder account already linked; ownership changes require an explicit migration"
+                    .into(),
+            ));
+        }
+    }
+    let refresh_ref = match existing {
+        Some((_, _, reference)) => reference,
+        None => services
+            .secret_provider
+            .put(
+                &format!("coder-user-refresh-{}", principal.user_id.0),
+                refresh_token.as_bytes(),
+            )
+            .await
+            .map_err(|_| failure())?,
+    };
+    if let Some((_, _, reference)) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT coder_url, coder_user_id, coder_refresh_secret_ref
+           FROM coder_user_links WHERE user_id=$1",
     )
     .bind(principal.user_id.0)
     .fetch_optional(services.db.pool())
     .await?
-    .flatten();
-    let refresh_ref = match existing_ref {
-        Some(reference) => {
-            services
-                .secret_provider
-                .replace(&reference, refresh_token.as_bytes())
-                .await
-                .map_err(|_| failure())?;
-            reference
-        }
-        None => services
+    {
+        services
             .secret_provider
-            .put(&secret_name, refresh_token.as_bytes())
+            .replace(&reference, refresh_token.as_bytes())
             .await
-            .map_err(|_| failure())?,
-    };
+            .map_err(|_| failure())?;
+    }
     let mut tx = services.db.pool().begin().await?;
     let inserted = sqlx::query("INSERT INTO coder_user_links(user_id,coder_url,coder_user_id,coder_refresh_secret_ref) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
         .bind(principal.user_id.0).bind(&base).bind(id).bind(&refresh_ref).execute(&mut *tx).await?;
@@ -313,10 +330,7 @@ pub async fn callback(
         let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coder_user_links WHERE user_id=$1 AND coder_url=$2 AND coder_user_id=$3)")
             .bind(principal.user_id.0).bind(&base).bind(id).fetch_one(&mut *tx).await?;
         if !same {
-            return Err(ManagerError::Conflict(
-                "Coder account already linked; ownership changes require an explicit migration"
-                    .into(),
-            ));
+            unreachable!("existing link was validated before updating its credential")
         }
         sqlx::query("UPDATE coder_user_links SET coder_refresh_secret_ref=$2 WHERE user_id=$1")
             .bind(principal.user_id.0)

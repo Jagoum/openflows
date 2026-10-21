@@ -301,7 +301,9 @@ PY
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
     # Use the BASE role so the controller can find the heartbeat under the
     # base-role key (not the worker id — sentinel always matches base role).
-    export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
+      export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    fi
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="sentinel"

@@ -250,6 +250,7 @@ impl RuntimeCredentialService {
             .rotate_credential_pair(
                 id,
                 workspace_id,
+                None,
                 &secret.hash(),
                 expires_at,
                 refresh_id,
@@ -293,6 +294,7 @@ impl RuntimeCredentialService {
             .rotate_credential_pair(
                 access_id,
                 scope.workspace_id,
+                Some(&crate::auth::crypto::hash_token(raw_refresh)),
                 &access.hash(),
                 access_expires_at,
                 refresh_id,

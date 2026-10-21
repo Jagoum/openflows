@@ -102,6 +102,30 @@ impl TenantRuntimeRepository {
         &self.pool
     }
 
+    /// Reconcile active tenant ACLs after a Redis restart. Redis ACL users are
+    /// server state, while the credential rows and secret references are the
+    /// durable source of truth.
+    pub async fn restore_redis_credentials(&self) -> Result<(), ManagerError> {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT username, namespace, secret_ref, tenant_id::text
+               FROM tenant_redis_credentials
+              WHERE revoked_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (username, namespace, secret_ref, _tenant_id) in rows {
+            let password = self.secret_provider.get(&secret_ref).await.map_err(|e| {
+                ManagerError::Config(format!("cannot restore tenant Redis secret: {e}"))
+            })?;
+            let password = std::str::from_utf8(&password)
+                .map_err(|_| ManagerError::Config("tenant Redis secret is not UTF-8".into()))?;
+            self.redis_isolation
+                .ensure_tenant(&username, password, &namespace)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Allocate a tenant-scoped Redis credential and its immutable namespace.
     /// Returns the issued credential with the raw password mounted exactly once
     /// (the caller stores the secret reference; only the hash is persisted).
@@ -176,7 +200,15 @@ impl TenantRuntimeRepository {
     ) -> Result<TenantRedisCredential, ManagerError> {
         if let Some(existing) = self.redis_credential(org_id, tenant_id).await? {
             match self.secret_provider.get(&existing.secret_ref).await {
-                Ok(_) => return Ok(existing),
+                Ok(password) => {
+                    let password = std::str::from_utf8(&password).map_err(|_| {
+                        ManagerError::Config("tenant Redis secret is not UTF-8".into())
+                    })?;
+                    self.redis_isolation
+                        .ensure_tenant(&existing.username, password, &existing.namespace)
+                        .await?;
+                    return Ok(existing);
+                }
                 Err(crate::secrets::SecretError::NotFound(_)) => {
                     // The database is durable, but an in-memory development
                     // provider is not. Revoke the stale row and converge on a
@@ -361,19 +393,26 @@ impl TenantRuntimeRepository {
         redis_url
             .set_password(Some(redis_password.as_str()))
             .map_err(|_| ManagerError::Config("invalid Redis password".into()))?;
-        let payload = Zeroizing::new(serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "workspace_id": workspace_id,
-            "tenant_id": tenant_id,
-            "manager_url": manager_url.trim_end_matches('/'),
-            "bootstrap_token": bootstrap.as_str(),
-            "redis_url": redis_url.as_str(),
-            "redis_username": redis.username,
-            "redis_namespace": redis.namespace,
-            "hook_key": hook_key.as_str(),
-            "hook_url": format!("http://openflows-nexus-{tenant_id}:3001/experimental/hooks/chat"),
-        }))
-        .map_err(|e| ManagerError::Service(e.into()))?);
+        let relay_base = std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL")
+            .unwrap_or_else(|_| format!("http://openflows-nexus-{tenant_id}:3001"))
+            .replace("{tenant}", &tenant_id.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let payload = Zeroizing::new(
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "workspace_id": workspace_id,
+                "tenant_id": tenant_id,
+                "manager_url": manager_url.trim_end_matches('/'),
+                "bootstrap_token": bootstrap.as_str(),
+                "redis_url": redis_url.as_str(),
+                "redis_username": redis.username,
+                "redis_namespace": redis.namespace,
+                "hook_key": hook_key.as_str(),
+                "hook_url": format!("{relay_base}/experimental/hooks/chat"),
+            }))
+            .map_err(|e| ManagerError::Service(e.into()))?,
+        );
         let stored_secret_ref = if let Some(existing) = existing_bundle {
             match self.secret_provider.replace(&existing, &payload).await {
                 Ok(()) => existing,

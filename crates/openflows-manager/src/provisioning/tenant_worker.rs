@@ -257,8 +257,11 @@ impl TenantProvisionWorker {
         }
         sqlx::query("UPDATE workspaces SET desired_state = 'stopped', observed_state = 'stopped', updated_at = now() WHERE tenant_id = $1 AND desired_state <> 'deleted'")
             .bind(tenant_id.0).execute(&mut *tx).await?;
-        sqlx::query("UPDATE tenants SET desired_state = 'paused', observed_state = 'paused', updated_at = now() WHERE id = $1")
+        let changed = sqlx::query("UPDATE tenants SET desired_state = 'paused', observed_state = 'paused', updated_at = now() WHERE id = $1 AND desired_state <> 'deleted'")
             .bind(tenant_id.0).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Ok(TenantProvisionOutcome::StaleLease);
+        }
         if !guard
             .complete_in_tx(
                 &mut tx,
@@ -289,6 +292,9 @@ impl TenantProvisionWorker {
         .await?;
         for (id, workspace, org) in &rows {
             let workspace_id = crate::id::WorkspaceId::from_uuid(*id);
+            if self.runtime_registered_and_healthy(workspace_id).await? {
+                continue;
+            }
             let bootstrap_ref = self
                 .runtime_credentials
                 .ensure_bootstrap_ref(crate::id::WorkspaceId::from_uuid(*id))
@@ -385,9 +391,10 @@ impl TenantProvisionWorker {
             String,
             Option<String>,
             Option<i32>,
+            i32,
         ) = sqlx::query_as(
             "SELECT w.id, w.role, o.coder_organization_id, w.tenant_id,
-                    r.full_name, w.branch, w.slot
+            r.full_name, w.branch, w.slot, t.fleet_size
                FROM workspaces w JOIN organizations o ON o.id = w.organization_id
                JOIN tenants t ON t.id = w.tenant_id AND t.organization_id = w.organization_id
                JOIN github_repositories r ON r.organization_id = t.organization_id
@@ -488,6 +495,10 @@ impl TenantProvisionWorker {
                         value: row.6.map(|value| value.to_string()).unwrap_or_default(),
                     },
                     coder_client::types::WorkspaceParameterValue {
+                        name: "fleet_size".into(),
+                        value: row.7.to_string(),
+                    },
+                    coder_client::types::WorkspaceParameterValue {
                         name: "a2a_relay_addr".into(),
                         value: format!("openflows-nexus-{}:3000", row.3),
                     },
@@ -500,6 +511,11 @@ impl TenantProvisionWorker {
                 "worker workspace scope mismatch",
             ));
         }
+        // Persist the upstream identifier before waiting for readiness so a
+        // failed build can still be deleted during tenant cleanup.
+        self.tenant_runtime
+            .set_coder_workspace_id(crate::id::WorkspaceId::from_uuid(row.0), &created.id)
+            .await?;
         self.adapter.wait_workspace_ready(&org, &created.id).await?;
         if !self
             .runtime_registered_and_healthy(crate::id::WorkspaceId::from_uuid(row.0))
@@ -519,7 +535,7 @@ impl TenantProvisionWorker {
         if !guard.lock_in_tx(&mut tx).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
-        sqlx::query("UPDATE workspaces SET coder_workspace_id = $1, observed_state = 'running', updated_at = now() WHERE id = $2").bind(created.id).bind(row.0).execute(&mut *tx).await?;
+        sqlx::query("UPDATE workspaces SET desired_state = 'running', observed_state = 'running', updated_at = now() WHERE id = $1").bind(row.0).execute(&mut *tx).await?;
         if !guard
             .complete_in_tx(
                 &mut tx,
@@ -714,6 +730,10 @@ impl TenantProvisionWorker {
         let compact_tenant = tenant_id.0.simple().to_string();
         let workspace_name = format!("of-nexus-{}", &compact_tenant[..20]);
         let repository = self.tenant_repository_full_name(tenant_id).await?;
+        let fleet_size: i32 = sqlx::query_scalar("SELECT fleet_size FROM tenants WHERE id = $1")
+            .bind(tenant_id.0)
+            .fetch_one(&self.pool)
+            .await?;
         let created = match self
             .adapter
             .create_tenant_workspace_with_parameters(
@@ -746,6 +766,10 @@ impl TenantProvisionWorker {
                     coder_client::types::WorkspaceParameterValue {
                         name: "github_repository".into(),
                         value: repository,
+                    },
+                    coder_client::types::WorkspaceParameterValue {
+                        name: "fleet_size".into(),
+                        value: fleet_size.to_string(),
                     },
                 ],
             )

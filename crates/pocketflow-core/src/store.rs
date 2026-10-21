@@ -66,25 +66,15 @@ impl RedisBackend {
     }
 
     async fn keys(&self, pattern: &str) -> Vec<String> {
-        use fred::types::scan::Scanner;
-        use futures::StreamExt;
-        let mut keys = Vec::new();
-        let mut stream = self.client.scan(pattern, None, None);
-        while let Some(result) = stream.next().await {
-            if let Ok(mut scan_result) = result {
-                if let Some(page) = scan_result.take_results() {
-                    for key in page {
-                        if let Some(s) = key.into_string() {
-                            keys.push(s);
-                        }
-                    }
-                }
-                if scan_result.has_more() {
-                    scan_result.next();
-                }
-            }
-        }
-        keys
+        use fred::interfaces::SetsInterface;
+        let Some(index) = tenant_index_key(pattern) else {
+            return Vec::new();
+        };
+        let keys: Vec<String> = self.client.smembers(index).await.unwrap_or_default();
+        let prefix = pattern.trim_end_matches('*');
+        keys.into_iter()
+            .filter(|key| key.starts_with(prefix))
+            .collect()
     }
 
     async fn ping(&self) -> Result<()> {
@@ -158,6 +148,9 @@ impl Backend {
                     {
                         warn!(key, %error, "Redis set failed");
                     }
+                    if let Some(index) = tenant_index_key(key) {
+                        let _ = b.client.sadd::<i64, _, _>(index, key).await;
+                    }
                 }
             }
         }
@@ -172,6 +165,9 @@ impl Backend {
                 use fred::prelude::*;
                 if let Err(error) = bounded_redis::<i64, _, _>("DEL", b.client.del(key)).await {
                     warn!(key, %error, "Redis del failed");
+                }
+                if let Some(index) = tenant_index_key(key) {
+                    let _ = b.client.srem::<i64, _, _>(index, key).await;
                 }
             }
         }
@@ -204,6 +200,12 @@ impl Backend {
                 .context("Redis PING timed out")?,
         }
     }
+}
+
+fn tenant_index_key(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("ns:")?;
+    let tenant = rest.split_once(':')?.0;
+    Some(format!("ns:{tenant}:_keys"))
 }
 
 // ── SharedStore (public API) ──────────────────────────────────────────────

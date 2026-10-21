@@ -265,13 +265,14 @@ pub(crate) fn validate_resource_state(scope: &RuntimeScope) -> Result<(), Manage
     }
     // A workspace's startup script needs a repository-scoped GitHub token
     // before the provisioning worker can mark its desired state as running.
-    // Permit this bootstrap window only after the tenant is still being
-    // provisioned and the runtime has registered and heartbeated as running.
-    // Once the tenant is active, retain the normal desired=running gate.
+    // Permit this bootstrap window for Nexus and worker workspaces after
+    // registration and heartbeat, regardless of whether the tenant has
+    // already reached running state.
     let workspace_is_running = scope.workspace_observed_state == "running"
-        && (scope.workspace_desired_state == "running"
-            || (scope.workspace_desired_state == "provisioning"
-                && scope.tenant_desired_state == "provisioning"));
+        && matches!(
+            scope.workspace_desired_state.as_str(),
+            "running" | "provisioning"
+        );
     if !workspace_is_running {
         return Err(ManagerError::api(
             "WORKSPACE_UNAVAILABLE",

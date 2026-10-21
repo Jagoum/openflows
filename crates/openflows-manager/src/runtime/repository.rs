@@ -338,6 +338,7 @@ impl RuntimeRepository {
         &self,
         access_id: uuid::Uuid,
         workspace_id: WorkspaceId,
+        presented_refresh_hash: Option<&str>,
         access_hash: &str,
         access_expires_at: DateTime<Utc>,
         refresh_id: uuid::Uuid,
@@ -348,8 +349,18 @@ impl RuntimeRepository {
         let mut tx = self.pool.begin().await?;
         let generation: i64 = sqlx::query_scalar(
             "UPDATE workspaces SET credential_generation = credential_generation + 1, updated_at = now()
-             WHERE id = $1 RETURNING credential_generation",
-        ).bind(workspace_id.0).fetch_optional(&mut *tx).await?
+             WHERE id = $1
+               AND ($2::text IS NULL OR EXISTS (
+                 SELECT 1 FROM runtime_credentials rc
+                  WHERE rc.workspace_id = workspaces.id
+                    AND rc.credential_hash = $2
+                    AND rc.audience = 'openflows-workspace-refresh'
+                    AND rc.revoked_at IS NULL
+                    AND rc.expires_at > clock_timestamp()
+                    AND rc.generation = workspaces.credential_generation
+               ))
+             RETURNING credential_generation",
+        ).bind(workspace_id.0).bind(presented_refresh_hash).fetch_optional(&mut *tx).await?
             .ok_or_else(|| ManagerError::not_found("workspace"))?;
         sqlx::query("UPDATE runtime_credentials SET revoked_at = clock_timestamp() WHERE workspace_id = $1 AND revoked_at IS NULL")
             .bind(workspace_id.0).execute(&mut *tx).await?;
@@ -566,8 +577,7 @@ impl RuntimeRepository {
               AND t.desired_state IN ('running', 'provisioning')
               AND t.observed_state NOT IN ('deleted', 'deleting')
               AND w.observed_state = 'running'
-              AND (w.desired_state = 'running'
-                   OR (w.desired_state = 'provisioning' AND t.desired_state = 'provisioning'))
+              AND w.desired_state IN ('running', 'provisioning')
               AND w.role = $10 AND r.accessible
             FOR UPDATE OF r")
             .bind(scope.organization_id.0).bind(scope.tenant_id.0).bind(scope.workspace_id.0)
@@ -648,7 +658,7 @@ impl RuntimeRepository {
               WHERE l.id = $1 AND c.access_generation = $2
                 AND w.credential_generation = $3
                 AND c.status = 'active' AND w.observed_state = 'running'
-                AND w.desired_state = 'running'",
+                AND w.desired_state IN ('running', 'provisioning')",
         )
         .bind(lease_id.0)
         .bind(expected_connection_generation)

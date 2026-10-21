@@ -154,7 +154,8 @@ impl ZepService {
 
     /// Apply the custom graph ontology to the shared org knowledge graph.
     pub async fn apply_org_ontology(&self) -> Result<(), ManagerError> {
-        let req = crate::zep::ontology::org_graph_ontology_request();
+        let mut req = crate::zep::ontology::org_graph_ontology_request();
+        req.graph_ids = Some(vec![self.org_graph_id.clone()]);
         self.client.graph_set_ontology(&req).await.map(|_| ())
     }
 }

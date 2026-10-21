@@ -70,8 +70,10 @@ steps below remain a reference for externally managed OAuth registrations.
 6. Check that retries retain that owner, and another tenant created by the same
    user can use the same account.
 
-No manual Coder API token is required from the user. OAuth tokens are not stored
-as the durable identity; only the deployment and verified Coder user ID are.
+No manual Coder API token is required from the user. The verified Coder user ID
+and deployment form the durable identity; the renewable OAuth refresh credential
+is stored separately in the configured secret provider. Operators must protect
+and revoke it when the account is disconnected.
 
 ## Existing tenants
 

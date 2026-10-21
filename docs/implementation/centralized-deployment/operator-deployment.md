@@ -54,10 +54,12 @@ the existing `openflows doctor` diagnoses the tenant controller.
    The pinned Coder v2.37.3 uses the `oauth2` experiment and `callback_url` API
    field; the supplied Compose/setup code handles those differences. Its OAuth
    tokens do not enforce the requested scope, even though scopes are advertised.
-   The link handler uses the token only to identify the account and attempts
-   revocation immediately. Do not assume the requested `user:read_personal`
-   scope limits tokens on this Coder version. Production deployment must also
-   validate OAuth scope enforcement in its selected Coder release.
+   The link handler verifies the account and stores its renewable OAuth refresh
+   credential in the configured secret provider. Protect and rotate this secret
+   as a user credential; disconnecting an account must revoke it. Do not assume
+   the requested `user:read_personal` scope limits tokens on this Coder version.
+   Production deployment must validate OAuth scope enforcement in its selected
+   Coder release.
 4. Authorize setup once against an existing Coder deployment:
 
    ```sh

@@ -80,7 +80,7 @@ pub async fn receive(
     );
     let claims = verify(&auth, secret, &expected_audience, &envelope, body.as_ref())?;
 
-    let target: Option<(uuid::Uuid, uuid::Uuid, String)> = sqlx::query_as(
+    let targets: Vec<(uuid::Uuid, uuid::Uuid, String)> = sqlx::query_as(
         "SELECT source.organization_id, source.tenant_id,
                 hook.secret_ref
            FROM workspaces source
@@ -97,17 +97,39 @@ pub async fn receive(
     )
     .bind(envelope.meta.workspace_id.as_deref())
     .bind(&envelope.meta.owner_id)
-    .fetch_optional(services.db.pool())
+    .fetch_all(services.db.pool())
     .await?;
+    let target = if envelope.meta.workspace_id.is_none() && targets.len() != 1 {
+        return Err(ManagerError::api(
+            "AMBIGUOUS_HOOK_WORKSPACE",
+            "workspace_id is required when the Coder owner has multiple tenants",
+        ));
+    } else {
+        targets.into_iter().next()
+    };
     let (_organization_id, tenant_id, hook_secret_ref) =
         target.ok_or_else(|| ManagerError::not_found("hook workspace"))?;
 
     // Best-effort: ensure a Zep thread exists for this conversation so the
     // agents can persist and later recall the discussion. Keyed by our chat id
     // and the Coder owner id. Non-fatal; Zep is never on the relay path.
-    if let Some(zep) = &services.zep {
-        zep.thread_create(&envelope.meta.chat_id, &envelope.meta.owner_id)
-            .await;
+    if let Some(zep) = services.zep.clone() {
+        let chat_id = envelope.meta.chat_id.clone();
+        let owner_id = envelope.meta.owner_id.clone();
+        let db = services.db.pool().clone();
+        tokio::spawn(async move {
+            let user_id: Option<uuid::Uuid> = sqlx::query_scalar(
+                "SELECT user_id FROM coder_user_links WHERE coder_user_id = $1 LIMIT 1",
+            )
+            .bind(owner_id)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten();
+            if let Some(user_id) = user_id {
+                zep.thread_create(&chat_id, &user_id.to_string()).await;
+            }
+        });
     }
 
     let tenant_secret = zeroize::Zeroizing::new(
@@ -119,7 +141,12 @@ pub async fn receive(
                 ManagerError::api("SERVICE_UNAVAILABLE", "tenant hook channel unavailable")
             })?,
     );
-    let relay_url = format!("http://openflows-nexus-{tenant_id}:3001/experimental/hooks/chat");
+    let relay_base = std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL")
+        .unwrap_or_else(|_| format!("http://openflows-nexus-{tenant_id}:3001"))
+        .replace("{tenant}", &tenant_id.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let relay_url = format!("{relay_base}/experimental/hooks/chat");
     let relay_claims = HookClaims {
         iss: "openflows-manager".into(),
         aud: relay_url.clone(),

@@ -154,9 +154,20 @@ async fn populate_development_secrets(
                     .await
                     .map_err(|_| ManagerError::Config("cannot verify development secret".into()))?;
                 if current != value.as_bytes() {
-                    return Err(ManagerError::Config(format!(
-                        "development secret '{name}' differs from the existing stored value"
-                    )));
+                    if name == "master-key" || name.ends_with("/master-key") {
+                        return Err(ManagerError::Config(
+                            "development master key differs from the existing stored value; refusing to replace it"
+                                .into(),
+                        ));
+                    }
+                    provider
+                        .replace(&name, value.as_bytes())
+                        .await
+                        .map_err(|_| {
+                            ManagerError::Config(format!(
+                                "cannot renew development secret '{name}'"
+                            ))
+                        })?;
                 }
             }
             Err(_) => {
@@ -524,6 +535,7 @@ impl ManagerServices {
             provider.clone(),
             redis_isolation,
         );
+        services.tenant_runtime.restore_redis_credentials().await?;
         services.runtime_credentials =
             crate::runtime::RuntimeCredentialService::with_secret_provider(
                 services.runtime_repo.clone(),

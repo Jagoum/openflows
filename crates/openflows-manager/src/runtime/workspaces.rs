@@ -114,6 +114,11 @@ impl RuntimeWorkspaceService {
         // Sanitize the branch/ticket association; slot is validated below.
         let ticket_id = ticket_id.map(|t| t.to_string());
 
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(scope.tenant_id.0)
+            .execute(&mut *tx)
+            .await?;
         let existing: Option<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
             "SELECT o.id, w.id FROM operations o
                JOIN workspaces w ON w.id = o.resource_id
@@ -123,9 +128,10 @@ impl RuntimeWorkspaceService {
         .bind(scope.organization_id.0)
         .bind(idempotency_key)
         .bind(scope.tenant_id.0)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some((operation_id, workspace_id)) = existing {
+            tx.commit().await?;
             return Ok(RuntimeWorkspaceResponse {
                 workspace_id: workspace_id.to_string(),
                 operation_id: operation_id.to_string(),
@@ -134,7 +140,6 @@ impl RuntimeWorkspaceService {
         }
 
         // Validate the slot and reserve capacity transactionally.
-        let mut tx = self.pool.begin().await?;
         // The caller is authorized by the authenticated Nexus runtime; derive
         // the tenant/org from the scope (never from the request body).
         let org_id = scope.organization_id;

@@ -343,7 +343,9 @@ PY
       sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
     fi
 
-    if [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      log "Hosted GitHub App installation token configured; personal gh identity check is not applicable"
+    elif [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
       # Authenticate gh persistently as the inherited identity for BOTH the
       # `coder` user and `root` (the sudo'd clone below uses root's $HOME).
       # --hostname + --git-protocol make the stored credential explicit and
@@ -361,9 +363,15 @@ PY
     # Resolve the expected account from the inherited token via the GitHub API
     # (the coder_external_auth data source does not expose the login). Honor
     # GITHUB_API_BASE so self-hosted setups match the rest of the system.
-    EXPECTED_LOGIN=$(curl -fsSL -H "Authorization: token $GIT_TOKEN" "$${GITHUB_API_BASE:-https://api.github.com}/user" \
-      | python3 -c 'import sys,json;print(json.load(sys.stdin)["login"])') \
-      || { log "FATAL: could not resolve the inherited GitHub identity from the external-auth token"; exit 1; }
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      # Installation tokens are repository-scoped and intentionally do not
+      # expose a personal /user identity. Commits are authored as the App bot.
+      EXPECTED_LOGIN="openflows[bot]"
+    else
+      EXPECTED_LOGIN=$(curl -fsSL -H "Authorization: token $GIT_TOKEN" "$${GITHUB_API_BASE:-https://api.github.com}/user" \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["login"])') \
+        || { log "FATAL: could not resolve the inherited GitHub identity from the external-auth token"; exit 1; }
+    fi
     if [ -z "$EXPECTED_LOGIN" ]; then
       log "FATAL: resolved an empty inherited GitHub identity from the external-auth token"
       exit 1
@@ -514,7 +522,9 @@ PY
     # OPENFLOWS_ROLE must be the BASE role (forge), not the worker id
     # (forge-1): the controller writes dispatch and reads heartbeats under
     # the base-role key, so a worker-id role would never match.
-    export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
+      export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    fi
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="$ROLE_BASE"

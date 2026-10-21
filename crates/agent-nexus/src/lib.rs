@@ -817,9 +817,16 @@ Before significant work, read the relevant skill file to understand the workflow
     }
 
     async fn sync_registry(&self, store: &SharedStore) -> Result<()> {
-        let registry = self
+        let mut registry = self
             .load_registry()
             .context("Cannot initialize worker fleet from registry")?;
+        if let Ok(value) = std::env::var("OPENFLOWS_FLEET_SIZE") {
+            let pairs: u32 = value
+                .parse()
+                .context("OPENFLOWS_FLEET_SIZE must be a positive integer")?;
+            anyhow::ensure!(pairs > 0, "OPENFLOWS_FLEET_SIZE must be positive");
+            registry = registry.with_team_fleet(pairs);
+        }
         anyhow::ensure!(
             !registry.forge_slots().is_empty(),
             "Worker fleet has no enabled FORGE slots; check enabled and max_instances in {}",
@@ -1243,7 +1250,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 role,
                 slot_number,
                 Some(ticket_id),
-                Some(&branch),
+                (!branch.is_empty()).then_some(branch.as_str()),
                 &idempotency_key,
             )
             .await?;
