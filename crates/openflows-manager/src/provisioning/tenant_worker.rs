@@ -430,6 +430,11 @@ impl TenantProvisionWorker {
             "lore" => Role::Lore,
             _ => return Err(ManagerError::InvalidInput("invalid workspace role".into())),
         };
+        let ticket_id: Option<String> =
+            sqlx::query_scalar("SELECT ticket_id FROM workspaces WHERE id = $1")
+                .bind(row.0)
+                .fetch_one(&self.pool)
+                .await?;
         let version = self
             .release_repo
             .get_org_template_version(guard.organization_id, release_id, role)
@@ -453,6 +458,54 @@ impl TenantProvisionWorker {
                 crate::id::WorkspaceId::from_uuid(row.0),
             )
             .await?;
+        let mut parameters = vec![
+            coder_client::types::WorkspaceParameterValue {
+                name: "hosted".into(),
+                value: "true".into(),
+            },
+            coder_client::types::WorkspaceParameterValue {
+                name: "runtime_secret_ref".into(),
+                value: runtime_secret_ref,
+            },
+            coder_client::types::WorkspaceParameterValue {
+                name: "workspace_image_digest".into(),
+                value: workspace_image_digest,
+            },
+            coder_client::types::WorkspaceParameterValue {
+                name: "role".into(),
+                value: row.1.clone(),
+            },
+            coder_client::types::WorkspaceParameterValue {
+                name: "tenant".into(),
+                value: row.3.to_string(),
+            },
+            coder_client::types::WorkspaceParameterValue {
+                name: "repo_url".into(),
+                value: format!("https://github.com/{}.git", row.4),
+            },
+            coder_client::types::WorkspaceParameterValue {
+                name: "branch".into(),
+                value: row.5.clone().unwrap_or_default(),
+            },
+            coder_client::types::WorkspaceParameterValue {
+                name: "slot".into(),
+                value: row.6.map(|value| value.to_string()).unwrap_or_default(),
+            },
+            coder_client::types::WorkspaceParameterValue {
+                name: "fleet_size".into(),
+                value: row.7.to_string(),
+            },
+            coder_client::types::WorkspaceParameterValue {
+                name: "a2a_relay_addr".into(),
+                value: format!("openflows-nexus-{}:3000", row.3),
+            },
+        ];
+        if let Some(ticket_id) = ticket_id {
+            parameters.push(coder_client::types::WorkspaceParameterValue {
+                name: "ticket_id".into(),
+                value: ticket_id,
+            });
+        }
         let created = self
             .adapter
             .create_tenant_workspace_with_parameters(
@@ -461,48 +514,7 @@ impl TenantProvisionWorker {
                 &template,
                 &version_id,
                 &worker_workspace_name(&row.1, row.0),
-                &[
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "hosted".into(),
-                        value: "true".into(),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "runtime_secret_ref".into(),
-                        value: runtime_secret_ref,
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "workspace_image_digest".into(),
-                        value: workspace_image_digest,
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "role".into(),
-                        value: row.1.clone(),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "tenant".into(),
-                        value: row.3.to_string(),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "repo_url".into(),
-                        value: format!("https://github.com/{}.git", row.4),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "branch".into(),
-                        value: row.5.clone().unwrap_or_default(),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "slot".into(),
-                        value: row.6.map(|value| value.to_string()).unwrap_or_default(),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "fleet_size".into(),
-                        value: row.7.to_string(),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "a2a_relay_addr".into(),
-                        value: format!("openflows-nexus-{}:3000", row.3),
-                    },
-                ],
+                &parameters,
             )
             .await?;
         if created.organization_id != org.0 || created.owner_id != owner.0 {
