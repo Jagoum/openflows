@@ -537,6 +537,75 @@ pub async fn get_operation(
     })))
 }
 
+/// `POST /operations/{id}` — manually requeue an exhausted/retryable
+/// operation using the permission required by its original action.
+pub async fn retry_operation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(op): Path<String>,
+) -> Result<Response, ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let principal = authenticated_user(&headers, &services.session_manager).await?;
+    require_csrf_for_browser(&principal, &headers).await?;
+    let idempotency_key = idempotency_key(&headers)?;
+    let op_id = op
+        .parse::<crate::id::OperationId>()
+        .map_err(|_| ManagerError::not_found("operation"))?;
+    let operation =
+        crate::operations::get_for_user(&services.orgs_service.pool, op_id, principal.user_id)
+            .await?
+            .ok_or_else(|| ManagerError::not_found("operation"))?;
+    let org_id = OrganizationId::from_uuid(operation.organization_id);
+    let (membership, org_state) = services
+        .org_repo
+        .membership_and_org(org_id, principal.user_id)
+        .await?;
+    if matches!(
+        operation.kind.as_str(),
+        "tenant.delete" | "tenant.clean" | "tenant.clean_all" | "organization.provision"
+    ) {
+        Policy::require_admin(membership.as_ref(), org_state.as_ref())?;
+    } else {
+        Policy::require_developer(membership.as_ref(), org_state.as_ref())?;
+    }
+
+    let request_hash = crate::idempotency::IdempotencyRequest::hash_request(
+        &serde_json::json!({"operation_id": op_id}),
+    )
+    .map_err(|_| ManagerError::InvalidInput("cannot hash request".into()))?;
+    let result = services
+        .idempotency
+        .execute(
+            &crate::idempotency::IdempotencyRequest {
+                actor_id: principal.user_id,
+                organization_id: org_id,
+                route: "POST /operations/{id}/retry".into(),
+                key: idempotency_key,
+                request_hash,
+            },
+            |conn| {
+                Box::pin(async move {
+                    crate::operations::retry_in_tx(conn, op_id, org_id).await?;
+                    Ok(op_id.to_string())
+                })
+            },
+        )
+        .await?;
+    let operation_id = match result {
+        crate::idempotency::IdempotencyOutcome::New { response_reference }
+        | crate::idempotency::IdempotencyOutcome::Replay { response_reference } => {
+            response_reference
+        }
+    };
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"operation_id": operation_id, "status": "queued"})),
+    )
+        .into_response())
+}
+
 pub fn idempotency_key(headers: &HeaderMap) -> Result<String, ManagerError> {
     let key = headers
         .get("idempotency-key")

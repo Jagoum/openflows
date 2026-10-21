@@ -121,6 +121,41 @@ data "coder_parameter" "coder_url" {
   type        = "string"
 }
 
+# Hosted runtime mode. When true, this worker sources scoped runtime
+# credentials from the secret-injection backend's mounted file
+# (OPENFLOWS_RUNTIME_CREDENTIAL_FILE) instead of the owner's Coder external-auth
+# token, so the tenant's Git identity is scoped and rotation does not require a
+# rebuild. Local mode (the default) preserves the existing operator workflow.
+data "coder_parameter" "hosted" {
+  name        = "hosted"
+  description  = "Whether this workspace is provisioned in hosted mode (scoped runtime credentials)"
+  default     = "false"
+  type        = "bool"
+  mutable     = false
+}
+
+data "coder_parameter" "runtime_secret_ref" {
+  name        = "runtime_secret_ref"
+  description = "Provisioner-resolved per-workspace secret reference"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
+data "coder_parameter" "workspace_image_digest" {
+  name        = "workspace_image_digest"
+  description = "Release-pinned sha256 digest for the hosted workspace image"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
+data "coder_parameter" "a2a_relay_addr" {
+  name = "a2a_relay_addr"
+  type = "string"
+  default = "openflows-nexus:3000"
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -242,7 +277,29 @@ resource "coder_agent" "main" {
     # this token resolves to the real account the workspace should commit and
     # open PRs as. This is a REQUIRED, verified identity: startup fails loudly
     # if it cannot be established — never a silent REST-API fallback.
-    GIT_TOKEN="${data.coder_external_auth.github.access_token}"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      test -r "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" || { log "FATAL: runtime secret is not mounted"; exit 1; }
+      eval "$(python3 - "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" <<'PY'
+import json, shlex, sys
+d=json.load(open(sys.argv[1]))
+for env,key in [('OF_MANAGER_URL','manager_url'),('OF_BOOTSTRAP','bootstrap_token'),('REDIS_URL','redis_url'),('OPENFLOWS_TENANT','redis_namespace')]:
+    print('export %s=%s' % (env, shlex.quote(str(d[key]))))
+PY
+)"
+      SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register")
+      eval "$(python3 - "$SESSION" <<'PY'
+import json, shlex, sys
+d=json.loads(sys.argv[1])
+print('export OF_RUNTIME_ACCESS_TOKEN=%s' % shlex.quote(d['access_token']))
+print('export OF_RUNTIME_REFRESH_TOKEN=%s' % shlex.quote(d['refresh_token']))
+PY
+)"
+      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
+      GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
+      GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
+    else
+      GIT_TOKEN="${data.coder_parameter.hosted.value == "true" ? "" : data.coder_external_auth.github[0].access_token}"
+    fi
     if [ -z "$GIT_TOKEN" ]; then
       log "FATAL: no inherited GitHub credential for the controller-spawner (workspace owner external auth is not linked)"
       exit 1
@@ -461,7 +518,7 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="$ROLE_BASE"
-    export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
+    export A2A_RELAY_ADDR="${data.coder_parameter.a2a_relay_addr.value}"
     export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
@@ -518,7 +575,7 @@ resource "docker_volume" "workspace" {
 
 resource "docker_container" "workspace" {
   name  = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
-  image = var.workspace_image
+  image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
 
@@ -545,19 +602,30 @@ resource "docker_container" "workspace" {
     }
   }
 
-  env = [
+  dynamic "volumes" {
+    for_each = data.coder_parameter.hosted.value == "true" && data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
+    content {
+      container_path = "/run/openflows/runtime.json"
+      host_path      = data.coder_parameter.runtime_secret_ref.value
+      read_only      = true
+    }
+  }
+
+  env = concat([
     "GITHUB_API_BASE=${var.github_api_base}",
     "GITHUB_GIT_BASE=${var.github_git_base}",
-    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+    "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
     # Base role (forge-1 -> forge): harness Redis keys are namespaced by base role
     "OPENFLOWS_ROLE=${replace(data.coder_parameter.role.value, "/-[0-9]+$/", "")}",
-    "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
+    "A2A_RELAY_ADDR=${data.coder_parameter.a2a_relay_addr.value}",
     "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
-  ]
+  ], data.coder_parameter.hosted.value == "true" ? [] : [
+    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+  ])
 
   # egress allowlist: Coder control plane + github.com + Redis only
   # (enforced at network level; Redis is a documented exception per docs/governance.md)
@@ -572,5 +640,7 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 data "coder_external_auth" "github" {
-  id = "primary-github"
+  count = data.coder_parameter.hosted.value == "true" ? 0 : 1
+  id       = "primary-github"
+  optional = true
 }

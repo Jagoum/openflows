@@ -263,7 +263,16 @@ pub(crate) fn validate_resource_state(scope: &RuntimeScope) -> Result<(), Manage
             "tenant is not available",
         ));
     }
-    if scope.workspace_observed_state != "running" || scope.workspace_desired_state != "running" {
+    // A workspace's startup script needs a repository-scoped GitHub token
+    // before the provisioning worker can mark its desired state as running.
+    // Permit this bootstrap window only after the tenant is still being
+    // provisioned and the runtime has registered and heartbeated as running.
+    // Once the tenant is active, retain the normal desired=running gate.
+    let workspace_is_running = scope.workspace_observed_state == "running"
+        && (scope.workspace_desired_state == "running"
+            || (scope.workspace_desired_state == "provisioning"
+                && scope.tenant_desired_state == "provisioning"));
+    if !workspace_is_running {
         return Err(ManagerError::api(
             "WORKSPACE_UNAVAILABLE",
             "workspace is not available for runtime access",

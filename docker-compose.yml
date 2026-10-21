@@ -67,6 +67,11 @@ services:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       CODER_URL: ${CODER_URL:-http://localhost:${CODER_PORT:-7080}}
       CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS: ${CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS:-true}
+      CODER_OAUTH2_GITHUB_CLIENT_ID: ${CODER_OAUTH2_GITHUB_CLIENT_ID:-}
+      CODER_OAUTH2_GITHUB_CLIENT_SECRET: ${CODER_OAUTH2_GITHUB_CLIENT_SECRET:-}
+      CODER_OAUTH2_GITHUB_ALLOWED_ORGS: ${CODER_OAUTH2_GITHUB_ALLOWED_ORGS:-}
+      CODER_OAUTH2_GITHUB_ALLOW_EVERYONE: ${CODER_OAUTH2_GITHUB_ALLOW_EVERYONE:-false}
+      CODER_OAUTH2_PROVIDER_ENABLE: ${CODER_OAUTH2_PROVIDER_ENABLE:-false}
       # GitHub external auth (Git App) — lets agents push/pull against PRIVATE
       # repos via OIDC. Values come from .env (see quick_start.md Step 2).
       # IMPORTANT: `coder server` fails to start if client_id/client_secret are

@@ -164,7 +164,9 @@ fn api_status(code: &str) -> u16 {
         | "CONNECTION_UNAVAILABLE"
         | "REPOSITORY_UNAVAILABLE"
         | "AUTH_CHANGED" => 403,
-        "RATE_LIMITED" | "TOO_MANY_REQUESTS" => 429,
+        "RATE_LIMITED" | "TOO_MANY_REQUESTS" | "TENANT_LIMIT_REACHED" | "WORKER_LIMIT_REACHED" => {
+            429
+        }
         "SERVICE_UNAVAILABLE" | "GITHUB_UNAVAILABLE" => 503,
         "GITHUB_OAUTH_ERROR" => 401,
         _ => 500,
