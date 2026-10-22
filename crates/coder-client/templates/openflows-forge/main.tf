@@ -218,9 +218,13 @@ resource "coder_agent" "main" {
     HOOKS_SRC="/home/coder/.openflows/artifacts/plugin/hooks/$ROLE_BASE"
     HOOKS_DIR="/home/coder/.openflows/hooks"
     if [ -d "$HOOKS_SRC" ]; then
-      mkdir -p "$HOOKS_DIR"
-      cp -r "$HOOKS_SRC/." "$HOOKS_DIR/"
-      chmod +x "$HOOKS_DIR"/*.sh 2>/dev/null || true
+      # The artifacts volume (/home/coder/.openflows) is a host bind mount
+      # owned by root, so these operations must run via sudo as the coder
+      # user cannot create directories or write inside a root-owned mount.
+      sudo mkdir -p "$HOOKS_DIR"
+      sudo cp -r "$HOOKS_SRC/." "$HOOKS_DIR/"
+      sudo chmod +x "$HOOKS_DIR"/*.sh 2>/dev/null || true
+      sudo chown -R coder:coder "$HOOKS_DIR" 2>/dev/null || true
       log "Installed $ROLE_BASE hooks from artifacts volume"
     else
       log "WARNING: no hooks found for role $ROLE_BASE at $HOOKS_SRC"
@@ -230,46 +234,46 @@ resource "coder_agent" "main" {
     # whose scripts exist are registered, so this works for every role.
     mkdir -p /home/coder/.claude
     python3 - "$HOOKS_DIR" /home/coder/.claude/settings.json <<'PYEOF'
-    import json, os, sys
-    hooks_dir, settings_path = sys.argv[1], sys.argv[2]
-    def cmd(name):
-        path = os.path.join(hooks_dir, name)
-        return path if os.path.isfile(path) else None
-    event_map = {
-        "SessionStart": [(None, "session_start.sh")],
-        "PreToolUse": [("Bash", "pre_bash_guard.sh"),
-                        ("Bash", "pre_bash_readonly_guard.sh"),
-                        ("Write|Edit|MultiEdit", "pre_write_check.sh")],
-        "PostToolUse": [("Write|Edit|MultiEdit", "post_write_lint.sh"),
-                         ("Write|Edit|MultiEdit", "post_write_validate.sh")],
-        "PreCompact": [(None, "pre_compact_handoff.sh")],
-        "Stop": [(None, "stop_require_artifact.sh"),
-                  (None, "stop_require_eval.sh")],
-        "SubagentStop": [(None, "subagent_stop.sh")],
-    }
-    hooks = {}
-    for event, entries in event_map.items():
-        matchers = []
-        for matcher, script in entries:
-            path = cmd(script)
-            if not path:
-                continue
-            entry = {"hooks": [{"type": "command", "command": path}]}
-            if matcher:
-                entry["matcher"] = matcher
-            matchers.append(entry)
-        if matchers:
-            hooks[event] = matchers
-    settings = {}
-    if os.path.exists(settings_path):
-        try:
-            settings = json.load(open(settings_path))
-        except Exception:
-            settings = {}
-    settings["hooks"] = hooks
-    json.dump(settings, open(settings_path, "w"), indent=2)
-    print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
-    PYEOF
+import json, os, sys
+hooks_dir, settings_path = sys.argv[1], sys.argv[2]
+def cmd(name):
+    path = os.path.join(hooks_dir, name)
+    return path if os.path.isfile(path) else None
+event_map = {
+    "SessionStart": [(None, "session_start.sh")],
+    "PreToolUse": [("Bash", "pre_bash_guard.sh"),
+                    ("Bash", "pre_bash_readonly_guard.sh"),
+                    ("Write|Edit|MultiEdit", "pre_write_check.sh")],
+    "PostToolUse": [("Write|Edit|MultiEdit", "post_write_lint.sh"),
+                     ("Write|Edit|MultiEdit", "post_write_validate.sh")],
+    "PreCompact": [(None, "pre_compact_handoff.sh")],
+    "Stop": [(None, "stop_require_artifact.sh"),
+              (None, "stop_require_eval.sh")],
+    "SubagentStop": [(None, "subagent_stop.sh")],
+}
+hooks = {}
+for event, entries in event_map.items():
+    matchers = []
+    for matcher, script in entries:
+        path = cmd(script)
+        if not path:
+            continue
+        entry = {"hooks": [{"type": "command", "command": path}]}
+        if matcher:
+            entry["matcher"] = matcher
+        matchers.append(entry)
+    if matchers:
+        hooks[event] = matchers
+settings = {}
+if os.path.exists(settings_path):
+    try:
+        settings = json.load(open(settings_path))
+    except Exception:
+        settings = {}
+settings["hooks"] = hooks
+json.dump(settings, open(settings_path, "w"), indent=2)
+print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
+PYEOF
 
     # Inherit the controller-spawner's GitHub identity from Coder external
     # auth (the tenant's linked GitHub App token). The workspace owner IS the
@@ -344,6 +348,13 @@ PY
     fi
 
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      # gh accepts installation tokens through its environment. These tokens
+      # cannot authenticate the personal /user endpoint used below.
+      if [ "$GITHUB_CLI_HOST" = "github.com" ]; then
+        export GH_TOKEN="$GIT_TOKEN"
+      elif [ -n "$GITHUB_CLI_HOST" ]; then
+        export GH_ENTERPRISE_TOKEN="$GIT_TOKEN"
+      fi
       log "Hosted GitHub App installation token configured; personal gh identity check is not applicable"
     elif [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
       # Authenticate gh persistently as the inherited identity for BOTH the
@@ -377,7 +388,9 @@ PY
       exit 1
     fi
 
-    if [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      log "GitHub CLI uses the repository-scoped installation token"
+    elif [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
       # Verify the authed gh identity actually matches the inherited account, so
       # gh/git act as the controller-spawner — never a dummy or mismatched login.
       AUTHED_LOGIN=$(gh api --hostname "$GITHUB_CLI_HOST" user --jq .login) \

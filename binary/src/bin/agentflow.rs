@@ -323,6 +323,10 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let resolver = openflows::orchestration::OrchestrationResolver::new()?;
     let orch_dir = resolver.ensure_orchestration_dir()?;
     resolver.validate()?;
+    if let Some(artifacts_dir) = std::env::var_os("ARTIFACTS_DIR") {
+        openflows::orchestration::publish_worker_hooks(std::path::Path::new(&artifacts_dir))
+            .context("Failed to publish hooks to the shared worker artifacts volume")?;
+    }
 
     let registry_path = resolver.registry_path();
     // Persist a tenant-supplied OPENFLOWS_REGISTRY_JSON onto the file-first registry.
