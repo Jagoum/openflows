@@ -273,7 +273,15 @@ pub(crate) fn validate_resource_state(scope: &RuntimeScope) -> Result<(), Manage
             scope.workspace_desired_state.as_str(),
             "running" | "provisioning"
         );
-    if !workspace_is_running {
+    // A newly registered workspace must obtain its first repository token
+    // before it can send its first readiness heartbeat. Allow that narrow
+    // registration window while the tenant is provisioning; subsequent
+    // requests still require an observed heartbeat or an authenticated
+    // runtime registration created for this workspace.
+    let workspace_is_registering = scope.workspace_registered_at.is_some()
+        && scope.workspace_desired_state == "provisioning"
+        && scope.workspace_observed_state == "provisioning";
+    if !workspace_is_running && !workspace_is_registering {
         return Err(ManagerError::api(
             "WORKSPACE_UNAVAILABLE",
             "workspace is not available for runtime access",

@@ -234,15 +234,17 @@ print('export OF_RUNTIME_ACCESS_TOKEN=%s' % shlex.quote(d['access_token']))
 print('export OF_RUNTIME_REFRESH_TOKEN=%s' % shlex.quote(d['refresh_token']))
 PY
 )"
-      # Establish readiness before the first broker exchange. During
-      # provisioning the broker requires an initial heartbeat.
-      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
       # The controller uses this Manager runtime session for hosted
       # control-plane calls. It is intentionally distinct from Coder user
       # credentials, which are never exported into the workspace.
       export OPENFLOWS_MANAGER_URL="$OF_MANAGER_URL"
       GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
       GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
+      # Readiness is reported only after the controller has obtained the
+      # credentials it needs to start. Registration is sufficient for the
+      # first broker exchange during provisioning; this heartbeat is the
+      # authoritative signal used to complete tenant provisioning.
+      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
     else
       GIT_TOKEN="${data.coder_parameter.hosted.value == "true" ? "" : data.coder_external_auth.github[0].access_token}"
     fi

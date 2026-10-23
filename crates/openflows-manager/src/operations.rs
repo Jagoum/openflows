@@ -214,8 +214,7 @@ pub async fn claim_kinds_with_org_slot(
                 AND kind = ANY($1::text[])
               ORDER BY organization_id, created_at
            ) candidates
-          ORDER BY created_at
-          LIMIT 64",
+          ORDER BY created_at",
     )
     .bind(kinds)
     .fetch_all(pool)

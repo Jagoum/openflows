@@ -47,8 +47,8 @@ services:
       CODER_OAUTH2_GITHUB_ALLOW_EVERYONE: ${CODER_OAUTH2_GITHUB_ALLOW_EVERYONE:-false}
       CODER_OAUTH2_PROVIDER_ENABLE: "true"
       # v2.37 uses the experiment; newer versions use PROVIDER_ENABLE above.
-      CODER_EXPERIMENTS: oauth2
-      CODER_CHAT_HOOK_URL: ${OPENFLOWS_HOOK_URL:-http://openflows-nexus:3001/experimental/hooks/chat}
+      CODER_EXPERIMENTS: ${CODER_EXPERIMENTS:-agent-lifecycle-hooks,oauth2}
+      CODER_CHAT_HOOK_URL: ${OPENFLOWS_HOOK_URL:?Set OPENFLOWS_HOOK_URL to the Manager hook endpoint}
       # The hook signing secret is the same durable file the `openflows operator setup`
       # command generates, so a fresh install starts without a separately-defined
       # CODER_CHAT_HOOK_SECRET env var.

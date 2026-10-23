@@ -895,13 +895,16 @@ impl TenantProvisionWorker {
         .bind(tenant_id.0)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
+        let changed = sqlx::query(
             "UPDATE workspaces SET desired_state = 'running', observed_state = 'running', updated_at = now()
-              WHERE id = $1",
+              WHERE id = $1 AND desired_state = 'provisioning'",
         )
         .bind(nexus_ws.0)
         .execute(&mut *tx)
         .await?;
+        if changed.rows_affected() != 1 {
+            return Ok(TenantProvisionOutcome::StaleLease);
+        }
         if !guard
             .complete_in_tx(
                 &mut tx,
