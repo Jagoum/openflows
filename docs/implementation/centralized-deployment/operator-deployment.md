@@ -16,7 +16,10 @@ the existing `openflows doctor` diagnoses the tenant controller.
 
 1. Copy `.env.openflows.example` to `.env.openflows`, restrict it to mode 0600,
    and fill in your domains, database passwords, GitHub application metadata,
-   and workspace image digest. Use the same file for Compose and the Manager.
+   workspace image digest, and `OPENFLOWS_HOOK_URL`. Set the hook URL to the
+   Manager's public `https://<openflows-host>/api/v1/hooks/coder/chat` endpoint;
+   it must be reachable from the Coder container. Use the same file for Compose
+   and the Manager.
    The example explicitly selects local mode. Database passwords in URLs must
    be URL-encoded if they contain reserved characters.
 2. Create the persistent `OPENFLOWS_SECRET_DIR` with mode 0700. Put the following
@@ -40,8 +43,9 @@ the existing `openflows doctor` diagnoses the tenant controller.
    docker compose --env-file .env.openflows -f deployment.compose.yml up -d
    ```
 
-   This Compose file enables Coder's OAuth provider and reads its GitHub secret
-   from a mounted file. The optional legacy Git external-auth provider is not
+   This Compose file enables Coder's OAuth provider and lifecycle-hook
+   experiment, reads its GitHub and hook secrets from mounted files, and sends
+   Coder hook events to `OPENFLOWS_HOOK_URL`. The optional legacy Git external-auth provider is not
    configured: Manager runtime templates obtain Git credentials through the
    OpenFlows broker. Ports bind to localhost. Supply reverse proxies/tunnels
    for the configured HTTPS origins; Coder's origin must also be reachable

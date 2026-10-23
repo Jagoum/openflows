@@ -579,8 +579,15 @@ impl RuntimeRepository {
               AND o.status IN ('ready','provisioning') AND c.status = 'active'
               AND t.desired_state IN ('running', 'provisioning')
               AND t.observed_state NOT IN ('deleted', 'deleting')
-              AND w.observed_state = 'running'
               AND w.desired_state IN ('running', 'provisioning')
+              AND (
+                    w.observed_state = 'running'
+                    OR (
+                        w.observed_state = 'provisioning'
+                        AND w.desired_state = 'provisioning'
+                        AND w.registered_at IS NOT NULL
+                    )
+              )
               AND w.role = $10 AND r.accessible
             FOR UPDATE OF r")
             .bind(scope.organization_id.0).bind(scope.tenant_id.0).bind(scope.workspace_id.0)
