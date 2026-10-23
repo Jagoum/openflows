@@ -18,8 +18,12 @@ the existing `openflows doctor` diagnoses the tenant controller.
    and fill in your domains, database passwords, GitHub application metadata,
    workspace image digest, and `OPENFLOWS_HOOK_URL`. Set the hook URL to the
    Manager's public `https://<openflows-host>/api/v1/hooks/coder/chat` endpoint;
-   it must be reachable from the Coder container. Use the same file for Compose
-   and the Manager.
+   it must be reachable from the Coder container. Also set
+   `OPENFLOWS_RUNTIME_RELAY_BASE_URL` to the deployment backend's
+   Manager-reachable Nexus URL template, retaining its `{tenant}` placeholder.
+   The ingress or service-discovery layer must route each expanded URL to that
+   tenant's Nexus hook server on port 3001. Use the same file for Compose and
+   the Manager; Docker-only workspace aliases are not valid from a host process.
    The example explicitly selects local mode. Database passwords in URLs must
    be URL-encoded if they contain reserved characters.
 2. Create the persistent `OPENFLOWS_SECRET_DIR` with mode 0700. Put the following

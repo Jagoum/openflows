@@ -419,7 +419,13 @@ impl TenantRuntimeRepository {
             .set_password(Some(redis_password.as_str()))
             .map_err(|_| ManagerError::Config("invalid Redis password".into()))?;
         let relay_base = std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL")
-            .unwrap_or_else(|_| format!("http://openflows-nexus-{tenant_id}:3001"))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ManagerError::Config(
+                    "OPENFLOWS_RUNTIME_RELAY_BASE_URL is required for Coder hook relay".into(),
+                )
+            })?
             .replace("{tenant}", &tenant_id.to_string())
             .trim_end_matches('/')
             .to_string();

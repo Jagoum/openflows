@@ -153,13 +153,9 @@ pub async fn receive(
     let relay_base = std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            (std::env::var("OPENFLOWS_MODE").ok().as_deref() == Some("local"))
-                .then(|| format!("http://openflows-nexus-{tenant_id}:3001"))
-        })
         .ok_or_else(|| {
             ManagerError::Config(
-                "OPENFLOWS_RUNTIME_RELAY_BASE_URL is required for hosted hook relay".into(),
+                "OPENFLOWS_RUNTIME_RELAY_BASE_URL is required for Coder hook relay".into(),
             )
         })?
         .replace("{tenant}", &tenant_id.to_string())

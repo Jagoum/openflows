@@ -411,6 +411,17 @@ impl TenantProvisionWorker {
         .bind(guard.organization_id.0)
         .fetch_one(&self.pool)
         .await?;
+        let workspace_id = crate::id::WorkspaceId::from_uuid(row.0);
+        let tenant_id = TenantId::from_uuid(row.3);
+        // A previous attempt may have completed runtime registration and its
+        // readiness heartbeat before losing the operation lease. Preserve that
+        // successful runtime instead of issuing another single-use bootstrap,
+        // which would clear registration and strand the adopted workspace.
+        if self.runtime_registered_and_healthy(workspace_id).await? {
+            return self
+                .mark_worker_running(guard, tenant_id, workspace_id)
+                .await;
+        }
         let owner: (String,) = sqlx::query_as(
             "SELECT coder_owner_id FROM runtime_identities WHERE tenant_id = (SELECT tenant_id FROM workspaces WHERE id = $1) AND organization_id = $2",
         ).bind(row.0).bind(guard.organization_id.0).fetch_one(&self.pool).await?;
@@ -536,47 +547,44 @@ impl TenantProvisionWorker {
         // Persist the upstream identifier before waiting for readiness so a
         // failed build can still be deleted during tenant cleanup.
         self.tenant_runtime
-            .set_coder_workspace_id(crate::id::WorkspaceId::from_uuid(row.0), &created.id)
+            .set_coder_workspace_id(workspace_id, &created.id)
             .await?;
         self.adapter.wait_workspace_ready(&org, &created.id).await?;
-        if !self
-            .runtime_registered_and_healthy(crate::id::WorkspaceId::from_uuid(row.0))
-            .await?
-        {
+        if !self.runtime_registered_and_healthy(workspace_id).await? {
             return Ok(TenantProvisionOutcome::NotReady(
-                TenantId::from_uuid(
-                    sqlx::query_scalar("SELECT tenant_id FROM workspaces WHERE id = $1")
-                        .bind(row.0)
-                        .fetch_one(&self.pool)
-                        .await?,
-                ),
+                tenant_id,
                 err::NEXUS_NOT_READY,
             ));
         }
+        self.mark_worker_running(guard, tenant_id, workspace_id)
+            .await
+    }
+
+    async fn mark_worker_running(
+        &self,
+        guard: &LeaseGuard,
+        tenant_id: TenantId,
+        workspace_id: crate::id::WorkspaceId,
+    ) -> Result<TenantProvisionOutcome, ManagerError> {
         let mut tx = self.pool.begin().await?;
         if !guard.lock_in_tx(&mut tx).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
-        let changed = sqlx::query("UPDATE workspaces SET desired_state = 'running', observed_state = 'running', updated_at = now() WHERE id = $1 AND desired_state = 'provisioning'").bind(row.0).execute(&mut *tx).await?;
+        let changed = sqlx::query("UPDATE workspaces SET desired_state = 'running', observed_state = 'running', updated_at = now() WHERE id = $1 AND desired_state = 'provisioning'").bind(workspace_id.0).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
         if !guard
             .complete_in_tx(
                 &mut tx,
-                serde_json::json!({"workspace_id": row.0, "status":"running"}),
+                serde_json::json!({"workspace_id": workspace_id, "status":"running"}),
             )
             .await?
         {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
         tx.commit().await?;
-        Ok(TenantProvisionOutcome::Provisioned(TenantId::from_uuid(
-            sqlx::query_scalar("SELECT tenant_id FROM workspaces WHERE id = $1")
-                .bind(row.0)
-                .fetch_one(&self.pool)
-                .await?,
-        )))
+        Ok(TenantProvisionOutcome::Provisioned(tenant_id))
     }
 
     /// Execute one provisioning attempt for a leased operation.

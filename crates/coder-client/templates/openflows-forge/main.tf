@@ -348,12 +348,22 @@ PY
     fi
 
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      # gh accepts installation tokens through its environment. These tokens
-      # cannot authenticate the personal /user endpoint used below.
-      if [ "$GITHUB_CLI_HOST" = "github.com" ]; then
-        export GH_TOKEN="$GIT_TOKEN"
-      elif [ -n "$GITHUB_CLI_HOST" ]; then
-        export GH_ENTERPRISE_TOKEN="$GIT_TOKEN"
+      # Store the installation token in gh's protected config instead of an
+      # inherited GH_TOKEN environment variable. The refresh daemon rewrites
+      # this file together with Git's credential store, so every later gh
+      # invocation reads the current broker token rather than the startup one.
+      unset GH_TOKEN GH_ENTERPRISE_TOKEN
+      if [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
+        mkdir -p /home/coder/.config/gh
+        {
+          printf '%s:\n' "$GITHUB_CLI_HOST"
+          printf '    oauth_token: %s\n' "$GIT_TOKEN"
+          printf '    git_protocol: https\n'
+        } > /home/coder/.config/gh/hosts.yml
+        chmod 600 /home/coder/.config/gh/hosts.yml
+        sudo mkdir -p /root/.config/gh
+        sudo cp /home/coder/.config/gh/hosts.yml /root/.config/gh/hosts.yml
+        sudo chmod 600 /root/.config/gh/hosts.yml
       fi
       log "Hosted GitHub App installation token configured; personal gh identity check is not applicable"
     elif [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
@@ -534,9 +544,10 @@ PY
     # Broker-backed git credential refresh. The startup installation token is
     # short-lived, so a long-running worker's push can outlive it. Refresh the
     # runtime session and re-fetch a fresh installation token from the Manager
-    # broker, then rewrite the stored git credentials so pushes keep
-    # authenticating mid-task. Runs in the background for the workspace
-    # lifetime; harmless when the Manager is unreachable.
+    # broker, then rewrite both Git's credential store and gh's protected
+    # hosts file so pushes and API/PR commands keep authenticating mid-task.
+    # Runs in the background for the workspace lifetime; harmless when the
+    # Manager is unreachable.
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
       nohup bash -c '
         REFRESH="$${OF_RUNTIME_REFRESH_TOKEN}"
@@ -550,8 +561,20 @@ PY
           echo "https://x-access-token:$${TOKEN}@github.com" > /home/coder/.git-credentials
           sudo cp /home/coder/.git-credentials /root/.git-credentials
           sudo chmod 600 /root/.git-credentials
+          if [ -n "$1" ]; then
+            mkdir -p /home/coder/.config/gh
+            {
+              printf "%s:\n" "$1"
+              printf "    oauth_token: %s\n" "$${TOKEN}"
+              printf "    git_protocol: https\n"
+            } > /home/coder/.config/gh/hosts.yml
+            chmod 600 /home/coder/.config/gh/hosts.yml
+            sudo mkdir -p /root/.config/gh
+            sudo cp /home/coder/.config/gh/hosts.yml /root/.config/gh/hosts.yml
+            sudo chmod 600 /root/.config/gh/hosts.yml
+          fi
         done
-      ' >>/home/coder/.openflows/git-refresh.log 2>&1 &
+      ' _ "$GITHUB_CLI_HOST" >>/home/coder/.openflows/git-refresh.log 2>&1 &
     fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
