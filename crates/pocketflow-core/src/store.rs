@@ -75,7 +75,11 @@ impl RedisBackend {
         let Some(index) = tenant_index_key(pattern) else {
             return Vec::new();
         };
-        let keys: Vec<String> = self.client.smembers(index.clone()).await.unwrap_or_default();
+        let keys: Vec<String> = self
+            .client
+            .smembers(index.clone())
+            .await
+            .unwrap_or_default();
         let mut matches: Vec<String> = keys
             .into_iter()
             .filter(|key| glob_match(pattern, key))
@@ -734,18 +738,33 @@ mod redis_index_tests {
             .set("ticket:T1:chat:forge", serde_json::json!("chat-1"))
             .await;
         assert!(
-            store.keys("ticket:*").await.iter().any(|k| k.contains("T1:chat")),
+            store
+                .keys("ticket:*")
+                .await
+                .iter()
+                .any(|k| k.contains("T1:chat")),
             "keys() should find keys written via set"
         );
 
         // `transition` must also maintain the index so lifecycle status keys
         // written directly are discoverable (review comment 31).
         store
-            .transition("T1", 0, "forge", Event::Plan { content: "p".into() })
+            .transition(
+                "T1",
+                0,
+                "forge",
+                Event::Plan {
+                    content: "p".into(),
+                },
+            )
             .await
             .unwrap();
         assert!(
-            store.keys("ticket:*").await.iter().any(|k| k.contains("T1:status")),
+            store
+                .keys("ticket:*")
+                .await
+                .iter()
+                .any(|k| k.contains("T1:status")),
             "keys() should find the lifecycle status key written via transition"
         );
 
@@ -760,9 +779,7 @@ mod redis_index_tests {
         store
             .set("ticket:T1:recovery_attempts", serde_json::json!(0))
             .await;
-        let recovery = store
-            .raw_keys("ns:ten-a:ticket:*:recovery_attempts")
-            .await;
+        let recovery = store.raw_keys("ns:ten-a:ticket:*:recovery_attempts").await;
         assert!(
             recovery.iter().any(|k| k.contains("T1:recovery_attempts")),
             "middle wildcard raw_keys should find recovery counters, got: {recovery:?}"

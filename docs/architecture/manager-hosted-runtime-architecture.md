@@ -160,7 +160,7 @@ flowchart LR
 |---|---|---|---|
 | Bootstrap token | Establish the first session for one workspace | Raw value in mounted bundle; hash in PostgreSQL; short-lived | Single use |
 | Access token | Authenticate normal runtime API calls | Process memory; hash in PostgreSQL; short-lived | Reused until rejected |
-| Refresh token | Rotate the runtime session | Process memory; hash in PostgreSQL; rotating, fixed-lifetime family | Each generation is single use |
+| Refresh token | Rotate the runtime session | Process memory; hash in PostgreSQL; rotating family with a 24-hour sliding expiry after each successful refresh | Each generation is single use; an inactive family expires after 24 hours |
 
 `RuntimeControlClient` serializes refresh under one mutex. If heartbeat and broker calls both receive `401`, only one consumes the refresh token. The other observes the new access token and retries. A request is retried only once.
 

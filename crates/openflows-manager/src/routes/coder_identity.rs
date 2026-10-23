@@ -283,7 +283,7 @@ pub async fn callback(
     let id = verified_user_id(&user)?;
     // Retain only the renewable credential, behind the configured secret
     // provider. The short-lived access token is never persisted or returned.
-    let existing: Option<(String, String, String)> = sqlx::query_as(
+    let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT coder_url, coder_user_id, coder_refresh_secret_ref
            FROM coder_user_links WHERE user_id=$1",
     )
@@ -298,8 +298,11 @@ pub async fn callback(
             ));
         }
     }
-    let refresh_ref = match existing {
-        Some((_, _, reference)) => reference,
+    let refresh_ref = match existing
+        .as_ref()
+        .and_then(|(_, _, reference)| reference.clone())
+    {
+        Some(reference) => reference,
         None => services
             .secret_provider
             .put(
@@ -309,17 +312,19 @@ pub async fn callback(
             .await
             .map_err(|_| failure())?,
     };
-    if let Some((_, _, reference)) = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT coder_url, coder_user_id, coder_refresh_secret_ref
-           FROM coder_user_links WHERE user_id=$1",
-    )
-    .bind(principal.user_id.0)
-    .fetch_optional(services.db.pool())
-    .await?
-    {
+    if let Some((_, _, Some(reference))) = existing.as_ref() {
         services
             .secret_provider
-            .replace(&reference, refresh_token.as_bytes())
+            .replace(reference, refresh_token.as_bytes())
+            .await
+            .map_err(|_| failure())?;
+    }
+    if let Some((_, _, None)) = existing.as_ref() {
+        // Legacy links created before refresh-token storage are repaired by
+        // the same callback instead of failing on a nullable column.
+        services
+            .secret_provider
+            .put(&refresh_ref, refresh_token.as_bytes())
             .await
             .map_err(|_| failure())?;
     }

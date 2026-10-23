@@ -125,8 +125,7 @@ impl TenantRuntimeRepository {
                     // credential on the next reconciliation.
                     warn!(
                         username,
-                        secret_ref,
-                        "skipping Redis credential restore: stored secret is missing"
+                        secret_ref, "skipping Redis credential restore: stored secret is missing"
                     );
                     continue;
                 }
@@ -198,6 +197,13 @@ impl TenantRuntimeRepository {
             Err(error) => {
                 let _ = self.secret_provider.delete(&stored_secret_ref).await;
                 let _ = self.redis_isolation.revoke_tenant(&username).await;
+                // Another Manager replica may have created the live
+                // credential between the initial lookup and this insert.
+                // Converge on that durable row instead of surfacing a
+                // duplicate-key retry loop.
+                if let Some(existing) = self.redis_credential(org_id, tenant_id).await? {
+                    return Ok(existing);
+                }
                 return Err(error.into());
             }
         };

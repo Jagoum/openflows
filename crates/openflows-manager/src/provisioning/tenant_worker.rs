@@ -338,8 +338,11 @@ impl TenantProvisionWorker {
         if !guard.lock_in_tx(&mut tx).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
-        sqlx::query("UPDATE tenants SET desired_state = 'running', observed_state = 'running', updated_at = now() WHERE id = $1")
+        let changed = sqlx::query("UPDATE tenants SET desired_state = 'running', observed_state = 'running', updated_at = now() WHERE id = $1 AND desired_state NOT IN ('deleted', 'deleting')")
             .bind(tenant_id.0).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Ok(TenantProvisionOutcome::StaleLease);
+        }
         if !guard
             .complete_in_tx(
                 &mut tx,
@@ -554,7 +557,10 @@ impl TenantProvisionWorker {
         if !guard.lock_in_tx(&mut tx).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
-        sqlx::query("UPDATE workspaces SET desired_state = 'running', observed_state = 'running', updated_at = now() WHERE id = $1").bind(row.0).execute(&mut *tx).await?;
+        let changed = sqlx::query("UPDATE workspaces SET desired_state = 'running', observed_state = 'running', updated_at = now() WHERE id = $1 AND desired_state = 'provisioning'").bind(row.0).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Ok(TenantProvisionOutcome::StaleLease);
+        }
         if !guard
             .complete_in_tx(
                 &mut tx,

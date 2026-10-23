@@ -106,9 +106,7 @@ pub async fn receive(
     let mut seen = std::collections::HashSet::new();
     let targets: Vec<_> = targets
         .into_iter()
-        .filter(|(organization_id, tenant_id, _)| {
-            seen.insert((*organization_id, *tenant_id))
-        })
+        .filter(|(organization_id, tenant_id, _)| seen.insert((*organization_id, *tenant_id)))
         .collect();
     let target = if envelope.meta.workspace_id.is_none() && targets.len() != 1 {
         return Err(ManagerError::api(
@@ -153,7 +151,17 @@ pub async fn receive(
             })?,
     );
     let relay_base = std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL")
-        .unwrap_or_else(|_| format!("http://openflows-nexus-{tenant_id}:3001"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            (std::env::var("OPENFLOWS_MODE").ok().as_deref() == Some("local"))
+                .then(|| format!("http://openflows-nexus-{tenant_id}:3001"))
+        })
+        .ok_or_else(|| {
+            ManagerError::Config(
+                "OPENFLOWS_RUNTIME_RELAY_BASE_URL is required for hosted hook relay".into(),
+            )
+        })?
         .replace("{tenant}", &tenant_id.to_string())
         .trim_end_matches('/')
         .to_string();

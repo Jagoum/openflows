@@ -558,6 +558,9 @@ PY
     # OPENFLOWS_ROLE must be the BASE role (forge), not the worker id
     # (forge-1): the controller writes dispatch and reads heartbeats under
     # the base-role key, so a worker-id role would never match.
+    # Hosted mode already loaded the authenticated tenant URL from the
+    # Manager-injected runtime secret. Never replace it with the public Coder
+    # parameter, which is not a secret delivery channel.
     if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
       export REDIS_URL="${data.coder_parameter.redis_url.value}"
     fi
