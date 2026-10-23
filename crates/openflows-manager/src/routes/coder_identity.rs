@@ -330,7 +330,13 @@ pub async fn callback(
         let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coder_user_links WHERE user_id=$1 AND coder_url=$2 AND coder_user_id=$3)")
             .bind(principal.user_id.0).bind(&base).bind(id).fetch_one(&mut *tx).await?;
         if !same {
-            unreachable!("existing link was validated before updating its credential")
+            // The INSERT was a no-op because (coder_url, coder_user_id) is
+            // already claimed by a *different* OpenFlows user. The earlier
+            // check only inspects the current user's link, so it cannot see
+            // this conflict; surface it instead of panicking.
+            return Err(ManagerError::Conflict(
+                "This Coder account is already linked to another OpenFlows user".into(),
+            ));
         }
         sqlx::query("UPDATE coder_user_links SET coder_refresh_secret_ref=$2 WHERE user_id=$1")
             .bind(principal.user_id.0)

@@ -285,9 +285,16 @@ impl RuntimeCredentialService {
         let refresh = Secret::generate();
         let access_id = uuid::Uuid::new_v4();
         let refresh_id = uuid::Uuid::new_v4();
+        // Slide the refresh family forward so a running, healthy tenant is
+        // never locked out after the original 24-hour window. Rotation keeps
+        // the family renewable as long as the workspace keeps refreshing;
+        // revocation (stop/delete) advances the workspace generation, which
+        // immediately invalidates every credential in the family regardless
+        // of this renewal.
+        let family_expires_at = Utc::now() + Duration::hours(REFRESH_FAMILY_TTL_HOURS);
         let access_expires_at = std::cmp::min(
             Utc::now() + Duration::minutes(ACCESS_TTL_MINUTES),
-            scope.credential_family_expires_at,
+            family_expires_at,
         );
         let generation = self
             .repo
@@ -300,7 +307,7 @@ impl RuntimeCredentialService {
                 refresh_id,
                 &refresh.hash(),
                 scope.credential_family_id,
-                scope.credential_family_expires_at,
+                family_expires_at,
             )
             .await?;
         Ok(RuntimeSessionIssue {
@@ -308,7 +315,7 @@ impl RuntimeCredentialService {
             access_secret: access.encode(),
             access_expires_at,
             refresh_secret: refresh.encode(),
-            refresh_expires_at: scope.credential_family_expires_at,
+            refresh_expires_at: family_expires_at,
             generation,
         })
     }

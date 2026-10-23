@@ -522,7 +522,16 @@ pub async fn doctor() -> Result<()> {
             .map_err(anyhow::Error::msg),
     );
     report("public origin", origin("OPENFLOWS_PUBLIC_URL").map(|_| ()));
-    let root = PathBuf::from(setting("OPENFLOWS_SECRET_DIR")?);
+    // Resolve the secret directory as a reported check so a missing directory
+    // does not abort the remaining independent diagnostics (PostgreSQL, Redis,
+    // Coder, Docker). Secret-dependent checks below report FAIL on their own.
+    let root = match setting("OPENFLOWS_SECRET_DIR") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(error) => {
+            report("secret directory", Err(error));
+            PathBuf::new()
+        }
+    };
     for key in [
         "OPENFLOWS_CRYPTO_MASTER_KEY_REF",
         "OPENFLOWS_CODER_HOOK_SECRET_REF",

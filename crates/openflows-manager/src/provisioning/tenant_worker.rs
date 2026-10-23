@@ -255,7 +255,7 @@ impl TenantProvisionWorker {
         if !guard.lock_in_tx(&mut tx).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
-        sqlx::query("UPDATE workspaces SET desired_state = 'stopped', observed_state = 'stopped', updated_at = now() WHERE tenant_id = $1 AND desired_state <> 'deleted'")
+        sqlx::query("UPDATE workspaces SET desired_state = 'stopped', observed_state = 'stopped', registered_at = NULL, last_heartbeat_at = NULL, updated_at = now() WHERE tenant_id = $1 AND desired_state <> 'deleted'")
             .bind(tenant_id.0).execute(&mut *tx).await?;
         let changed = sqlx::query("UPDATE tenants SET desired_state = 'paused', observed_state = 'paused', updated_at = now() WHERE id = $1 AND desired_state <> 'deleted'")
             .bind(tenant_id.0).execute(&mut *tx).await?;
@@ -392,9 +392,10 @@ impl TenantProvisionWorker {
             Option<String>,
             Option<i32>,
             i32,
+            Option<String>,
         ) = sqlx::query_as(
             "SELECT w.id, w.role, o.coder_organization_id, w.tenant_id,
-            r.full_name, w.branch, w.slot, t.fleet_size
+            r.full_name, w.branch, w.slot, t.fleet_size, w.a2a_pair_token
                FROM workspaces w JOIN organizations o ON o.id = w.organization_id
                JOIN tenants t ON t.id = w.tenant_id AND t.organization_id = w.organization_id
                JOIN github_repositories r ON r.organization_id = t.organization_id
@@ -504,6 +505,12 @@ impl TenantProvisionWorker {
             parameters.push(coder_client::types::WorkspaceParameterValue {
                 name: "ticket_id".into(),
                 value: ticket_id,
+            });
+        }
+        if let Some(pair_token) = &row.8 {
+            parameters.push(coder_client::types::WorkspaceParameterValue {
+                name: "a2a_pair_token".into(),
+                value: pair_token.clone(),
             });
         }
         let created = self

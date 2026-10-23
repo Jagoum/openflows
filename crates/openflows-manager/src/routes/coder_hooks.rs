@@ -99,6 +99,17 @@ pub async fn receive(
     .bind(&envelope.meta.owner_id)
     .fetch_all(services.db.pool())
     .await?;
+    // The owner may own several workspaces within one tenant (e.g. Nexus plus
+    // a worker), and every matching workspace joins to the same Nexus row, so
+    // the raw result can contain duplicate tenant targets. Deduplicate by
+    // tenant before deciding the owner match is ambiguous.
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<_> = targets
+        .into_iter()
+        .filter(|(organization_id, tenant_id, _)| {
+            seen.insert((*organization_id, *tenant_id))
+        })
+        .collect();
     let target = if envelope.meta.workspace_id.is_none() && targets.len() != 1 {
         return Err(ManagerError::api(
             "AMBIGUOUS_HOOK_WORKSPACE",

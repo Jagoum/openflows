@@ -18,6 +18,7 @@ use crate::id::{OrganizationId, TenantId, WorkspaceId};
 use crate::secrets::SecretProvider;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tracing::warn;
 use zeroize::Zeroizing;
 
 /// The Redis username prefix for tenant-scoped clients.
@@ -114,9 +115,27 @@ impl TenantRuntimeRepository {
         .fetch_all(&self.pool)
         .await?;
         for (username, namespace, secret_ref, _tenant_id) in rows {
-            let password = self.secret_provider.get(&secret_ref).await.map_err(|e| {
-                ManagerError::Config(format!("cannot restore tenant Redis secret: {e}"))
-            })?;
+            let password = match self.secret_provider.get(&secret_ref).await {
+                Ok(password) => password,
+                Err(crate::secrets::SecretError::NotFound(_)) => {
+                    // The credential row is durable in PostgreSQL, but the
+                    // local in-memory provider lost its secret on restart. Do
+                    // not block Manager startup (and its recovery workers) on
+                    // it: `ensure_redis_credential` replaces the stale
+                    // credential on the next reconciliation.
+                    warn!(
+                        username,
+                        secret_ref,
+                        "skipping Redis credential restore: stored secret is missing"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ManagerError::Config(format!(
+                        "cannot restore tenant Redis secret: {error}"
+                    )))
+                }
+            };
             let password = std::str::from_utf8(&password)
                 .map_err(|_| ManagerError::Config("tenant Redis secret is not UTF-8".into()))?;
             self.redis_isolation

@@ -306,9 +306,15 @@ PY
     # delivery channel.
     if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
       export REDIS_URL="${data.coder_parameter.redis_url.value}"
-    export OPENFLOWS_FLEET_SIZE="${data.coder_parameter.fleet_size.value}"
       export OPENFLOWS_REDIS_USERNAME="${data.coder_parameter.redis_username.value}"
       export OPENFLOWS_REDIS_NAMESPACE="${data.coder_parameter.redis_namespace.value}"
+    fi
+    # Fleet size is authoritative only for hosted runtimes, where the Manager
+    # passes it as a workspace parameter. Local tenants supply their fleet
+    # through OPENFLOWS_REGISTRY_JSON (tenant add --fleet N); exporting a
+    # parameter that defaults to 1 here would shrink that registry fleet.
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      export OPENFLOWS_FLEET_SIZE="${data.coder_parameter.fleet_size.value}"
     fi
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export GITHUB_REPOSITORY="${data.coder_parameter.github_repository.value}"

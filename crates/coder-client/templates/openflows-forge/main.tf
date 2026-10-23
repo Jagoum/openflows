@@ -531,6 +531,29 @@ PY
       fi
     fi
 
+    # Broker-backed git credential refresh. The startup installation token is
+    # short-lived, so a long-running worker's push can outlive it. Refresh the
+    # runtime session and re-fetch a fresh installation token from the Manager
+    # broker, then rewrite the stored git credentials so pushes keep
+    # authenticating mid-task. Runs in the background for the workspace
+    # lifetime; harmless when the Manager is unreachable.
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      nohup bash -c '
+        REFRESH="$${OF_RUNTIME_REFRESH_TOKEN}"
+        while true; do
+          sleep 480
+          RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
+          ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
+          REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
+          GIT=$(curl -fsS -H "Authorization: Bearer $${ACCESS}" -H "Content-Type: application/json" --data "{\"purpose\":\"git\"}" "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials" 2>/dev/null) || continue
+          TOKEN=$(printf "%s" "$${GIT}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
+          echo "https://x-access-token:$${TOKEN}@github.com" > /home/coder/.git-credentials
+          sudo cp /home/coder/.git-credentials /root/.git-credentials
+          sudo chmod 600 /root/.git-credentials
+        done
+      ' >>/home/coder/.openflows/git-refresh.log 2>&1 &
+    fi
+
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
     # OPENFLOWS_ROLE must be the BASE role (forge), not the worker id
     # (forge-1): the controller writes dispatch and reads heartbeats under

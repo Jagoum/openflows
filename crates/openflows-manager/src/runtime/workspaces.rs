@@ -96,6 +96,7 @@ impl RuntimeWorkspaceService {
         slot: Option<i32>,
         ticket_id: Option<&str>,
         branch: Option<&str>,
+        a2a_pair_token: Option<&str>,
         idempotency_key: &str,
     ) -> Result<RuntimeWorkspaceResponse, ManagerError> {
         // Only the tenant's Nexus controller may request workers.
@@ -198,6 +199,13 @@ impl RuntimeWorkspaceService {
         if let Some(branch) = branch {
             sqlx::query("UPDATE workspaces SET branch = $1 WHERE id = $2")
                 .bind(branch)
+                .bind(workspace_id.0)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(pair_token) = a2a_pair_token {
+            sqlx::query("UPDATE workspaces SET a2a_pair_token = $1 WHERE id = $2")
+                .bind(pair_token)
                 .bind(workspace_id.0)
                 .execute(&mut *tx)
                 .await?;

@@ -725,7 +725,7 @@ async fn worker_request_requires_nexus_and_enforces_fleet_limit() {
         h.quotas.clone(),
     );
     let resp = ws_svc
-        .request_worker(&scope, "forge", Some(1), None, None, "worker-1")
+        .request_worker(&scope, "forge", Some(1), None, None, None, "worker-1")
         .await
         .unwrap();
     assert_eq!(resp.status, "queued");
@@ -733,11 +733,11 @@ async fn worker_request_requires_nexus_and_enforces_fleet_limit() {
     // A second worker in the same tenant is within the default fleet ceiling
     // (2); a third must be rejected as a resource-limit violation.
     ws_svc
-        .request_worker(&scope, "sentinel", Some(1), None, None, "worker-2")
+        .request_worker(&scope, "sentinel", Some(1), None, None, None, "worker-2")
         .await
         .unwrap();
     let err = ws_svc
-        .request_worker(&scope, "vessel", Some(1), None, None, "worker-3")
+        .request_worker(&scope, "vessel", Some(1), None, None, None, "worker-3")
         .await
         .unwrap_err();
     assert!(

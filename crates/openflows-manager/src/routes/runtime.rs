@@ -162,6 +162,8 @@ pub struct WorkerRequest {
     pub ticket_id: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub a2a_pair_token: Option<String>,
 }
 
 pub async fn request_worker(
@@ -187,6 +189,7 @@ pub async fn request_worker(
             body.slot,
             body.ticket_id.as_deref(),
             body.branch.as_deref(),
+            body.a2a_pair_token.as_deref(),
             &idempotency_key,
         )
         .await?;

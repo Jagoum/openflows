@@ -139,9 +139,15 @@ pub fn resolve_secret_provider(
 /// This is deliberately idempotent. A filesystem provider already contains
 /// the values after the first Manager start, so a restart must not fail just
 /// because `put` correctly refuses to overwrite an existing secret.
+///
+/// `master_key_ref` names the secret that holds the envelope master key
+/// (`OPENFLOWS_CRYPTO_MASTER_KEY_REF`). That secret must never be silently
+/// replaced when the seeded value differs from the stored one, otherwise
+/// existing encrypted records become unreadable.
 async fn populate_development_secrets(
     provider: &dyn crate::secrets::SecretProvider,
     contents: &[u8],
+    master_key_ref: &Option<String>,
 ) -> Result<(), ManagerError> {
     let values: std::collections::HashMap<String, String> = serde_json::from_slice(contents)
         .map_err(|_| ManagerError::Config("invalid development secrets file".into()))?;
@@ -154,7 +160,17 @@ async fn populate_development_secrets(
                     .await
                     .map_err(|_| ManagerError::Config("cannot verify development secret".into()))?;
                 if current != value.as_bytes() {
-                    if name == "master-key" || name.ends_with("/master-key") {
+                    // Protect the configured master-key reference (not a
+                    // hardcoded filename). When no ref is configured the dev
+                    // key is used, so the legacy `master-key` name is still
+                    // guarded for the local/test seed.
+                    let is_master_key = matches!(
+                        master_key_ref.as_deref(),
+                        Some(ref_name)
+                            if name == ref_name || name.ends_with(&format!("/{ref_name}"))
+                    ) || (master_key_ref.is_none()
+                        && (name == "master-key" || name.ends_with("/master-key")));
+                    if is_master_key {
                         return Err(ManagerError::Config(
                             "development master key differs from the existing stored value; refusing to replace it"
                                 .into(),
@@ -847,7 +863,12 @@ impl AppState {
                     // The development file is a seed for both local providers:
                     // in-memory for ephemeral tests and filesystem for a local
                     // Manager that must survive restarts.
-                    populate_development_secrets(provider.as_ref(), &contents).await?;
+                    populate_development_secrets(
+                        provider.as_ref(),
+                        &contents,
+                        &config.crypto_master_key_ref,
+                    )
+                    .await?;
                 }
                 let services =
                     ManagerServices::from_db_with_config(db, &config, provider.into()).await?;
@@ -1191,6 +1212,7 @@ mod development_secret_tests {
         populate_development_secrets(
             provider.as_ref(),
             br#"{"oauth":"client-secret","master":"01234567890123456789012345678901"}"#,
+            &Some("master".into()),
         )
         .await
         .unwrap();
@@ -1200,9 +1222,36 @@ mod development_secret_tests {
             .unwrap();
         assert_eq!(key.0, *b"01234567890123456789012345678901");
         assert!(provider.get("missing").await.is_err());
-        let error = populate_development_secrets(provider.as_ref(), b"private-credential")
+        let error = populate_development_secrets(provider.as_ref(), b"private-credential", &None)
             .await
             .unwrap_err();
         assert!(!error.to_string().contains("private-credential"));
+    }
+
+    #[tokio::test]
+    async fn configured_master_key_ref_is_protected_from_replacement() {
+        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER).unwrap();
+        let ref_name = "crypto-master-key";
+        // Seed the configured master-key reference.
+        populate_development_secrets(
+            provider.as_ref(),
+            br#"{"crypto-master-key":"01234567890123456789012345678901"}"#,
+            &Some(ref_name.into()),
+        )
+        .await
+        .unwrap();
+        // A restart with a different seed must refuse to replace it, not
+        // silently overwrite the key (which would break existing records).
+        let error = populate_development_secrets(
+            provider.as_ref(),
+            br#"{"crypto-master-key":"99999999999999999999999999999999"}"#,
+            &Some(ref_name.into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to replace"),
+            "expected a refusal, got: {error}"
+        );
     }
 }

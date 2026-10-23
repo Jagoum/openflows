@@ -59,6 +59,8 @@ struct WorkerRequest<'a> {
     ticket_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    a2a_pair_token: Option<&'a str>,
 }
 
 impl RuntimeControlClient {
@@ -207,6 +209,7 @@ impl RuntimeControlClient {
         slot: Option<i32>,
         ticket_id: Option<&str>,
         branch: Option<&str>,
+        a2a_pair_token: Option<&str>,
         idempotency_key: &str,
     ) -> Result<WorkerRequestResponse> {
         let body = serde_json::to_value(WorkerRequest {
@@ -214,6 +217,7 @@ impl RuntimeControlClient {
             slot,
             ticket_id,
             branch,
+            a2a_pair_token,
         })?;
         let response = self
             .send_retrying_refresh(

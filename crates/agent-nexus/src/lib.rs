@@ -1236,6 +1236,13 @@ Before significant work, read the relevant skill file to understand the workflow
             .and_then(|(_, value)| value.parse::<i32>().ok());
         let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
         let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
+        let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
+        store
+            .set(
+                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
+                json!(crate::a2a::A2ARelay::hash_pair_token(&a2a_pair_token)),
+            )
+            .await;
         let idempotency_store_key = format!("runtime:worker-request:{worker_id}:{ticket_id}");
         let idempotency_key: String = store
             .get_typed(&idempotency_store_key)
@@ -1251,6 +1258,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 slot_number,
                 Some(ticket_id),
                 (!branch.is_empty()).then_some(branch.as_str()),
+                Some(&a2a_pair_token),
                 &idempotency_key,
             )
             .await?;

@@ -28,6 +28,7 @@ the existing `openflows doctor` diagnoses the tenant controller.
    | `github-app-private-key` | OpenFlows GitHub App PEM private key |
    | `github-webhook-secret` | The secret configured for the GitHub App webhook |
    | `coder-github-client-secret` | Separate GitHub OAuth application's client secret for Coder sign-in |
+   | `coder-hook-secret` | Exactly 32 random bytes shared by Coder and the Manager for lifecycle-hook signing (`openssl rand -hex 32`; setup reuses it) |
 
    GitHub application registration and authorization remain external steps.
    Retaining GitHub login in both products requires two client registrations.
