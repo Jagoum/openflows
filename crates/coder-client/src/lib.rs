@@ -29,9 +29,26 @@ use config::{GithubConfig, TenantConfig};
 use envconfig::Envconfig;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock as SyncRwLock;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+/// Typed HTTP rejection from Coder, without copying its response body into
+/// application logs or API responses.
+#[derive(Debug)]
+pub struct CoderHttpError {
+    pub operation: &'static str,
+    pub status: reqwest::StatusCode,
+}
+
+impl std::fmt::Display for CoderHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Coder {} returned HTTP {}", self.operation, self.status)
+    }
+}
+
+impl std::error::Error for CoderHttpError {}
 
 fn check_template_push_output(name: &str, output: &std::process::Output) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -123,6 +140,8 @@ fn resolve_coder_cli() -> PathBuf {
 pub struct CoderClient {
     base_url: String,
     token: String,
+    /// Shared, rotated platform credential. Only Manager clients set this.
+    shared_token: Option<Arc<SyncRwLock<String>>>,
     http: reqwest::Client,
     /// Workspace name for `coder ssh` (e.g., "forge-1-T-041").
     workspace_name: Option<String>,
@@ -222,6 +241,7 @@ impl CoderClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            shared_token: None,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -246,6 +266,12 @@ impl CoderClient {
     /// via the `CODER_SESSION_TOKEN` environment variable.
     pub fn with_session_token(mut self, token: &str) -> Self {
         self.session_token = Some(token.to_string());
+        self
+    }
+
+    /// Use a credential that the Manager can rotate while workers keep running.
+    pub fn with_shared_token(mut self, token: Arc<SyncRwLock<String>>) -> Self {
+        self.shared_token = Some(token);
         self
     }
 
@@ -275,6 +301,7 @@ impl CoderClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token: String::new(),
+            shared_token: None,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -293,6 +320,7 @@ impl CoderClient {
         Self {
             base_url: self.base_url.clone(),
             token,
+            shared_token: None,
             http: self.http.clone(),
             workspace_name: self.workspace_name.clone(),
             session_token: self.session_token.clone(),
@@ -330,8 +358,15 @@ impl CoderClient {
         path: &str,
     ) -> reqwest::RequestBuilder {
         let mut req = self.http.request(method, self.url(path));
-        if !self.token.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.token));
+        let token = self.shared_token.as_ref().map(|token| {
+            token
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        });
+        let token = token.as_deref().unwrap_or(&self.token);
+        if !token.is_empty() {
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
         req
     }
@@ -895,14 +930,11 @@ impl CoderClient {
         if resp.status().is_success() {
             Ok(resp.json().await?)
         } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "Failed to list Coder templates in org '{}' ({}): {}",
-                org_id.0,
-                status,
-                body
-            )
+            Err(CoderHttpError {
+                operation: "list organization templates",
+                status: resp.status(),
+            }
+            .into())
         }
     }
 
@@ -981,13 +1013,11 @@ impl CoderClient {
             }
             Ok(versions)
         } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "Failed to list Coder template versions ({}): {}",
-                status,
-                body
-            )
+            Err(CoderHttpError {
+                operation: "list template versions",
+                status: resp.status(),
+            }
+            .into())
         }
     }
 
@@ -1020,17 +1050,21 @@ impl CoderClient {
         let mut tar_archive = Vec::new();
         std::io::Read::read_to_end(&mut decoder, &mut tar_archive)
             .context("Failed to decode packaged Coder template")?;
-        let uploaded: CoderUploadedFile = self
+        let upload_response = self
             .authenticated_request(reqwest::Method::POST, "/api/v2/files")
             .header("Content-Type", "application/x-tar")
             .body(tar_archive)
             .send()
             .await
-            .context("Failed to upload Coder template archive")?
-            .error_for_status()
-            .context("Coder rejected template archive upload")?
-            .json()
-            .await?;
+            .context("Failed to upload Coder template archive")?;
+        if !upload_response.status().is_success() {
+            return Err(CoderHttpError {
+                operation: "upload template archive",
+                status: upload_response.status(),
+            }
+            .into());
+        }
+        let uploaded: CoderUploadedFile = upload_response.json().await?;
         if uploaded.id.is_empty() {
             bail!("Coder file upload returned no archive hash");
         }
@@ -1054,13 +1088,11 @@ impl CoderClient {
             .await
             .context("Failed to create Coder template version")?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            bail!(
-                "Failed to create Coder template version ({}): {}",
-                status,
-                body
-            );
+            return Err(CoderHttpError {
+                operation: "create template version",
+                status: response.status(),
+            }
+            .into());
         }
         let version: CoderTemplateVersion = response.json().await?;
         if version.id.is_empty() {
@@ -1701,6 +1733,45 @@ impl CoderClient {
 
     /// Delete a workspace by triggering a delete build and waiting for deletion to complete.
     pub async fn delete_workspace(&self, id: &str) -> Result<()> {
+        let current = self
+            .authenticated_request(reqwest::Method::GET, &format!("/api/v2/workspaces/{id}"))
+            .send()
+            .await
+            .context("Failed to check workspace before deletion")?;
+        if matches!(current.status().as_u16(), 404 | 410) {
+            info!(workspace_id = id, status = %current.status(), "Workspace already deleted");
+            return Ok(());
+        }
+        if !current.status().is_success() {
+            return Err(CoderHttpError {
+                operation: "check workspace before deletion",
+                status: current.status(),
+            }
+            .into());
+        }
+        // A prior attempt may have completed after Manager gave up waiting.
+        // Confirm Coder's resource state before asking it to start another
+        // delete build; some Coder versions reject duplicate transitions.
+        let workspace: CoderWorkspace = current
+            .json()
+            .await
+            .context("Failed to read workspace before deletion")?;
+        if workspace.workspace_status() == WorkspaceStatus::Deleted
+            || workspace.latest_build.as_ref().is_some_and(|build| {
+                build.transition.as_deref() == Some("delete") && build.status == "succeeded"
+            })
+        {
+            info!(workspace_id = id, "Workspace already deleted");
+            return Ok(());
+        }
+        if workspace.latest_build.as_ref().is_some_and(|build| {
+            build.transition.as_deref() == Some("delete")
+                && matches!(build.status.as_str(), "pending" | "running")
+        }) {
+            return self
+                .wait_for_workspace_deleted(id, Duration::from_secs(60))
+                .await;
+        }
         let resp = self
             .authenticated_request(
                 reqwest::Method::POST,
@@ -1725,8 +1796,52 @@ impl CoderClient {
         }
 
         if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Failed to delete workspace: {}", body)
+            let status = resp.status();
+            // Coder can reject a repeated delete build even though an earlier
+            // attempt already deleted the workspace. Confirm the final state
+            // before treating a conflict or validation rejection as failure.
+            if matches!(status.as_u16(), 400 | 409 | 422) {
+                let check = self
+                    .authenticated_request(
+                        reqwest::Method::GET,
+                        &format!("/api/v2/workspaces/{id}"),
+                    )
+                    .send()
+                    .await
+                    .context("Failed to verify workspace deletion")?;
+                if matches!(check.status().as_u16(), 404 | 410) {
+                    info!(workspace_id = id, %status, "Workspace already deleted");
+                    return Ok(());
+                }
+                if check.status().is_success() {
+                    let workspace: CoderWorkspace = check
+                        .json()
+                        .await
+                        .context("Failed to verify workspace deletion")?;
+                    if workspace.workspace_status() == WorkspaceStatus::Deleted
+                        || workspace.latest_build.as_ref().is_some_and(|build| {
+                            build.transition.as_deref() == Some("delete")
+                                && build.status == "succeeded"
+                        })
+                    {
+                        info!(workspace_id = id, %status, "Workspace already deleted");
+                        return Ok(());
+                    }
+                    if workspace.latest_build.as_ref().is_some_and(|build| {
+                        build.transition.as_deref() == Some("delete")
+                            && matches!(build.status.as_str(), "pending" | "running")
+                    }) {
+                        return self
+                            .wait_for_workspace_deleted(id, Duration::from_secs(60))
+                            .await;
+                    }
+                }
+            }
+            return Err(CoderHttpError {
+                operation: "delete workspace",
+                status,
+            }
+            .into());
         }
 
         self.wait_for_workspace_deleted(id, Duration::from_secs(60))
@@ -2577,6 +2692,7 @@ impl CoderClient {
         let labels = build_chat_labels(ticket_id, role, "openflows", &tenant);
         let chat_req = CreateChatRequest {
             organization_id: Some(organization_id),
+            owner_id: None,
             workspace_id: workspace.id.clone(),
             model_config_id,
             content: vec![ChatInputPart::text(prompt)],
@@ -2827,7 +2943,32 @@ mod http_mock {
                     body,
                 });
 
-                let (status, content) = if path == "/api/v2/workspaces/ws-restart" {
+                let (status, content) = if path == "/api/v2/workspaces/ws-delete-running"
+                    && method == "GET"
+                {
+                    let requests = requests.lock().await;
+                    let checks = requests
+                        .iter()
+                        .filter(|r| r.method == "GET" && r.path == path)
+                        .count();
+                    let (state, build_state) = if checks > 1 {
+                        ("deleted", "succeeded")
+                    } else {
+                        ("deleting", "running")
+                    };
+                    ("200 OK", serde_json::json!({"id":"ws-delete-running", "status":state, "latest_build":{"status":build_state, "transition":"delete"}}).to_string())
+                } else if path == "/api/v2/workspaces/ws-delete-me" && method == "GET" {
+                    let requests = requests.lock().await;
+                    let submitted = requests.iter().any(|r| {
+                        r.method == "POST" && r.path == "/api/v2/workspaces/ws-delete-me/builds"
+                    });
+                    let (state, build_state) = if submitted {
+                        ("deleted", "succeeded")
+                    } else {
+                        ("running", "succeeded")
+                    };
+                    ("200 OK", serde_json::json!({"id":"ws-delete-me", "status":state, "latest_build":{"status":build_state, "transition": if submitted { "delete" } else { "start" }}}).to_string())
+                } else if path == "/api/v2/workspaces/ws-restart" {
                     let requests = requests.lock().await;
                     let stopped = requests.iter().any(|r| {
                         r.method == "POST" && r.path == "/api/v2/workspaces/ws-restart/builds"
@@ -2908,7 +3049,7 @@ mod http_mock {
             ),
             ("GET", "/api/v2/templates/template-abc/versions") => (
                 "200 OK",
-                r#"[{"id":"version-1","name":"release-1","template_id":"template-abc","organization_id":"org-abc","job":{"id":"job-1","status":"succeeded"}}]"#.to_string(),
+                r#"[{"id":"version-1","name":"release-1","template_id":"template-abc","organization_id":"org-abc","job":{"id":"job-1","status":"succeeded","error":null,"error_code":null}}]"#.to_string(),
             ),
             ("GET", "/api/v2/templates/template-foreign/versions") => (
                 "200 OK",
@@ -2917,6 +3058,10 @@ mod http_mock {
             ("POST", "/api/v2/workspaces/ws-delete-me/builds") => (
                 "201 Created",
                 r#"{"id":"build-1","transition":"delete"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/workspaces/ws-delete-me") => (
+                "200 OK",
+                r#"{"id":"ws-delete-me","name":"ws-delete-me","status":"deleted","latest_build":{"status":"succeeded","transition":"delete"}}"#.to_string(),
             ),
             ("POST", "/api/v2/workspaces/ws-delete-fail/builds") => (
                 "201 Created",
@@ -2938,6 +3083,22 @@ mod http_mock {
                 "410 Gone",
                 r#"{"message":"Workspace ws-gone was deleted"}"#.to_string(),
             ),
+            ("POST", "/api/v2/workspaces/ws-already-deleted/builds") => (
+                "400 Bad Request",
+                r#"{"message":"workspace has already been deleted"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/workspaces/ws-already-deleted") => (
+                "404 Not Found",
+                r#"{"message":"workspace was deleted"}"#.to_string(),
+            ),
+            ("POST", "/api/v2/workspaces/ws-delete-denied/builds") => (
+                "403 Forbidden",
+                r#"{"message":"operator credential expired"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/workspaces/ws-delete-denied") => (
+                "200 OK",
+                r#"{"id":"ws-delete-denied","name":"ws-delete-denied","status":"running"}"#.to_string(),
+            ),
             ("POST", "/api/v2/workspaces/ws-wait-gone/builds") => (
                 "201 Created",
                 r#"{"id":"build-3","transition":"delete"}"#.to_string(),
@@ -2954,6 +3115,26 @@ mod http_mock {
 #[cfg(test)]
 mod tests {
     use super::parse_chat_models_body;
+
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn manager_requests_use_the_latest_shared_operator_token() {
+        let token = Arc::new(RwLock::new("first-key".to_owned()));
+        let client = crate::CoderClient::new("https://coder.example.test", "first-key")
+            .with_shared_token(token.clone());
+        let first = client
+            .authenticated_request(reqwest::Method::GET, "/api/v2/users/me")
+            .build()
+            .unwrap();
+        assert_eq!(first.headers()["authorization"], "Bearer first-key");
+        *token.write().unwrap() = "second-key".to_owned();
+        let second = client
+            .authenticated_request(reqwest::Method::GET, "/api/v2/users/me")
+            .build()
+            .unwrap();
+        assert_eq!(second.headers()["authorization"], "Bearer second-key");
+    }
 
     #[test]
     fn coder_cli_path_override_takes_precedence() {
@@ -3102,6 +3283,8 @@ mod tests {
             .expect("list using Coder's template-id route");
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].id, "version-1");
+        assert_eq!(versions[0].job.as_ref().unwrap().error, "");
+        assert_eq!(versions[0].job.as_ref().unwrap().error_code, "");
 
         let error = client
             .list_template_versions(&org, &crate::CoderTemplateId::new("template-foreign"))
@@ -3269,6 +3452,7 @@ mod tests {
 
         let req = CreateChatRequest {
             organization_id: Some("org-abc".to_string()),
+            owner_id: Some("tenant-owner".to_string()),
             workspace_id: "ws-1".to_string(),
             model_config_id: None,
             content: vec![crate::types::ChatInputPart::text("hello")],
@@ -3294,6 +3478,7 @@ mod tests {
             .expect("organization_id must be present and a string");
         assert!(!org_id.is_empty(), "organization_id must not be empty");
         assert_eq!(org_id, "org-abc");
+        assert_eq!(body["owner_id"], "tenant-owner");
         server.shutdown().await;
     }
 
@@ -3351,12 +3536,32 @@ mod tests {
             .delete_workspace("ws-deleted")
             .await
             .expect("workspace with deleted status should succeed");
+        assert!(!server
+            .requests()
+            .await
+            .iter()
+            .any(|r| { r.method == "POST" && r.path == "/api/v2/workspaces/ws-deleted/builds" }));
+        client
+            .delete_workspace("ws-delete-running")
+            .await
+            .expect("an existing delete build should be waited on");
+        assert!(!server.requests().await.iter().any(|r| {
+            r.method == "POST" && r.path == "/api/v2/workspaces/ws-delete-running/builds"
+        }));
 
         // 410 Gone on delete build should be treated as success (already deleted)
         client
             .delete_workspace("ws-gone")
             .await
             .expect("410 on build should succeed");
+
+        client
+            .delete_workspace("ws-already-deleted")
+            .await
+            .expect("a rejected repeat delete must succeed after confirming 404");
+        assert!(!server.requests().await.iter().any(|r| {
+            r.method == "POST" && r.path == "/api/v2/workspaces/ws-already-deleted/builds"
+        }));
 
         // 410 Gone during wait should be treated as success (confirmed deleted)
         client
@@ -3383,6 +3588,20 @@ mod tests {
             err
         );
 
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_reports_coder_denial_without_response_body() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        let err = client
+            .delete_workspace("ws-delete-denied")
+            .await
+            .unwrap_err();
+        let coder = err.downcast_ref::<crate::CoderHttpError>().unwrap();
+        assert_eq!(coder.status, reqwest::StatusCode::FORBIDDEN);
+        assert!(!err.to_string().contains("operator credential expired"));
         server.shutdown().await;
     }
 }

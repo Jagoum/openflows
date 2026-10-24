@@ -151,6 +151,7 @@ fn api_v1_router() -> Router<AppState> {
         // Runtime worker provisioning and workspace lifecycle:
         // authenticated by a workspace runtime credential (the tenant Nexus).
         .route("/runtime/workspaces", post(runtime::request_worker))
+        .route("/runtime/chats", post(runtime::create_chat))
         .route(
             "/runtime/workspaces/{workspace}",
             get(runtime::get_workspace).delete(runtime::delete_workspace),

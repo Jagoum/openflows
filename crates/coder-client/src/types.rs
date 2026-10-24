@@ -157,9 +157,9 @@ pub struct CoderProvisionerJob {
     pub id: String,
     #[serde(default)]
     pub status: String,
-    #[serde(default, rename = "error")]
+    #[serde(default, rename = "error", deserialize_with = "nullable_string")]
     pub error: String,
-    #[serde(default, rename = "error_code")]
+    #[serde(default, rename = "error_code", deserialize_with = "nullable_string")]
     pub error_code: String,
 }
 
@@ -293,6 +293,13 @@ pub struct CoderUploadedFile {
 }
 
 fn nullable_template_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    nullable_string(deserializer)
+}
+
+fn nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -777,6 +784,10 @@ pub struct CreateChatRequest {
     /// this organization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization_id: Option<String>,
+    /// Set only by a trusted control plane creating a Chat on behalf of its
+    /// verified tenant owner. Coder checks impersonation privileges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
     /// Workspace ID to run the chat in.
     pub workspace_id: String,
     /// The model config ID (from `/api/v2/organizations/{org}/chats/models`).

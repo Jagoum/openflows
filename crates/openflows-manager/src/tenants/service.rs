@@ -402,6 +402,24 @@ impl TenantService {
                                 "tenant is already deleted".into(),
                             ));
                         }
+                        if current == "deleting" {
+                            // A second request must follow the original
+                            // cleanup, not launch another Coder delete build.
+                            let existing: Option<uuid::Uuid> = sqlx::query_scalar(
+                                "SELECT id FROM operations
+                                  WHERE organization_id = $1 AND resource_id = $2
+                                    AND kind = 'tenant.delete'
+                                    AND state IN ('queued', 'running', 'retryable_failed')
+                                  ORDER BY created_at DESC LIMIT 1",
+                            )
+                            .bind(org_id.0)
+                            .bind(tenant_id.0)
+                            .fetch_optional(&mut *conn)
+                            .await?;
+                            if let Some(id) = existing {
+                                return Ok(id.to_string());
+                            }
+                        }
 
                         sqlx::query(
                             "UPDATE tenants SET desired_state = 'deleting', updated_at = now()

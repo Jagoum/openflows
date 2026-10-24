@@ -418,17 +418,8 @@ impl TenantRuntimeRepository {
         redis_url
             .set_password(Some(redis_password.as_str()))
             .map_err(|_| ManagerError::Config("invalid Redis password".into()))?;
-        let relay_base = std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                ManagerError::Config(
-                    "OPENFLOWS_RUNTIME_RELAY_BASE_URL is required for Coder hook relay".into(),
-                )
-            })?
-            .replace("{tenant}", &tenant_id.to_string())
-            .trim_end_matches('/')
-            .to_string();
+        let hook_url =
+            crate::config::runtime_hook_url(tenant_id.into()).map_err(ManagerError::Config)?;
         let payload = Zeroizing::new(
             serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
@@ -440,7 +431,7 @@ impl TenantRuntimeRepository {
                 "redis_username": redis.username,
                 "redis_namespace": redis.namespace,
                 "hook_key": hook_key.as_str(),
-                "hook_url": format!("{relay_base}/experimental/hooks/chat"),
+                "hook_url": hook_url,
             }))
             .map_err(|e| ManagerError::Service(e.into()))?,
         );

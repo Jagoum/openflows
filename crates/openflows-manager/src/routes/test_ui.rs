@@ -185,7 +185,8 @@ function watchOperation(id) {
       if (generation !== operationGeneration || org !== organizationId) return;
       show('operation-output', operation);
       $('retry-operation').disabled = !(operation.state === 'retryable_failed' ||
-        (operation.state === 'failed' && operation.kind === 'org.provision' && operation.error_code === 'IMPORT_FAILED'));
+        (operation.state === 'failed' && (operation.kind === 'template.promote' ||
+          (operation.kind === 'org.provision' && operation.error_code === 'IMPORT_FAILED'))));
       if (['succeeded', 'failed', 'cancelled'].includes(operation.state)) {
         log(`Operation ${operation.state}${operation.error_code ? ': ' + operation.error_code : ''}`, operation.state !== 'succeeded');
         await refreshOrganizations(org);
@@ -291,7 +292,12 @@ $('refresh-orgs').onclick = () => action(async () => { await refreshOrganization
 $('promote-release').onclick = () => action(async () => {
   const result = await mutate(`/api/v1/platform/organizations/${organizationId}/template-release/promote-configured`);
   show('org-output', result);
-  log(`Configured template release promoted: ${result.release_id}`);
+  if (result.operation_id) {
+    watchOperation(result.operation_id);
+    log(`Template release promotion queued: ${result.release_id}`);
+  } else {
+    log(`Configured template release already promoted: ${result.release_id}`);
+  }
 }, 'org-output');
 $('organizations').onchange = () => action(async () => {
   cancelOperation(); tenantId = null; organizationId = $('organizations').value || null;

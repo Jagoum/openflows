@@ -16,6 +16,39 @@ use tower_http::trace::TraceLayer;
 
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 
+fn coder_operator_token(bytes: Vec<u8>) -> Result<String, ManagerError> {
+    let raw = String::from_utf8(bytes)
+        .map_err(|_| ManagerError::Config("Coder operator token is not UTF-8".into()))?;
+    let token = raw.trim();
+    if token.is_empty()
+        || reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).is_err()
+    {
+        return Err(ManagerError::Config(
+            "Coder operator token is empty or contains invalid header characters".into(),
+        ));
+    }
+    Ok(token.to_owned())
+}
+
+#[cfg(test)]
+mod coder_operator_token_tests {
+    use super::coder_operator_token;
+
+    #[test]
+    fn strips_line_ending_from_file_backed_token() {
+        assert_eq!(
+            coder_operator_token(b"operator-key\r\n".to_vec()).unwrap(),
+            "operator-key"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_header_unsafe_token() {
+        assert!(coder_operator_token(b" \n".to_vec()).is_err());
+        assert!(coder_operator_token(b"first\nsecond".to_vec()).is_err());
+    }
+}
+
 /// Async dependency probe used by `/ready`.
 ///
 /// The trait keeps the readiness endpoint decoupled from Redis and gives tests
@@ -107,11 +140,11 @@ pub struct ManagerServices {
 /// The secret-provider adapter name for the isolated in-memory provider.
 pub const IN_MEMORY_SECRET_PROVIDER: &str = "in-memory";
 pub const FILESYSTEM_SECRET_PROVIDER: &str = "filesystem";
+pub const AWS_SECRETS_MANAGER_SECRET_PROVIDER: &str = "aws-secrets-manager";
 
-/// Resolve a [`SecretProvider`] by adapter name. Only the in-memory provider is
-/// implemented; any other name fails closed (a durable production adapter is a
-/// deployment decision, not something to invent here).
-pub fn resolve_secret_provider(
+/// Resolve the selected deployment backend. AWS credentials come from the SDK
+/// default chain (for example, a workload identity), never user sessions.
+pub async fn resolve_secret_provider(
     name: &str,
 ) -> Result<Box<dyn crate::secrets::SecretProvider>, ManagerError> {
     match name {
@@ -124,6 +157,24 @@ pub fn resolve_secret_provider(
             })?;
             Ok(Box::new(
                 crate::secrets::FilesystemSecretProvider::new(root)
+                    .map_err(|e| ManagerError::Config(e.to_string()))?,
+            ))
+        }
+        AWS_SECRETS_MANAGER_SECRET_PROVIDER => {
+            let prefix = std::env::var("OPENFLOWS_AWS_SECRETS_PREFIX").map_err(|_| {
+                ManagerError::Config(
+                    "AWS Secrets Manager requires OPENFLOWS_AWS_SECRETS_PREFIX".into(),
+                )
+            })?;
+            let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            if sdk_config.region().is_none() {
+                return Err(ManagerError::Config(
+                    "AWS Secrets Manager requires an AWS region".into(),
+                ));
+            }
+            let client = aws_sdk_secretsmanager::Client::new(&sdk_config);
+            Ok(Box::new(
+                crate::secrets::AwsSecretsManagerSecretProvider::new(client, prefix)
                     .map_err(|e| ManagerError::Config(e.to_string()))?,
             ))
         }
@@ -597,7 +648,7 @@ impl ManagerServices {
             services.login.zep = Some(zep.clone());
             services.zep = Some(zep);
         }
-        services.with_org_provision(config, provider.as_ref()).await
+        services.with_org_provision(config, provider).await
     }
 
     /// Build and attach the durable organization-provisioning worker using the
@@ -613,7 +664,7 @@ impl ManagerServices {
     pub async fn with_org_provision(
         mut self,
         config: &crate::config::ManagerConfig,
-        provider: &dyn crate::secrets::SecretProvider,
+        provider: std::sync::Arc<dyn crate::secrets::SecretProvider>,
     ) -> Result<Self, ManagerError> {
         let Some(url) = &config.coder_url else {
             return Ok(self);
@@ -621,16 +672,50 @@ impl ManagerServices {
         let Some(ref_name) = &config.coder_operator_token_ref else {
             return Ok(self);
         };
+        crate::config::runtime_hook_url(uuid::Uuid::nil()).map_err(ManagerError::Config)?;
         let token_bytes = provider.get(ref_name).await.map_err(|e| {
             ManagerError::Config(format!("failed to resolve Coder operator token: {e}"))
         })?;
-        let token = String::from_utf8(token_bytes)
-            .map_err(|_| ManagerError::Config("Coder operator token is not UTF-8".into()))?;
+        let token = coder_operator_token(token_bytes)?;
 
+        let shared_token = std::sync::Arc::new(std::sync::RwLock::new(token.clone()));
         let mut real_adapter =
-            crate::coder::RealCoderAdapter::from_parts(url, &token, &config.coder_version_baseline);
+            crate::coder::RealCoderAdapter::from_parts(url, &token, &config.coder_version_baseline)
+                .with_shared_operator_token(shared_token.clone());
+        if let Some(email) = crate::operator::managed_bootstrap_email()
+            .await
+            .map_err(ManagerError::Service)?
+        {
+            let provider = provider.clone();
+            let ref_name = ref_name.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    match crate::operator::setup(true, Some(&email)).await {
+                        Ok(()) => match provider.get(&ref_name).await {
+                            Ok(bytes) => match coder_operator_token(bytes) {
+                                Ok(token) => {
+                                    *shared_token.write().unwrap_or_else(|e| e.into_inner()) =
+                                        token;
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "renewed Coder operator key is invalid")
+                                }
+                            },
+                            Err(error) => {
+                                tracing::error!(%error, "cannot reload Coder operator key")
+                            }
+                        },
+                        Err(error) => tracing::warn!(%error, "Coder operator key renewal failed"),
+                    }
+                }
+            });
+        }
         if config.provisioner_backend == "docker" {
-            let master = resolve_master_key(provider, &config.crypto_master_key_ref).await?;
+            let master =
+                resolve_master_key(provider.as_ref(), &config.crypto_master_key_ref).await?;
             let cipher =
                 crate::auth::crypto::EnvelopeCipher::derive(&master.0, "coder-provisioner", 1);
             real_adapter = real_adapter.with_docker_provisioner(
@@ -709,7 +794,8 @@ impl ManagerServices {
             adapter,
         )
         .with_runtime_endpoints(
-            config.auth.public_url.clone(),
+            crate::config::runtime_manager_url(&config.auth.public_url)
+                .map_err(crate::error::ManagerError::Config)?,
             config
                 .runtime_redis_url
                 .clone()
@@ -855,7 +941,7 @@ impl AppState {
         let services = match &config.database_url {
             Some(url) => {
                 let db = Db::connect(url).await?;
-                let provider = resolve_secret_provider(&config.secret_provider)?;
+                let provider = resolve_secret_provider(&config.secret_provider).await?;
                 if let Some(path) = std::env::var_os("OPENFLOWS_DEV_SECRETS_FILE") {
                     let contents = std::fs::read(path).map_err(|_| {
                         ManagerError::Config("cannot read development secrets file".into())
@@ -1084,6 +1170,24 @@ pub async fn serve(
     let org_provision = state
         .services()
         .and_then(|services| services.org_provision.clone());
+    let promotion_dependencies = state.services().and_then(|services| {
+        services.org_provision.clone().map(|worker| {
+            (
+                services.release_approvals.pool.clone(),
+                services.release_approvals.clone(),
+                worker,
+            )
+        })
+    });
+    let promotion_loop = async move {
+        match promotion_dependencies {
+            Some((pool, approvals, worker)) => {
+                crate::routes::platform_releases::run_promotion_worker(pool, approvals, worker)
+                    .await
+            }
+            None => std::future::pending().await,
+        }
+    };
     let provisioner_adapter = org_provision.as_ref().map(|worker| worker.adapter.clone());
     let provisioner_recovery_loop = async move {
         let Some(adapter) = provisioner_adapter else {
@@ -1122,6 +1226,7 @@ pub async fn serve(
         result = async { server.await } => result?,
         result = connection_loop => result?,
         result = org_provision_loop => result?,
+        result = promotion_loop => result?,
         result = provisioner_recovery_loop => result?,
         result = tenant_provision_loop => result?,
     }
@@ -1208,7 +1313,9 @@ mod development_secret_tests {
 
     #[tokio::test]
     async fn development_file_populates_oauth_and_master_key_references() {
-        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER).unwrap();
+        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER)
+            .await
+            .unwrap();
         populate_development_secrets(
             provider.as_ref(),
             br#"{"oauth":"client-secret","master":"01234567890123456789012345678901"}"#,
@@ -1230,7 +1337,9 @@ mod development_secret_tests {
 
     #[tokio::test]
     async fn configured_master_key_ref_is_protected_from_replacement() {
-        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER).unwrap();
+        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER)
+            .await
+            .unwrap();
         let ref_name = "crypto-master-key";
         // Seed the configured master-key reference.
         populate_development_secrets(

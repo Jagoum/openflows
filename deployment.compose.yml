@@ -46,7 +46,7 @@ services:
       CODER_OAUTH2_GITHUB_ALLOWED_ORGS: ${CODER_OAUTH2_GITHUB_ALLOWED_ORGS:-}
       CODER_OAUTH2_GITHUB_ALLOW_EVERYONE: ${CODER_OAUTH2_GITHUB_ALLOW_EVERYONE:-false}
       CODER_OAUTH2_PROVIDER_ENABLE: "true"
-      # v2.37 uses the experiment; newer versions use PROVIDER_ENABLE above.
+      # OAuth provider is enabled explicitly; the experiment preserves local compatibility.
       CODER_EXPERIMENTS: ${CODER_EXPERIMENTS:-agent-lifecycle-hooks,oauth2}
       CODER_CHAT_HOOK_URL: ${OPENFLOWS_HOOK_URL:?Set OPENFLOWS_HOOK_URL to the Manager hook endpoint}
       # The hook signing secret is the same durable file the `openflows operator setup`
@@ -55,6 +55,9 @@ services:
       CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:-}
       CODER_CHAT_HOOK_ENABLED: "true"
       CODER_PROVISIONER_DAEMONS: "1"
+      # The Manager requests a 90-day admin key and renews it before expiry.
+      # Do not extend the default lifetime of interactive user sessions.
+      CODER_MAX_ADMIN_TOKEN_LIFETIME: ${CODER_MAX_ADMIN_TOKEN_LIFETIME:-2160h}
       TF_PLUGIN_CACHE_DIR: /root/.terraform.d/plugin-cache
     secrets: [coder_github_secret, coder_hook_secret]
     volumes:
@@ -63,6 +66,24 @@ services:
     depends_on:
       coder-db:
         condition: service_healthy
+    restart: unless-stopped
+  # Local Manager runs on the host; tenant containers remain on this network.
+  runtime-relay:
+    image: nginx:1.28-alpine
+    user: "101:101"
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    ports: ["127.0.0.1:7081:8080"]
+    volumes:
+      - ./deploy/local/runtime-relay.conf:/etc/nginx/nginx.conf:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
 secrets:
   coder_github_secret:

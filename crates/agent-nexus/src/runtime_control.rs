@@ -50,6 +50,12 @@ pub struct WorkerStatus {
     pub observed_state: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RuntimeChatResponse {
+    pub chat_id: String,
+    pub workspace_id: String,
+}
+
 #[derive(Serialize)]
 struct WorkerRequest<'a> {
     role: &'a str,
@@ -255,12 +261,69 @@ impl RuntimeControlClient {
             bail!("worker status request failed with {}", response.status())
         }
     }
+
+    pub async fn create_chat(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        prompt: &str,
+    ) -> Result<RuntimeChatResponse> {
+        let response = self.send_retrying_refresh(
+            reqwest::Method::POST,
+            "/api/v1/runtime/chats",
+            Some(serde_json::json!({"workspace_id":workspace_id,"ticket_id":ticket_id,"prompt":prompt})),
+            None,
+        ).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            let code = body
+                .pointer("/error/code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("CODER_CHAT_UNAVAILABLE");
+            bail!("managed chat creation failed with {status} ({code})");
+        }
+        response
+            .json()
+            .await
+            .context("invalid runtime chat response")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mockito::{Matcher, Server};
+
+    #[tokio::test]
+    async fn managed_chat_uses_runtime_credential_and_scoped_request() {
+        let mut server = Server::new_async().await;
+        let request = server
+            .mock("POST", "/api/v1/runtime/chats")
+            .match_header("authorization", "Bearer runtime-access")
+            .match_body(Matcher::Json(serde_json::json!({
+                "workspace_id":"worker-id", "ticket_id":"T-CI-001", "prompt":"Begin work"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"chat_id":"chat-id","workspace_id":"worker-id"}"#)
+            .create_async()
+            .await;
+        let runtime = RuntimeControlClient {
+            base_url: server.url(),
+            http: reqwest::Client::new(),
+            tokens: Arc::new(Mutex::new(RuntimeTokens {
+                access: "runtime-access".into(),
+                refresh: "runtime-refresh".into(),
+            })),
+        };
+        let chat = runtime
+            .create_chat("worker-id", "T-CI-001", "Begin work")
+            .await
+            .unwrap();
+        assert_eq!(chat.chat_id, "chat-id");
+        request.assert_async().await;
+    }
 
     #[tokio::test]
     async fn broker_api_token_uses_runtime_auth_and_api_purpose() {

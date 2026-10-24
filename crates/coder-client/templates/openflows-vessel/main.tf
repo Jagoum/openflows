@@ -124,6 +124,7 @@ resource "coder_agent" "main" {
 
     # Setup git credentials from Coder external auth (the tenant's linked
     # GitHub App token). PAT flow removed — external auth is the sole source.
+    mkdir -p /home/coder/.local/state/openflows
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
       test -r "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" || { log "FATAL: runtime secret is not mounted"; exit 1; }
       eval "$(python3 - "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" <<'PY'
@@ -245,7 +246,7 @@ PY
           sudo cp /home/coder/.git-credentials /root/.git-credentials
           sudo chmod 600 /root/.git-credentials
         done
-      ' >>/home/coder/.openflows/git-refresh.log 2>&1 &
+      ' >>/home/coder/.local/state/openflows/git-refresh.log 2>&1 &
     fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace)

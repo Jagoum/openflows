@@ -192,7 +192,7 @@ pub async fn start(
         ("state", state_value.as_str()),
         ("code_challenge", challenge.as_str()),
         ("code_challenge_method", "S256"),
-        ("scope", "user:read_personal"),
+        ("scope", crate::operator::CODER_USER_SCOPES),
     ]);
     let cookie = super::auth::session_cookie_header(
         COOKIE,

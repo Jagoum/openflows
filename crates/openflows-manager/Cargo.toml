@@ -44,6 +44,8 @@ hmac = "0.12"
 tar = "0.4"
 flate2 = "1"
 hex = "0.4"
+aws-config = { version = "1.13.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-secretsmanager = "1.123.0"
 
 [features]
 default = []

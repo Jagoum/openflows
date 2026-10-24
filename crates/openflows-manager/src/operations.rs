@@ -192,7 +192,9 @@ pub async fn claim_kind(
 /// Claim one operation from a set of kinds while reserving the organization's
 /// provisioning slot in the same database transaction. The advisory lock is
 /// scoped to the organization, so separate Manager instances cannot both pass
-/// the quota check before either one records its lease.
+/// the quota check before either one records its lease. Tenant deletion is a
+/// finalizer: after normal attempts are exhausted, an unresolved deletion is
+/// eligible again after five minutes while its tenant is still `deleting`.
 pub async fn claim_kinds_with_org_slot(
     pool: &PgPool,
     owner: &str,
@@ -208,11 +210,18 @@ pub async fn claim_kinds_with_org_slot(
              SELECT DISTINCT ON (organization_id) id, organization_id, created_at
                FROM operations
               WHERE (state IN ('queued', 'running')
-                 OR (state = 'retryable_failed' AND retry_at IS NOT NULL))
+                 OR (state = 'retryable_failed' AND retry_at IS NOT NULL)
+                 OR (kind = 'tenant.delete' AND state = 'retryable_failed'
+                     AND retry_at IS NULL AND updated_at < now() - interval '5 minutes'
+                     AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = operations.resource_id
+                                 AND t.organization_id = operations.organization_id
+                                 AND t.desired_state = 'deleting')))
                 AND (lease_expires_at IS NULL OR lease_expires_at < now())
                 AND (retry_at IS NULL OR retry_at <= now())
                 AND kind = ANY($1::text[])
-              ORDER BY organization_id, created_at
+              ORDER BY organization_id,
+                       CASE WHEN kind = 'tenant.delete' THEN 0 ELSE 1 END,
+                       created_at
            ) candidates
           ORDER BY created_at",
     )
@@ -236,7 +245,12 @@ pub async fn claim_kinds_with_org_slot(
                FROM operations
               WHERE id = $1
                 AND (state IN ('queued', 'running')
-                     OR (state = 'retryable_failed' AND retry_at IS NOT NULL))
+                     OR (state = 'retryable_failed' AND retry_at IS NOT NULL)
+                     OR (kind = 'tenant.delete' AND state = 'retryable_failed'
+                         AND retry_at IS NULL AND updated_at < now() - interval '5 minutes'
+                         AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = operations.resource_id
+                                     AND t.organization_id = operations.organization_id
+                                     AND t.desired_state = 'deleting')))
                 AND (lease_expires_at IS NULL OR lease_expires_at < now())
                 AND (retry_at IS NULL OR retry_at <= now())
                 AND kind = ANY($2::text[])
@@ -506,8 +520,9 @@ fn retry_delay(attempt: i32) -> Duration {
     Duration::seconds((1_i64 << exponent).min(60))
 }
 
-/// Requeue a retryable operation, or an organization import failure created
-/// before bounded import recovery, inside the request's idempotency transaction.
+/// Requeue a retryable operation, an organization import failure created
+/// before bounded import recovery, or a failed template promotion after its
+/// operator has corrected the underlying Coder configuration.
 /// A live lease cannot be stolen from an active worker; the adapter retains its
 /// per-release import attempt limit even when the operation is manually retried.
 pub async fn retry_in_tx(
@@ -523,7 +538,8 @@ pub async fn retry_in_tx(
           WHERE id = $1 AND organization_id = $2
             AND (state = 'retryable_failed'
                  OR (state = 'failed' AND kind = 'org.provision'
-                     AND error_code = 'IMPORT_FAILED'))
+                     AND error_code = 'IMPORT_FAILED')
+                 OR (state = 'failed' AND kind = 'template.promote'))
             AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp())",
     )
     .bind(id.0)

@@ -1449,6 +1449,16 @@ Before significant work, read the relevant skill file to understand the workflow
             return;
         }
 
+        if let Some(runtime) = &self.runtime_control {
+            if let Err(error) = self
+                .create_managed_chat_for_assignment(store, runtime, worker_id, ticket)
+                .await
+            {
+                warn!(worker_id, ticket_id, error = %error, "Managed Chat creation deferred; retrying on next poll");
+            }
+            return;
+        }
+
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
             None => {
@@ -1781,6 +1791,7 @@ Use `openflows-harness` for all coordination:
 
         let chat_req = CreateChatRequest {
             organization_id,
+            owner_id: None,
             workspace_id: workspace_id.clone(),
             model_config_id,
             content: vec![coder_client::types::ChatInputPart::text(initial_prompt)],
@@ -1922,6 +1933,55 @@ Use `openflows-harness` for all coordination:
         // Store workspace_id mapping
         let ws_key = full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role);
         store.set(&ws_key, json!(workspace_id)).await;
+    }
+
+    async fn create_managed_chat_for_assignment(
+        &self,
+        store: &SharedStore,
+        runtime: &crate::runtime_control::RuntimeControlClient,
+        worker_id: &str,
+        ticket: &Ticket,
+    ) -> Result<()> {
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let workspace_id = slots
+            .get(worker_id)
+            .and_then(|slot| slot.workspace_id.as_deref())
+            .context("worker workspace is not assigned yet")?;
+        let role = Self::worker_role(worker_id);
+        let chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, role);
+        let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, role);
+        let prompt = format!(
+            "You are the OpenFlows {role} agent for ticket {id}.\n\nTitle: {title}\n\n{body}\n\nRead /home/coder/workspace/AGENTS.md and /home/coder/workspace/{role}.agent.md if present. Read `openflows-harness dispatch read` and `openflows-harness status get`, then write a plan and report `plan_ready` before implementation.",
+            id=ticket.id, title=ticket.title, body=ticket.body,
+        );
+        let chat = runtime
+            .create_chat(workspace_id, &ticket.id, &prompt)
+            .await?;
+        if chat.workspace_id != workspace_id {
+            anyhow::bail!("Manager returned a Chat for a different workspace");
+        }
+        store.set(&chat_key, json!(chat.chat_id)).await;
+        store
+            .set(
+                &full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, role),
+                json!("started"),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, role),
+                json!(workspace_id),
+            )
+            .await;
+        let mut dispatch: serde_json::Value = store.get_typed(&dispatch_key).await
+            .unwrap_or_else(|| json!({"ticket_id":ticket.id,"title":ticket.title,"body":ticket.body,"branch":ticket.branch}));
+        if let Some(obj) = dispatch.as_object_mut() {
+            obj.insert("chat_id".into(), json!(chat.chat_id));
+        }
+        store.set(&dispatch_key, dispatch).await;
+        info!(worker_id, ticket_id = %ticket.id, chat_id = %chat.chat_id, "Managed Coder Chat ready");
+        Ok(())
     }
 
     /// Send a harness-aware resume prompt to a chat that is stuck.
@@ -2369,6 +2429,7 @@ Use `openflows-harness` for all coordination:
 
                     let chat_req = coder_client::types::CreateChatRequest {
                         organization_id: Some(organization_id),
+                        owner_id: None,
                         workspace_id: workspace_id.clone(),
                         model_config_id: None,
                         content: vec![coder_client::types::ChatInputPart::text(
@@ -2662,6 +2723,7 @@ Use `openflows-harness` for all coordination:
 
                     let chat_req = coder_client::types::CreateChatRequest {
                         organization_id: Some(organization_id),
+                        owner_id: None,
                         workspace_id: workspace_id.clone(),
                         model_config_id: None,
                         content: vec![coder_client::types::ChatInputPart::text(&pr_review_prompt)],
@@ -2972,6 +3034,7 @@ Use `openflows-harness` for all coordination:
 
             let chat_req = coder_client::types::CreateChatRequest {
                 organization_id: Some(organization_id),
+                owner_id: None,
                 workspace_id: workspace_id.clone(),
                 model_config_id: None,
                 content: vec![],
@@ -6504,6 +6567,7 @@ mod tests {
             .await;
         let request = coder_client::types::CreateChatRequest {
             organization_id: None,
+            owner_id: None,
             workspace_id: "ws".into(),
             model_config_id: None,
             content: vec![],
@@ -6553,6 +6617,7 @@ mod tests {
                 .await;
             let req = coder_client::types::CreateChatRequest {
                 organization_id: Some("org".into()),
+                owner_id: None,
                 workspace_id: "ws".into(),
                 model_config_id: None,
                 content: vec![],
@@ -6706,6 +6771,7 @@ mod tests {
             store.set("ticket:T-1:sentinel_session", json!("old")).await;
             let request = coder_client::types::CreateChatRequest {
                 organization_id: Some("org".into()),
+                owner_id: None,
                 workspace_id: "new-ws".into(),
                 model_config_id: None,
                 content: vec![],

@@ -28,6 +28,13 @@ enum Command {
     },
     /// Read-only deployment checks; exits nonzero if any check fails.
     Doctor,
+    /// Reissue a single-use bootstrap after a hosted workspace lost its runtime session.
+    RepairRuntime {
+        /// OpenFlows workspace UUID (not the Coder workspace UUID).
+        workspace_id: uuid::Uuid,
+    },
+    /// Replace the Coder lifecycle-hook secret from standard input.
+    SetCoderHookSecret,
 }
 
 #[tokio::main]
@@ -45,7 +52,13 @@ async fn main() -> Result<(), ManagerError> {
         .compact()
         .init();
 
-    match cli.command.unwrap_or(Command::Serve) {
+    let command = cli.command.unwrap_or(Command::Serve);
+    if !matches!(&command, Command::Doctor) {
+        openflows_manager::operator::load_hosted_configuration()
+            .await
+            .map_err(ManagerError::Service)?;
+    }
+    match command {
         Command::Setup {
             initialize_coder,
             admin_email,
@@ -59,7 +72,28 @@ async fn main() -> Result<(), ManagerError> {
                 .await
                 .map_err(ManagerError::Service);
         }
+        Command::RepairRuntime { workspace_id } => {
+            return openflows_manager::operator::repair_runtime(workspace_id)
+                .await
+                .map_err(ManagerError::Service);
+        }
+        Command::SetCoderHookSecret => {
+            return openflows_manager::operator::set_coder_hook_secret()
+                .await
+                .map_err(ManagerError::Service);
+        }
         Command::Serve => {}
+    }
+
+    // Managed installations can repair or renew the Coder authority before
+    // workers begin. The saved bootstrap password is never sent to runtimes.
+    if let Some(email) = openflows_manager::operator::managed_bootstrap_email()
+        .await
+        .map_err(ManagerError::Service)?
+    {
+        openflows_manager::operator::setup(true, Some(&email))
+            .await
+            .map_err(ManagerError::Service)?;
     }
 
     // Centralized, typed configuration. Hosted-mode configuration failures are

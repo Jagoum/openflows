@@ -239,6 +239,13 @@ fn retryable_import_error(error: ManagerError, attempt: usize) -> ManagerError {
 }
 
 impl RealCoderAdapter {
+    pub fn with_shared_operator_token(
+        mut self,
+        token: std::sync::Arc<std::sync::RwLock<String>>,
+    ) -> Self {
+        self.client = self.client.with_shared_token(token);
+        self
+    }
     pub fn new(client: CoderClient, version_baseline: impl Into<String>) -> Self {
         RealCoderAdapter {
             client,

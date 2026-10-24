@@ -337,14 +337,20 @@ PY
       # Ubuntu base image (codercom/enterprise-base): prefer the official
       # GitHub apt repo (always current), fall back to the distro package.
       sudo mkdir -p -m 0755 /etc/apt/keyrings 2>/dev/null || true
-      sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      sudo curl -fsSL --connect-timeout 5 --max-time 15 https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
       if [ -s /etc/apt/keyrings/githubcli-archive-keyring.gpg ]; then
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
           | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
       fi
-      sudo apt-get update -qq >/dev/null 2>&1 || true
-      sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
+      # Optional package installation must not hold a workspace's startup
+      # script indefinitely when an apt mirror is unreachable. Production
+      # workspace images should include gh at build time.
+      timeout -k 5s 45s sudo apt-get update -qq >/dev/null 2>&1 || true
+      timeout -k 5s 45s sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
+      if ! command -v gh >/dev/null 2>&1; then
+        log "WARNING: gh is unavailable; Git push still uses the broker credential, and PR creation must use the REST fallback"
+      fi
     fi
 
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
@@ -443,22 +449,22 @@ PY
     # The fresh workspace volume is root-owned initially, so any copy/clone
     # into /home/coder/workspace must run via sudo (then be chowned back).
     if [ -d /home/coder/workspace/.git ]; then
-      cd /home/coder/workspace && git pull 2>/dev/null || true
-      git fetch --all --prune 2>/dev/null || true
+      cd /home/coder/workspace && timeout -k 5s 45s git pull 2>/dev/null || log "WARNING: repository pull failed or timed out; using local checkout"
+      timeout -k 5s 45s git fetch --all --prune 2>/dev/null || log "WARNING: repository fetch failed or timed out; using local refs"
     elif [ -d "$GOLDEN_REPO/.git" ]; then
       sudo cp -a "$GOLDEN_REPO/." /home/coder/workspace/ 2>/tmp/forge_golden_err.log
       sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
       log "Copied golden repo seed into /home/coder/workspace"
       # Refresh to latest before checkout (design: copy -> refresh -> checkout).
       cd /home/coder/workspace
-      git fetch --all --prune 2>/dev/null || true
+      timeout -k 5s 45s git fetch --all --prune 2>/dev/null || log "WARNING: repository fetch failed or timed out; using seed refs"
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
       log "WARNING: no golden repo seed at $GOLDEN_REPO — falling back to direct clone"
-      if sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/forge_clone_err.log; then
+      if timeout -k 5s 90s sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/forge_clone_err.log; then
         sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
         log "Cloned repository into /home/coder/workspace"
         cd /home/coder/workspace
-        git fetch --all --prune 2>/dev/null || true
+        timeout -k 5s 45s git fetch --all --prune 2>/dev/null || log "WARNING: repository fetch failed or timed out; using cloned refs"
       else
         log "WARNING: git clone failed — $(tail -5 /tmp/forge_clone_err.log 2>/dev/null)"
       fi
@@ -548,6 +554,7 @@ PY
     # hosts file so pushes and API/PR commands keep authenticating mid-task.
     # Runs in the background for the workspace lifetime; harmless when the
     # Manager is unreachable.
+    mkdir -p /home/coder/.local/state/openflows
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
       nohup bash -c '
         REFRESH="$${OF_RUNTIME_REFRESH_TOKEN}"
@@ -574,7 +581,7 @@ PY
             sudo chmod 600 /root/.config/gh/hosts.yml
           fi
         done
-      ' _ "$GITHUB_CLI_HOST" >>/home/coder/.openflows/git-refresh.log 2>&1 &
+      ' _ "$GITHUB_CLI_HOST" >>/home/coder/.local/state/openflows/git-refresh.log 2>&1 &
     fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
@@ -614,29 +621,31 @@ PY
     # If no CLI binary is available, the workspace relies on Coder control-
     # plane agents via the Coder Chat created by the controller.
     AGENT_CLI=""
-    if [ -f /opt/openflows-dev/claude ]; then
+    if [ "${data.coder_parameter.hosted.value}" != "true" ] && [ -f /opt/openflows-dev/claude ]; then
       AGENT_CLI="claude"
       sudo cp /opt/openflows-dev/claude /usr/local/bin/claude
       sudo chmod +x /usr/local/bin/claude
       log "Mounted Claude Code binary from host — starting agent"
-    elif command -v claude >/dev/null 2>&1; then
+    elif [ "${data.coder_parameter.hosted.value}" != "true" ] && command -v claude >/dev/null 2>&1; then
       AGENT_CLI="claude"
       log "Claude Code found on PATH — starting agent"
-    elif [ -f /opt/openflows-dev/codex ]; then
+    elif [ "${data.coder_parameter.hosted.value}" != "true" ] && [ -f /opt/openflows-dev/codex ]; then
       AGENT_CLI="codex"
       sudo cp /opt/openflows-dev/codex /usr/local/bin/codex
       sudo chmod +x /usr/local/bin/codex
       log "Mounted Codex binary from host — starting agent"
-    elif command -v codex >/dev/null 2>&1; then
+    elif [ "${data.coder_parameter.hosted.value}" != "true" ] && command -v codex >/dev/null 2>&1; then
       AGENT_CLI="codex"
       log "Codex found on PATH — starting agent"
     fi
 
-    if [ -n "$AGENT_CLI" ]; then
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      log "Hosted Forge execution is started by Nexus through a Manager-created Coder Chat"
+    elif [ -n "$AGENT_CLI" ]; then
       nohup "$AGENT_CLI" -p "Start working on ticket $OPENFLOWS_TICKET. Read dispatch with 'openflows-harness dispatch read' and follow the workflow. Use 'openflows-harness status set <phase>' to report progress." </dev/null >/tmp/agent.log 2>&1 &
       log "Agent started (cli=$AGENT_CLI ticket=$OPENFLOWS_TICKET pid=$!)"
     else
-      log "No agent CLI binary found — workspace will rely on Coder Chat control-plane agent"
+      log "No agent CLI binary found — waiting for a Coder Chat from the controller"
     fi
   EOT
 }

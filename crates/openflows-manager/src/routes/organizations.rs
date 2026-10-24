@@ -497,8 +497,8 @@ fn parse_user(s: &str) -> Result<UserId, ManagerError> {
         .map_err(|_| ManagerError::InvalidInput("invalid user id".into()))
 }
 
-/// `GET /operations/{id}` — scoped operation status. The caller must be an
-/// active member of the operation's organization.
+/// `GET /operations/{id}` — scoped operation status. Organization members
+/// and, for promotion operations only, platform operators may inspect it.
 pub async fn get_operation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -514,17 +514,21 @@ pub async fn get_operation(
 
     // Resolve the operation's organization and require the caller be an active
     // member of it before returning any status.
-    let op_rec =
-        crate::operations::get_for_user(&services.orgs_service.pool, op_id, principal.user_id)
-            .await?
-            .ok_or_else(|| ManagerError::not_found("operation"))?;
+    let op_rec = operation_for_caller(services, op_id, principal.user_id).await?;
 
     let org_id = crate::id::OrganizationId::from_uuid(op_rec.organization_id);
     let (membership, org_state) = services
         .org_repo
         .membership_and_org(org_id, principal.user_id)
         .await?;
-    Policy::require_member(membership.as_ref(), org_state.as_ref())?;
+    if op_rec.kind != "template.promote"
+        || !services
+            .release_approvals
+            .is_platform_operator(principal.user_id)
+            .await?
+    {
+        Policy::require_member(membership.as_ref(), org_state.as_ref())?;
+    }
 
     Ok(Json(serde_json::json!({
         "id": op_id.to_string(),
@@ -553,16 +557,26 @@ pub async fn retry_operation(
     let op_id = op
         .parse::<crate::id::OperationId>()
         .map_err(|_| ManagerError::not_found("operation"))?;
-    let operation =
-        crate::operations::get_for_user(&services.orgs_service.pool, op_id, principal.user_id)
-            .await?
-            .ok_or_else(|| ManagerError::not_found("operation"))?;
+    let operation = operation_for_caller(services, op_id, principal.user_id).await?;
     let org_id = OrganizationId::from_uuid(operation.organization_id);
     let (membership, org_state) = services
         .org_repo
         .membership_and_org(org_id, principal.user_id)
         .await?;
-    if matches!(
+    if operation.kind == "template.promote"
+        && !services
+            .release_approvals
+            .is_platform_operator(principal.user_id)
+            .await?
+    {
+        return Err(ManagerError::api(
+            "PLATFORM_OPERATOR_REQUIRED",
+            "only a platform operator may retry template promotion",
+        ));
+    }
+    if operation.kind == "template.promote" {
+        // Platform promotion does not require membership in the customer's org.
+    } else if matches!(
         operation.kind.as_str(),
         "tenant.delete" | "tenant.clean" | "tenant.clean_all" | "organization.provision"
     ) {
@@ -604,6 +618,39 @@ pub async fn retry_operation(
         Json(serde_json::json!({"operation_id": operation_id, "status": "queued"})),
     )
         .into_response())
+}
+
+async fn operation_for_caller(
+    services: &crate::server::ManagerServices,
+    id: crate::id::OperationId,
+    caller: UserId,
+) -> Result<crate::operations::OperationRecord, ManagerError> {
+    if let Some(record) =
+        crate::operations::get_for_user(&services.orgs_service.pool, id, caller).await?
+    {
+        return Ok(record);
+    }
+    if !services
+        .release_approvals
+        .is_platform_operator(caller)
+        .await?
+    {
+        return Err(ManagerError::not_found("operation"));
+    }
+    let org: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT organization_id FROM operations WHERE id = $1 AND kind = 'template.promote'",
+    )
+    .bind(id.0)
+    .fetch_optional(&services.orgs_service.pool)
+    .await?;
+    let org = org.ok_or_else(|| ManagerError::not_found("operation"))?;
+    crate::operations::get_scoped(
+        &services.orgs_service.pool,
+        OrganizationId::from_uuid(org),
+        id,
+    )
+    .await?
+    .ok_or_else(|| ManagerError::not_found("operation"))
 }
 
 pub fn idempotency_key(headers: &HeaderMap) -> Result<String, ManagerError> {

@@ -74,10 +74,8 @@ pub async fn receive(
         .map_err(|_| ManagerError::InvalidInput("invalid hook body".into()))?;
     let envelope: HookEnvelope = serde_json::from_slice(&body)
         .map_err(|_| ManagerError::InvalidInput("invalid hook JSON".into()))?;
-    let expected_audience = format!(
-        "{}/api/v1/hooks/coder/chat",
-        services.auth_config.public_url.trim_end_matches('/')
-    );
+    let expected_audience = crate::config::coder_hook_url(&services.auth_config.public_url)
+        .map_err(ManagerError::Config)?;
     let claims = verify(&auth, secret, &expected_audience, &envelope, body.as_ref())?;
 
     let targets: Vec<(uuid::Uuid, uuid::Uuid, String)> = sqlx::query_as(
@@ -150,18 +148,7 @@ pub async fn receive(
                 ManagerError::api("SERVICE_UNAVAILABLE", "tenant hook channel unavailable")
             })?,
     );
-    let relay_base = std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ManagerError::Config(
-                "OPENFLOWS_RUNTIME_RELAY_BASE_URL is required for Coder hook relay".into(),
-            )
-        })?
-        .replace("{tenant}", &tenant_id.to_string())
-        .trim_end_matches('/')
-        .to_string();
-    let relay_url = format!("{relay_base}/experimental/hooks/chat");
+    let relay_url = crate::config::runtime_hook_url(tenant_id).map_err(ManagerError::Config)?;
     let relay_claims = HookClaims {
         iss: "openflows-manager".into(),
         aud: relay_url.clone(),

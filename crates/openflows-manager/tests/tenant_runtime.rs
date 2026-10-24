@@ -798,6 +798,15 @@ async fn runtime_renewal_revocation_and_tenant_deletion() {
         .delete_tenant(h.owner, h.org, tenant, "del-key", "r")
         .await
         .unwrap();
+    let repeated = h
+        .tenant_service
+        .delete_tenant(h.owner, h.org, tenant, "different-del-key", "r2")
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated, op_id,
+        "a second delete must reuse the cleanup operation"
+    );
     // The delete operation marks the tenant deleted.
     let del_guard = operations::claim_kind(&h.pool, "del-worker", Some("tenant.delete"))
         .await
@@ -834,6 +843,39 @@ async fn runtime_renewal_revocation_and_tenant_deletion() {
         !revoked,
         "tenant deletion must revoke live runtime credentials"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn exhausted_tenant_delete_is_recovered_without_manual_retry() {
+    let h = harness().await;
+    let tenant = create_tenant(&h, "delete-recovery", 1, "delete-recovery").await;
+    let op_id = h
+        .tenant_service
+        .delete_tenant(h.owner, h.org, tenant, "delete-recovery", "r")
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE operations SET state = 'retryable_failed', attempt_count = 8,
+            retry_at = NULL, updated_at = now() - interval '6 minutes'
+          WHERE id = $1",
+    )
+    .bind(op_id.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    h.worker.run_once().await.unwrap();
+    let (tenant_state, op_state): (String, String) = sqlx::query_as(
+        "SELECT t.desired_state, o.state FROM tenants t JOIN operations o ON o.resource_id = t.id
+          WHERE o.id = $1",
+    )
+    .bind(op_id.0)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(tenant_state, "deleted");
+    assert_eq!(op_state, "succeeded");
 }
 
 // ---------------------------------------------------------------------------

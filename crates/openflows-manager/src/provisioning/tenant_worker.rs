@@ -964,7 +964,16 @@ impl TenantProvisionWorker {
                     &coder_client::CoderOrganizationId::new(coder_org),
                     &workspace_id,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    tracing::warn!(tenant_id = %tenant_id.0, %workspace_id, %error,
+                        "Coder workspace teardown failed; tenant deletion will be retried");
+                    ManagerError::api(
+                        "CODER_WORKSPACE_DELETE_FAILED",
+                        "Coder workspace deletion failed; inspect the workspace's delete build in Coder",
+                    )
+                    .retryable(true)
+                })?;
         }
         self.tenant_runtime
             .revoke_redis_credential(org_id, tenant_id)
@@ -1058,11 +1067,29 @@ impl TenantProvisionWorker {
             }
             Ok(TenantProvisionOutcome::StaleLease) => {}
             Err(e) => {
-                tracing::warn!(%e, "tenant operation attempt failed with error");
+                let coder_rejection = match &e {
+                    ManagerError::Service(source) => source
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<coder_client::CoderHttpError>()),
+                    _ => None,
+                };
+                if let Some(coder) = coder_rejection {
+                    tracing::warn!(
+                        operation_id = %guard.operation_id,
+                        operation = coder.operation,
+                        coder_status = coder.status.as_u16(),
+                        "Coder rejected tenant operation"
+                    );
+                } else {
+                    tracing::warn!(operation_id = %guard.operation_id, error = %e, "tenant operation attempt failed");
+                }
                 let code = match &e {
                     ManagerError::Api(api) => api.code.as_str(),
                     ManagerError::Database(_) => "DATABASE_ERROR",
                     ManagerError::Config(_) => "CONFIGURATION_ERROR",
+                    _ if coder_rejection.is_some() && kind == Some("tenant.delete") => {
+                        "CODER_WORKSPACE_DELETE_FAILED"
+                    }
                     _ => "TENANT_OPERATION_FAILED",
                 };
                 let _ = guard.fail(true, Some(code)).await?;

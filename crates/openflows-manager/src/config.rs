@@ -10,6 +10,115 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub const RUNTIME_MANAGER_URL_ENV: &str = "OPENFLOWS_RUNTIME_MANAGER_URL";
+
+/// Coder's authenticated lifecycle hook endpoint and JWT audience.
+pub fn coder_hook_url(public_url: &str) -> Result<String, String> {
+    let configured = std::env::var("OPENFLOWS_HOOK_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}/api/v1/hooks/coder/chat",
+                public_url.trim_end_matches('/')
+            )
+        });
+    let value = configured.trim();
+    let url =
+        url::Url::parse(value).map_err(|_| "OPENFLOWS_HOOK_URL must be an absolute HTTP(S) URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/api/v1/hooks/coder/chat"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("OPENFLOWS_HOOK_URL must target /api/v1/hooks/coder/chat without credentials, query, or fragment".into());
+    }
+    Ok(value.to_string())
+}
+
+/// URL used by Coder workspaces to reach Manager. This can be a private
+/// service address while browser, GitHub, and OAuth callbacks use PUBLIC_URL.
+pub fn runtime_manager_url(public_url: &str) -> Result<String, String> {
+    let configured = std::env::var(RUNTIME_MANAGER_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| public_url.to_string());
+    let value = configured.trim().trim_end_matches('/');
+    let url = url::Url::parse(value)
+        .map_err(|_| "OPENFLOWS_RUNTIME_MANAGER_URL must be an absolute HTTP(S) origin")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err("OPENFLOWS_RUNTIME_MANAGER_URL must be an HTTP(S) origin without credentials, path, query, or fragment".into());
+    }
+    Ok(value.to_string())
+}
+
+/// Resolve the tenant-specific hook destination used for transport and JWT audience.
+pub fn runtime_hook_url(tenant: uuid::Uuid) -> Result<String, String> {
+    runtime_hook_url_from_base(
+        &std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL").unwrap_or_default(),
+        tenant,
+    )
+}
+
+fn runtime_hook_url_from_base(base: &str, tenant: uuid::Uuid) -> Result<String, String> {
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("OPENFLOWS_RUNTIME_RELAY_BASE_URL is required for Coder hook relay".into());
+    }
+    let expanded = base.replace("{tenant}", &tenant.to_string());
+    let url = url::Url::parse(&expanded)
+        .map_err(|_| "OPENFLOWS_RUNTIME_RELAY_BASE_URL must be an absolute HTTP(S) URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("OPENFLOWS_RUNTIME_RELAY_BASE_URL must be HTTP(S) without credentials, query, or fragment".into());
+    }
+    Ok(format!("{expanded}/experimental/hooks/chat"))
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    #[test]
+    fn expands_tenant_and_normalizes_base() {
+        let tenant = uuid::Uuid::nil();
+        assert_eq!(
+            runtime_hook_url_from_base(" http://127.0.0.1:7081/tenants/{tenant}/ ", tenant)
+                .unwrap(),
+            format!("http://127.0.0.1:7081/tenants/{tenant}/experimental/hooks/chat")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_relay_urls() {
+        for base in [
+            "",
+            "relative/path",
+            "ftp://relay",
+            "http://user:secret@relay",
+            "http://relay?x=1",
+            "http://relay#fragment",
+        ] {
+            assert!(runtime_hook_url_from_base(base, uuid::Uuid::nil()).is_err());
+        }
+    }
+}
+
 /// The deployment mode of the Manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,6 +162,7 @@ pub const MODE_ENV: &str = "OPENFLOWS_MODE";
 pub const DATABASE_URL_ENV: &str = "OPENFLOWS_DATABASE_URL";
 /// The environment variable selecting the secret-provider adapter.
 pub const SECRET_PROVIDER_ENV: &str = "OPENFLOWS_SECRET_PROVIDER";
+pub const AWS_SECRETS_PREFIX_ENV: &str = "OPENFLOWS_AWS_SECRETS_PREFIX";
 /// The default secret-provider adapter name for local mode and tests.
 pub const DEFAULT_SECRET_PROVIDER: &str = "in-memory";
 
@@ -810,12 +920,16 @@ impl ManagerConfig {
                         "hosted mode requires {DATABASE_URL_ENV}; refusing to fall back to local mode"
                     )
                 })?;
-                if configured_secret_provider.is_none()
-                    || secret_provider == DEFAULT_SECRET_PROVIDER
-                {
+                if secret_provider != crate::secrets::AWS_SECRETS_MANAGER_PROVIDER {
                     return Err(format!(
-                        "hosted mode requires a durable {SECRET_PROVIDER_ENV}; in-memory is local/test only"
+                        "hosted mode requires {SECRET_PROVIDER_ENV}=aws-secrets-manager; filesystem and in-memory are local/test only"
                     ));
+                }
+                if std::env::var(AWS_SECRETS_PREFIX_ENV)
+                    .ok()
+                    .is_none_or(|prefix| prefix.trim().is_empty())
+                {
+                    return Err(format!("hosted mode requires {AWS_SECRETS_PREFIX_ENV}"));
                 }
                 // Missing hosted authentication configuration must fail closed.
                 let github_client_secret_ref = github_client_secret_ref.ok_or_else(|| {
@@ -983,8 +1097,11 @@ mod tests {
         MODE_ENV,
         DATABASE_URL_ENV,
         SECRET_PROVIDER_ENV,
+        AWS_SECRETS_PREFIX_ENV,
         GITHUB_CLIENT_ID_ENV,
         PUBLIC_URL_ENV,
+        RUNTIME_MANAGER_URL_ENV,
+        "OPENFLOWS_HOOK_URL",
         GITHUB_CLIENT_SECRET_REF_ENV,
         CRYPTO_MASTER_KEY_REF_ENV,
         GITHUB_APP_ID_ENV,
@@ -1016,11 +1133,47 @@ mod tests {
         ZEP_ORG_GRAPH_ID_ENV,
     ];
 
+    #[test]
+    fn runtime_manager_origin_can_use_private_container_route() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(RUNTIME_MANAGER_URL_ENV, "http://host.docker.internal:3002");
+        assert_eq!(
+            runtime_manager_url("https://public.example").unwrap(),
+            "http://host.docker.internal:3002"
+        );
+        std::env::set_var(
+            RUNTIME_MANAGER_URL_ENV,
+            "http://user:pass@host:3002/private",
+        );
+        assert!(runtime_manager_url("https://public.example").is_err());
+    }
+
+    #[test]
+    fn coder_hook_audience_can_use_private_container_route() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(
+            "OPENFLOWS_HOOK_URL",
+            "http://host.docker.internal:3002/api/v1/hooks/coder/chat",
+        );
+        assert_eq!(
+            coder_hook_url("https://public.example").unwrap(),
+            "http://host.docker.internal:3002/api/v1/hooks/coder/chat"
+        );
+        std::env::set_var(
+            "OPENFLOWS_HOOK_URL",
+            "http://host.docker.internal:3002/wrong",
+        );
+        assert!(coder_hook_url("https://public.example").is_err());
+    }
+
     /// Set the env required for a hosted-mode config that should validate.
     fn set_hosted_env() {
         std::env::set_var(MODE_ENV, "hosted");
         std::env::set_var(DATABASE_URL_ENV, "postgres://hosted.example/control");
-        std::env::set_var(SECRET_PROVIDER_ENV, "vault");
+        std::env::set_var(SECRET_PROVIDER_ENV, "aws-secrets-manager");
+        std::env::set_var(AWS_SECRETS_PREFIX_ENV, "openflows/staging");
         std::env::set_var(GITHUB_CLIENT_ID_ENV, "client-id");
         std::env::set_var(PUBLIC_URL_ENV, "https://openflows.example.com");
         std::env::set_var(CODER_HOOK_SECRET_REF_ENV, "ref:coder-hook-secret");
@@ -1091,7 +1244,7 @@ mod tests {
             cfg.database_url.as_deref(),
             Some("postgres://hosted.example/control")
         );
-        assert_eq!(cfg.secret_provider, "vault");
+        assert_eq!(cfg.secret_provider, "aws-secrets-manager");
         // Hosted mode requires the auth secret refs.
         assert!(cfg.github_client_secret_ref.is_some());
         assert!(cfg.crypto_master_key_ref.is_some());
@@ -1120,6 +1273,28 @@ mod tests {
 
         let err = ManagerConfig::from_env().unwrap_err();
         assert!(err.contains(SECRET_PROVIDER_ENV));
+    }
+
+    #[test]
+    fn hosted_mode_rejects_filesystem_secrets() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        set_hosted_env();
+        std::env::set_var(SECRET_PROVIDER_ENV, "filesystem");
+
+        let err = ManagerConfig::from_env().unwrap_err();
+        assert!(err.contains("aws-secrets-manager"));
+    }
+
+    #[test]
+    fn hosted_mode_requires_aws_namespace() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        set_hosted_env();
+        std::env::remove_var(AWS_SECRETS_PREFIX_ENV);
+
+        let err = ManagerConfig::from_env().unwrap_err();
+        assert!(err.contains(AWS_SECRETS_PREFIX_ENV));
     }
 
     #[test]
