@@ -1,7 +1,7 @@
 //! Platform-operator actions for the deployment-configured template release.
 
 use crate::error::ManagerError;
-use crate::id::{OrganizationId, ReleaseId};
+use crate::id::OrganizationId;
 use crate::operations::{self, NewOperation};
 use crate::provisioning::OrgProvisionWorker;
 use crate::releases::ReleaseApprovalService;
@@ -154,18 +154,17 @@ async fn promote_once(
         std::process::id(),
         uuid::Uuid::new_v4()
     );
-    let Some(guard) = operations::claim_kind(pool, &owner, Some("template.promote")).await? else {
+    // Claim only promotions for the release this replica supports, so an older
+    // replica during a rolling deployment never fails a newer release's work or
+    // livelocks the queue by repeatedly reclaiming an unsupported promotion
+    // (requeue leaves created_at unchanged, and claim_kind selects the oldest).
+    let Some(release_id) = worker.release_id else {
         return Ok(());
     };
-    let record = operations::get_scoped(pool, guard.organization_id, guard.operation_id)
-        .await?
-        .ok_or_else(|| ManagerError::not_found("operation"))?;
-    let release_id = record.resource_id.map(ReleaseId::from_uuid);
-    if release_id != worker.release_id || worker.artifacts.is_none() {
-        // This replica cannot publish the requested release (for example it is an
-        // older binary during a rolling deployment). Do not fail the promotion:
-        // return it to the queue so a replica that supports the release can claim
-        // and publish it.
+    let Some(guard) = operations::claim_promote(pool, &owner, release_id.0).await? else {
+        return Ok(());
+    };
+    if worker.artifacts.is_none() {
         guard.requeue("waiting_for_release").await?;
         return Ok(());
     }
@@ -190,7 +189,7 @@ async fn promote_once(
     };
     let publish = approvals.releases.promote_to_org(
         guard.organization_id,
-        release_id.expect("checked above"),
+        release_id,
         worker.adapter.as_ref(),
         worker.artifacts.as_ref().expect("checked above"),
     );

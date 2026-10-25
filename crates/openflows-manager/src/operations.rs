@@ -189,6 +189,61 @@ pub async fn claim_kind(
     }))
 }
 
+/// Claim the oldest available `template.promote` operation for a specific
+/// release.
+///
+/// During a rolling deployment an older replica must never claim a promotion
+/// it cannot publish: doing so would either fail it or (if it simply requeued
+/// it) livelock the queue, since `claim_kind` always selects the oldest
+/// operation and requeue leaves `created_at` unchanged. Filtering the claim by
+/// `resource_id` (the release) lets a replica reach the promotions it can
+/// publish while leaving unsupported releases queued for a replica that
+/// supports them.
+pub async fn claim_promote(
+    pool: &PgPool,
+    owner: &str,
+    release_id: uuid::Uuid,
+) -> Result<Option<LeaseGuard>, ManagerError> {
+    let token = uuid::Uuid::new_v4();
+    let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
+        "UPDATE operations
+            SET lease_owner = $1,
+                lease_expires_at = clock_timestamp() + interval '30 seconds',
+                lease_token = $2,
+                attempt_count = attempt_count + 1,
+                state = 'running',
+                updated_at = now()
+          WHERE id = (
+                SELECT id
+                  FROM operations
+                 WHERE kind = 'template.promote'
+                   AND resource_id = $3
+                   AND (state IN ('queued', 'running')
+                        OR (state = 'retryable_failed' AND retry_at IS NOT NULL))
+                   AND (lease_expires_at IS NULL OR lease_expires_at < now())
+                   AND (retry_at IS NULL OR retry_at <= now())
+                 ORDER BY created_at
+                 LIMIT 1
+                 FOR UPDATE SKIP LOCKED
+          )
+          RETURNING id, organization_id",
+    )
+    .bind(owner)
+    .bind(token)
+    .bind(release_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(ManagerError::from)?;
+
+    Ok(row.map(|(id, org)| LeaseGuard {
+        operation_id: OperationId::from_uuid(id),
+        organization_id: OrganizationId::from_uuid(org),
+        owner: owner.to_string(),
+        token,
+        pool: pool.clone(),
+    }))
+}
+
 /// Claim one operation from a set of kinds while reserving the organization's
 /// provisioning slot in the same database transaction. The advisory lock is
 /// scoped to the organization, so separate Manager instances cannot both pass
