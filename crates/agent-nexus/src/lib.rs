@@ -1450,6 +1450,23 @@ Before significant work, read the relevant skill file to understand the workflow
         }
 
         if let Some(runtime) = &self.runtime_control {
+            // The managed Chat path must provision the required workspace
+            // instructions (AGENTS.md, role persona, skills, command documents)
+            // before starting the Chat, matching the non-managed path. This is a
+            // no-op when the instructions were already provisioned.
+            if let Some(client) = Self::coder_client_from_store(store).await {
+                let slots: HashMap<String, WorkerSlot> =
+                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                if let Some(ws) = slots.get(worker_id).and_then(|s| s.workspace_id.clone()) {
+                    if let Err(error) = self
+                        .ensure_workspace_instructions(store, &client, &ws, worker_id)
+                        .await
+                    {
+                        warn!(worker_id, ticket_id, error = %error, "Managed workspace instructions unavailable; deferring chat");
+                        return;
+                    }
+                }
+            }
             if let Err(error) = self
                 .create_managed_chat_for_assignment(store, runtime, worker_id, ticket)
                 .await
@@ -1962,10 +1979,25 @@ Use `openflows-harness` for all coordination:
             anyhow::bail!("Manager returned a Chat for a different workspace");
         }
         store.set(&chat_key, json!(chat.chat_id)).await;
+        // Preserve same-Chat recovery: do not unconditionally mark a returned
+        // Chat as `started`. A Chat in `error`/`requires_action` (which the
+        // Manager resumes on retry) must remain eligible for the existing
+        // resume flow instead of being treated as freshly started.
+        let mut action = "started";
+        if let Some(client) = Self::coder_client_from_store(store).await {
+            if let Ok(Some(live)) = client.get_chat_opt(&chat.chat_id).await {
+                if matches!(
+                    live.status(),
+                    ChatStatus::Error | ChatStatus::RequiresAction | ChatStatus::Waiting
+                ) {
+                    action = "resume_needed";
+                }
+            }
+        }
         store
             .set(
                 &full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, role),
-                json!("started"),
+                json!(action),
             )
             .await;
         store

@@ -348,6 +348,24 @@ pub async fn create_chat(
                         "stored Coder Chat does not match the tenant workspace",
                     ));
                 }
+                // Preserve same-Chat recovery: a Chat that failed or is waiting
+                // on a temporary model/tool error must not be returned unchanged
+                // on every retry, or the ticket stays stuck forever. Nudge it
+                // with the same harness-aware resume prompt Nexus uses.
+                if matches!(
+                    chat.status(),
+                    coder_client::types::ChatStatus::Error
+                        | coder_client::types::ChatStatus::RequiresAction
+                ) {
+                    let _ = client
+                        .send_chat_message(
+                            &chat_id,
+                            vec![coder_client::types::ChatInputPart::text(
+                                "Resume work on this ticket. Check your phase with `openflows-harness status get` and dispatch with `openflows-harness dispatch read`. Continue from there.",
+                            )],
+                        )
+                        .await;
+                }
                 tx.commit().await?;
                 return Ok(Json(
                     serde_json::json!({"chat_id":chat_id,"workspace_id":body.workspace_id}),

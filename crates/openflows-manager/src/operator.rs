@@ -888,10 +888,12 @@ async fn aws_upsert(
     name: &str,
     value: &[u8],
 ) -> Result<()> {
-    if aws_read_optional(provider, name).await?.is_some() {
-        provider.replace(name, value).await?;
-    } else {
-        provider.put(name, value).await?;
+    match aws_read_optional(provider, name).await? {
+        Some(existing) if existing != value => provider.replace(name, value).await?,
+        Some(_) => {}
+        None => {
+            provider.put(name, value).await?;
+        }
     }
     Ok(())
 }
@@ -1454,6 +1456,7 @@ pub async fn doctor() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::SecretProvider;
     #[test]
     fn setup_preserves_master_key_and_rejects_invalid_existing_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -1484,5 +1487,66 @@ mod tests {
         let app = json!({"id":uuid::Uuid::new_v4(),"redirect_uris":["https://flows.test/auth/coder/callback"]});
         assert!(verify_app(&app, "https://flows.test/auth/coder/callback").is_ok());
         assert!(verify_app(&app, "https://other.test/auth/coder/callback").is_err());
+    }
+
+    struct CountingProvider {
+        replaces: std::sync::atomic::AtomicUsize,
+        value: std::sync::RwLock<Option<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::secrets::SecretProvider for CountingProvider {
+        async fn put(
+            &self,
+            name: &str,
+            value: &[u8],
+        ) -> Result<crate::secrets::SecretRef, crate::secrets::SecretError> {
+            *self.value.write().unwrap() = Some(value.to_vec());
+            Ok(name.to_owned())
+        }
+        async fn replace(
+            &self,
+            _ref_name: &str,
+            value: &[u8],
+        ) -> Result<(), crate::secrets::SecretError> {
+            self.replaces
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.value.write().unwrap() = Some(value.to_vec());
+            Ok(())
+        }
+        async fn get(&self, ref_name: &str) -> Result<Vec<u8>, crate::secrets::SecretError> {
+            self.value
+                .read()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| crate::secrets::SecretError::NotFound(ref_name.into()))
+        }
+        async fn delete(&self, _ref_name: &str) -> Result<(), crate::secrets::SecretError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn aws_upsert_skips_unchanged_secret() {
+        let provider = CountingProvider {
+            replaces: Default::default(),
+            value: Default::default(),
+        };
+        aws_upsert(&provider, "k", b"value").await.unwrap();
+        // An identical value must not trigger a replacement (avoids needless
+        // secret-version writes from the recurring renewal loop).
+        aws_upsert(&provider, "k", b"value").await.unwrap();
+        assert_eq!(
+            provider.replaces.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "unchanged bytes must not call replace"
+        );
+        aws_upsert(&provider, "k", b"new").await.unwrap();
+        assert_eq!(
+            provider.replaces.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "changed bytes must call replace"
+        );
+        assert_eq!(provider.get("k").await.unwrap(), b"new");
     }
 }

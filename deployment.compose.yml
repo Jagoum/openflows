@@ -63,6 +63,9 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - tf_plugin_cache:/root/.terraform.d/plugin-cache
+    # Reach the host Manager for lifecycle hooks (host.docker.internal is a
+    # built-in alias on macOS/Windows; Linux Docker requires host-gateway).
+    extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
       coder-db:
         condition: service_healthy

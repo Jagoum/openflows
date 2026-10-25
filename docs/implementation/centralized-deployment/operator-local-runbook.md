@@ -47,6 +47,18 @@ Nexus container on port 3001. Port 7081 is bound to loopback, not the public
 tunnel. The Manager runs on the host in this runbook; a containerized Manager
 would use `http://runtime-relay:8080/tenants/{tenant}` instead.
 
+Because Coder and tenant workspaces reach the host Manager over the Docker
+network, the Manager must bind to a container-reachable address, not only
+loopback. Set `OPENFLOWS_MANAGER_ADDR` to the host's private LAN/Docker-bridge
+address (or `0.0.0.0:3002` behind a host firewall), not `127.0.0.1:3002`, so
+`host.docker.internal:3002` resolves from inside containers. On Linux Docker
+(which has no built-in `host.docker.internal` alias), add the matching
+`extra_hosts: ["host.docker.internal:host-gateway"]` mapping to every service
+and workspace container that must reach the Manager — the Coder service in
+`deployment.compose.yml` includes it, and workspace templates must add the
+same mapping to the `docker_container` resources. Without this mapping, runtime
+registration and hook delivery fail on Linux.
+
 Use `OPENFLOWS_CODER_BOOTSTRAP_EMAIL` only for a **new, empty Coder**. For an
 existing Coder, clear it and supply an administrator credential through
 `OPENFLOWS_CODER_BOOTSTRAP_TOKEN_FILE` for setup.

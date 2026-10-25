@@ -162,7 +162,11 @@ async fn promote_once(
         .ok_or_else(|| ManagerError::not_found("operation"))?;
     let release_id = record.resource_id.map(ReleaseId::from_uuid);
     if release_id != worker.release_id || worker.artifacts.is_none() {
-        guard.fail(false, Some("RELEASE_NOT_CONFIGURED")).await?;
+        // This replica cannot publish the requested release (for example it is an
+        // older binary during a rolling deployment). Do not fail the promotion:
+        // return it to the queue so a replica that supports the release can claim
+        // and publish it.
+        guard.requeue("waiting_for_release").await?;
         return Ok(());
     }
     if !guard.set_step("publish_templates").await? {
@@ -307,6 +311,11 @@ fn publication_error(error: ManagerError) -> ManagerError {
             )
             .retryable(true)
         }
+        ManagerError::Api(api)
+            if matches!(api.code.as_str(), "IMPORT_RETRYABLE" | "IMPORT_TIMEOUT") =>
+        {
+            ManagerError::api(&api.code, &api.message).retryable(true)
+        }
         other => other,
     }
 }
@@ -337,5 +346,20 @@ mod tests {
         let (status, body) = crate::error::to_http_response(&error);
         assert_eq!(status, 503);
         assert_eq!(body["error"]["code"], "TEMPLATE_PROMOTION_DB_FAILED");
+    }
+
+    #[test]
+    fn import_failures_remain_retryable() {
+        for code in ["IMPORT_RETRYABLE", "IMPORT_TIMEOUT"] {
+            let error = publication_error(ManagerError::api(code, "template import stalled"));
+            let ManagerError::Api(api) = error else {
+                panic!("{code} must surface as an Api error");
+            };
+            assert_eq!(api.code, code);
+            assert!(
+                api.retryable,
+                "{code} must be retryable so the adapter can attempt replacement imports"
+            );
+        }
     }
 }
