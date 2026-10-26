@@ -47,6 +47,7 @@ struct State {
     /// workspace id -> simulated workspace
     workspaces: HashMap<String, MockWorkspace>,
     next_workspace_id: u64,
+    workspace_restarts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +131,10 @@ impl Default for MockCoderAdapter {
 }
 
 impl MockCoderAdapter {
+    pub fn workspace_restart_count(&self) -> usize {
+        self.state.lock().unwrap().workspace_restarts
+    }
+
     pub fn organization_display_name(&self, org: &CoderOrganizationId) -> Option<String> {
         self.state
             .lock()
@@ -517,6 +522,7 @@ impl CoderAdapter for MockCoderAdapter {
         org: &CoderOrganizationId,
         workspace_id: &str,
     ) -> Result<(), ManagerError> {
+        self.state.lock().unwrap().workspace_restarts += 1;
         // The mock has no separate build history; a restart leaves the
         // workspace in its configured ready state.
         self.start_workspace(org, workspace_id).await

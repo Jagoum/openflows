@@ -43,7 +43,9 @@ steps below remain a reference for externally managed OAuth registrations.
    you have verified GitHub login and administrative access.
 5. In Coder Deployment Settings → OAuth2 Applications, register **OpenFlows**:
    - Callback: `<OPENFLOWS_PUBLIC_URL>/auth/coder/callback`.
-   - Allowed scope: `user:read_personal`.
+   - Allowed scope: `coder:all`. Coder does not currently expose a narrower
+     OAuth grant that can append messages to a tenant creator's Chat; the grant
+     remains bounded by that user's Coder permissions and stays inside Manager.
    - Generate a confidential client secret.
 6. Store that secret in a mode-0600 file under the configured filesystem secret
    directory. Do not paste it in chat or commit it. Set in `.env.prod`:

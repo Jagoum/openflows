@@ -175,49 +175,66 @@ impl RuntimeCredentialService {
             )
             .await?
             .ok_or_else(|| ManagerError::api("AUTH_FAILED", "runtime bootstrap is invalid"))?;
-        match self
+        if let Err(error) = self
             .secret_provider
             .delete(&consumed.bootstrap_secret_ref)
             .await
         {
-            Ok(()) | Err(crate::secrets::SecretError::NotFound(_)) => {}
-            Err(error) => {
-                return Err(ManagerError::Config(format!(
-                    "cannot retire consumed runtime bootstrap: {error}"
-                )))
+            if !matches!(&error, crate::secrets::SecretError::NotFound(_)) {
+                tracing::warn!(
+                    workspace_id = %consumed.workspace_id,
+                    %error,
+                    "Could not retire consumed runtime bootstrap secret"
+                );
             }
         }
         if let Some(runtime_secret_ref) = consumed.runtime_secret_ref.as_deref() {
-            let mut bytes = zeroize::Zeroizing::new(
-                self.secret_provider
-                    .get(runtime_secret_ref)
-                    .await
-                    .map_err(|error| {
-                        ManagerError::Config(format!(
-                            "cannot load registered workspace secret bundle: {error}"
-                        ))
-                    })?,
-            );
-            let mut payload: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|error| ManagerError::Service(error.into()))?;
-            if let Some(object) = payload.as_object_mut() {
-                object.insert(
-                    "bootstrap_token".into(),
-                    serde_json::Value::String(String::new()),
-                );
+            match self.secret_provider.get(runtime_secret_ref).await {
+                Ok(raw) => {
+                    let mut bytes = zeroize::Zeroizing::new(raw);
+                    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        Ok(mut payload) => {
+                            if let Some(object) = payload.as_object_mut() {
+                                object.insert(
+                                    "bootstrap_token".into(),
+                                    serde_json::Value::String(String::new()),
+                                );
+                            }
+                            match serde_json::to_vec(&payload) {
+                                Ok(updated) => {
+                                    bytes = zeroize::Zeroizing::new(updated);
+                                    if let Err(error) = self
+                                        .secret_provider
+                                        .replace(runtime_secret_ref, &bytes)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            workspace_id = %consumed.workspace_id,
+                                            %error,
+                                            "Could not remove consumed bootstrap from workspace secret bundle"
+                                        );
+                                    }
+                                }
+                                Err(error) => tracing::warn!(
+                                    workspace_id = %consumed.workspace_id,
+                                    %error,
+                                    "Could not encode workspace secret bundle cleanup"
+                                ),
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            workspace_id = %consumed.workspace_id,
+                            %error,
+                            "Could not decode workspace secret bundle cleanup"
+                        ),
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    workspace_id = %consumed.workspace_id,
+                    %error,
+                    "Could not load workspace secret bundle for bootstrap cleanup"
+                ),
             }
-            bytes = zeroize::Zeroizing::new(
-                serde_json::to_vec(&payload)
-                    .map_err(|error| ManagerError::Service(error.into()))?,
-            );
-            self.secret_provider
-                .replace(runtime_secret_ref, &bytes)
-                .await
-                .map_err(|error| {
-                    ManagerError::Config(format!(
-                        "cannot retire bootstrap from workspace secret bundle: {error}"
-                    ))
-                })?;
         }
         Ok(RuntimeSessionIssue {
             workspace_id: consumed.workspace_id,

@@ -90,7 +90,7 @@ async fn api(
         (Method::GET, "/.well-known/oauth-authorization-server") => (
             StatusCode::OK,
             Json(
-                json!({"scopes_supported":["user:read_personal","workspace:read","chat:create","chat:read","chat:update"]}),
+                json!({"scopes_supported":["coder:all","user:read_personal","workspace:read","chat:create","chat:read","chat:update"]}),
             ),
         ),
         (Method::GET, "/api/v2/oauth2-provider/apps") => (
@@ -123,7 +123,10 @@ async fn api(
                 app["redirect_uris"][0],
                 "https://flows.test/auth/coder/callback"
             );
-            assert!(app["scope"].as_str().unwrap().contains("workspace:read"));
+            let scopes: std::collections::HashSet<_> =
+                app["scope"].as_str().unwrap().split_whitespace().collect();
+            assert!(scopes.contains("coder:all"));
+            assert!(scopes.contains("user:read_personal"));
             app["id"] = json!("00000000-0000-0000-0000-000000000002");
             state.app_updates += 1;
             state.app = Some(app.clone());

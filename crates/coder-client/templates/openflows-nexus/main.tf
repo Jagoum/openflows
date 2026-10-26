@@ -218,15 +218,25 @@ resource "coder_agent" "main" {
     # secret-injection backend's mounted file instead, so no platform or
     # deployment-wide credential reaches the workspace.
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      test -r "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" || { echo "FATAL: runtime secret is not mounted" >&2; exit 1; }
-      eval "$(python3 - "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" <<'PY'
+      RUNTIME_CREDENTIAL_COPY=$(mktemp)
+      chmod 600 "$RUNTIME_CREDENTIAL_COPY"
+      if ! sudo cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY"; then
+        rm -f "$RUNTIME_CREDENTIAL_COPY"
+        echo "FATAL: runtime secret is not mounted" >&2
+        exit 1
+      fi
+      eval "$(python3 - "$RUNTIME_CREDENTIAL_COPY" <<'PY'
 import json, shlex, sys
 d=json.load(open(sys.argv[1]))
 for env,key in [('OF_MANAGER_URL','manager_url'),('OF_BOOTSTRAP','bootstrap_token'),('REDIS_URL','redis_url'),('OPENFLOWS_TENANT','redis_namespace'),('CODER_CHAT_HOOK_SECRET','hook_key'),('CODER_CHAT_HOOK_URL','hook_url')]:
     print('export %s=%s' % (env, shlex.quote(str(d[key]))))
 PY
 )"
-      SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register")
+      rm -f "$RUNTIME_CREDENTIAL_COPY"
+      SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register") || {
+        echo "FATAL: Manager runtime registration failed. Stop and then start this tenant through OpenFlows to inject a fresh bootstrap; restarting directly in Coder reuses a single-use credential." >&2
+        exit 1
+      }
       eval "$(python3 - "$SESSION" <<'PY'
 import json, shlex, sys
 d=json.loads(sys.argv[1])
@@ -238,13 +248,13 @@ PY
       # control-plane calls. It is intentionally distinct from Coder user
       # credentials, which are never exported into the workspace.
       export OPENFLOWS_MANAGER_URL="$OF_MANAGER_URL"
-      GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
+      GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials") || {
+        echo "FATAL: Manager GitHub credential exchange failed after runtime registration." >&2
+        exit 1
+      }
       GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
-      # Readiness is reported only after the controller has obtained the
-      # credentials it needs to start. Registration is sufficient for the
-      # first broker exchange during provisioning; this heartbeat is the
-      # authoritative signal used to complete tenant provisioning.
-      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
+      # The controller reports readiness after opening its tenant store.
+      # A successful bootstrap alone does not mean the controller is running.
     else
       GIT_TOKEN="${data.coder_parameter.hosted.value == "true" ? "" : data.coder_external_auth.github[0].access_token}"
     fi
@@ -357,6 +367,7 @@ resource "docker_volume" "artifacts" {
 }
 
 resource "docker_container" "workspace" {
+  count = data.coder_workspace.me.start_count
   name  = "openflows-nexus-${data.coder_workspace.me.id}"
   image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.

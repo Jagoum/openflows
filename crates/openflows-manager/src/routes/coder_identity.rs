@@ -224,16 +224,18 @@ pub async fn callback(
     let verifier: Option<String> = sqlx::query_scalar(
         "DELETE FROM coder_link_attempts WHERE state_hash=$1 AND user_id=$2 AND browser_hash=$3 AND expires_at>now() RETURNING verifier")
         .bind(hash(&query.state)).bind(principal.user_id.0).bind(hash(browser)).fetch_optional(services.db.pool()).await?;
-    let verifier = Zeroizing::new(verifier.ok_or_else(failure)?);
+    let verifier = Zeroizing::new(verifier.ok_or_else(|| {
+        tracing::warn!(stage = "state", "Coder account link callback rejected");
+        failure()
+    })?);
     let code = query.code.ok_or_else(failure)?;
     let (base, client_id, secret_ref) = configured()?;
-    let secret = Zeroizing::new(
-        services
-            .secret_provider
-            .get(&secret_ref)
-            .await
-            .map_err(|_| failure())?,
-    );
+    let secret = Zeroizing::new(services.secret_provider.get(&secret_ref).await.map_err(
+        |error| {
+            tracing::warn!(stage = "client_secret", %error, "Coder account link callback failed");
+            failure()
+        },
+    )?);
     let secret = std::str::from_utf8(&secret).map_err(|_| failure())?;
     let callback = format!(
         "{}/auth/coder/callback",
@@ -251,8 +253,12 @@ pub async fn callback(
         ])
         .send()
         .await
-        .map_err(|_| failure())?;
+        .map_err(|error| {
+            tracing::warn!(stage = "token_exchange", %error, "Coder account link callback failed");
+            failure()
+        })?;
     if !response.status().is_success() {
+        tracing::warn!(stage = "token_exchange", status = %response.status(), "Coder account link callback failed");
         return Err(failure());
     }
     #[derive(Deserialize)]
@@ -261,9 +267,16 @@ pub async fn callback(
         #[serde(default)]
         refresh_token: String,
     }
-    let token: Token = response.json().await.map_err(|_| failure())?;
+    let token: Token = response.json().await.map_err(|error| {
+        tracing::warn!(stage = "token_decode", %error, "Coder account link callback failed");
+        failure()
+    })?;
     let refresh_token = Zeroizing::new(token.refresh_token);
     if refresh_token.is_empty() {
+        tracing::warn!(
+            stage = "missing_refresh_token",
+            "Coder account link callback failed"
+        );
         return Err(ManagerError::api(
             "CODER_LINK_FAILED",
             "Coder did not issue a renewable authorization; reconnect the Coder account after the OAuth application is configured for refresh tokens",
@@ -275,12 +288,37 @@ pub async fn callback(
         .bearer_auth(token.as_str())
         .send()
         .await
-        .map_err(|_| failure())?;
+        .map_err(|error| {
+            tracing::warn!(stage = "identity_lookup", %error, "Coder account link callback failed");
+            failure()
+        })?;
     if !response.status().is_success() {
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        tracing::warn!(
+            stage = "identity_lookup",
+            %status,
+            message = body["message"].as_str().unwrap_or("missing"),
+            detail = body["detail"].as_str().unwrap_or("missing"),
+            "Coder account link callback failed"
+        );
         return Err(failure());
     }
-    let user: Value = response.json().await.map_err(|_| failure())?;
-    let id = verified_user_id(&user)?;
+    let user: Value = response.json().await.map_err(|error| {
+        tracing::warn!(stage = "identity_decode", %error, "Coder account link callback failed");
+        failure()
+    })?;
+    let id = verified_user_id(&user).map_err(|_| {
+        tracing::warn!(
+            stage = "identity_verify",
+            has_id = user["id"].as_str().is_some(),
+            login_type = user["login_type"].as_str().unwrap_or("missing"),
+            status = user["status"].as_str().unwrap_or("missing"),
+            service_account = user["is_service_account"].as_bool(),
+            "Coder account link callback failed"
+        );
+        failure()
+    })?;
     // Retain only the renewable credential, behind the configured secret
     // provider. The short-lived access token is never persisted or returned.
     let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
@@ -291,26 +329,63 @@ pub async fn callback(
     .fetch_optional(services.db.pool())
     .await?;
     if let Some((existing_url, existing_id, _)) = &existing {
-        if existing_url != &base || existing_id != &id {
+        if existing_url != &base || existing_id != id {
             return Err(ManagerError::Conflict(
                 "Coder account already linked; ownership changes require an explicit migration"
                     .into(),
             ));
         }
     }
-    let refresh_ref = match existing
+    let claimed_by_another_user: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM coder_user_links
+             WHERE coder_url=$1 AND coder_user_id=$2 AND user_id<>$3
+        )",
+    )
+    .bind(&base)
+    .bind(id)
+    .bind(principal.user_id.0)
+    .fetch_one(services.db.pool())
+    .await?;
+    if claimed_by_another_user {
+        return Err(ManagerError::Conflict(
+            "This Coder account is already linked to another OpenFlows user".into(),
+        ));
+    }
+    let (refresh_ref, created_refresh_secret) = match existing
         .as_ref()
         .and_then(|(_, _, reference)| reference.clone())
     {
-        Some(reference) => reference,
-        None => services
-            .secret_provider
-            .put(
-                &format!("coder-user-refresh-{}", principal.user_id.0),
-                refresh_token.as_bytes(),
-            )
-            .await
-            .map_err(|_| failure())?,
+        Some(reference) => (reference, false),
+        None => {
+            let name = format!("coder-user-refresh-{}", principal.user_id.0);
+            let reference = match services
+                .secret_provider
+                .put(&name, refresh_token.as_bytes())
+                .await
+            {
+                Ok(reference) => reference,
+                Err(crate::secrets::SecretError::AlreadyExists(_)) => {
+                    // Recover an orphan left by an older failed callback before
+                    // the database link was committed.
+                    let reference = services
+                        .secret_provider
+                        .canonical_reference(&name)
+                        .map_err(|_| failure())?;
+                    services
+                        .secret_provider
+                        .replace(&reference, refresh_token.as_bytes())
+                        .await
+                        .map_err(|_| failure())?;
+                    reference
+                }
+                Err(error) => {
+                    tracing::warn!(stage = "refresh_secret_create", %error, "Coder account link callback failed");
+                    return Err(failure());
+                }
+            };
+            (reference, true)
+        }
     };
     if let Some((_, _, Some(reference))) = existing.as_ref() {
         services
@@ -319,15 +394,9 @@ pub async fn callback(
             .await
             .map_err(|_| failure())?;
     }
-    if let Some((_, _, None)) = existing.as_ref() {
-        // Legacy links created before refresh-token storage are repaired by
-        // the same callback instead of failing on a nullable column.
-        services
-            .secret_provider
-            .put(&refresh_ref, refresh_token.as_bytes())
-            .await
-            .map_err(|_| failure())?;
-    }
+    // For a legacy link without a reference, the put above already created
+    // the secret. Creating it again would fail with AlreadyExists and leave
+    // the database link unrepairable after a successful OAuth exchange.
     let mut tx = services.db.pool().begin().await?;
     let inserted = sqlx::query("INSERT INTO coder_user_links(user_id,coder_url,coder_user_id,coder_refresh_secret_ref) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
         .bind(principal.user_id.0).bind(&base).bind(id).bind(&refresh_ref).execute(&mut *tx).await?;
@@ -339,6 +408,10 @@ pub async fn callback(
             // already claimed by a *different* OpenFlows user. The earlier
             // check only inspects the current user's link, so it cannot see
             // this conflict; surface it instead of panicking.
+            drop(tx);
+            if created_refresh_secret {
+                let _ = services.secret_provider.delete(&refresh_ref).await;
+            }
             return Err(ManagerError::Conflict(
                 "This Coder account is already linked to another OpenFlows user".into(),
             ));

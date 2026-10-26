@@ -129,6 +129,64 @@ pub(crate) fn bundled_files() -> Vec<BundledFile> {
             relative_path: "plugin/mcp/mcp.json.template",
             content: include_str!("../../orchestration/plugin/mcp/mcp.json.template"),
         },
+        // Slash commands used by hosted worker Chats. These must be embedded
+        // because packaged deployments do not have the source checkout.
+        BundledFile {
+            relative_path: "plugin/commands/address_review.md",
+            content: include_str!("../../orchestration/plugin/commands/address_review.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/assign.md",
+            content: include_str!("../../orchestration/plugin/commands/assign.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/check-ci.md",
+            content: include_str!("../../orchestration/plugin/commands/check-ci.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/ci_fix.md",
+            content: include_str!("../../orchestration/plugin/commands/ci_fix.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/document-pr.md",
+            content: include_str!("../../orchestration/plugin/commands/document-pr.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/gate-approve.md",
+            content: include_str!("../../orchestration/plugin/commands/gate-approve.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/handoff.md",
+            content: include_str!("../../orchestration/plugin/commands/handoff.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/merge.md",
+            content: include_str!("../../orchestration/plugin/commands/merge.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/plan.md",
+            content: include_str!("../../orchestration/plugin/commands/plan.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/review.md",
+            content: include_str!("../../orchestration/plugin/commands/review.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/segment-done.md",
+            content: include_str!("../../orchestration/plugin/commands/segment-done.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/status-check.md",
+            content: include_str!("../../orchestration/plugin/commands/status-check.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/status.md",
+            content: include_str!("../../orchestration/plugin/commands/status.md"),
+        },
+        BundledFile {
+            relative_path: "plugin/commands/update-changelog.md",
+            content: include_str!("../../orchestration/plugin/commands/update-changelog.md"),
+        },
         // Skills — shared
         BundledFile {
             relative_path: "plugin/skills/shared-harness-protocol/SKILL.md",

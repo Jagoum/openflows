@@ -153,6 +153,10 @@ fn api_v1_router() -> Router<AppState> {
         .route("/runtime/workspaces", post(runtime::request_worker))
         .route("/runtime/chats", post(runtime::create_chat))
         .route(
+            "/runtime/chats/{chat}/messages",
+            post(runtime::send_chat_message),
+        )
+        .route(
             "/runtime/workspaces/{workspace}",
             get(runtime::get_workspace).delete(runtime::delete_workspace),
         )

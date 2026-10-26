@@ -48,12 +48,23 @@ pub struct WorkerStatus {
     pub slot: Option<i32>,
     pub desired_state: String,
     pub observed_state: String,
+    #[serde(default)]
+    pub last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RuntimeChatResponse {
     pub chat_id: String,
     pub workspace_id: String,
+    // Older Manager versions did not return this field and had just delivered
+    // the initial prompt. Defaulting to true avoids duplicating that prompt
+    // during a rolling deployment; current Managers always return it.
+    #[serde(default = "default_chat_created")]
+    pub created: bool,
+}
+
+fn default_chat_created() -> bool {
+    true
 }
 
 #[derive(Serialize)]
@@ -70,6 +81,18 @@ struct WorkerRequest<'a> {
 }
 
 impl RuntimeControlClient {
+    #[cfg(test)]
+    pub(crate) fn for_test(base_url: String) -> Self {
+        Self {
+            base_url,
+            http: reqwest::Client::new(),
+            tokens: Arc::new(Mutex::new(RuntimeTokens {
+                access: "test-access".into(),
+                refresh: "test-refresh".into(),
+            })),
+        }
+    }
+
     /// Build a client from the runtime registration result exported by the
     /// Nexus template.  These values exist only in the workspace process.
     pub fn from_env() -> Result<Option<Self>> {
@@ -262,6 +285,24 @@ impl RuntimeControlClient {
         }
     }
 
+    /// Ask Manager to delete a hosted worker workspace. The identifier is the
+    /// OpenFlows workspace id returned by `request_worker`, not a Coder id.
+    pub async fn delete_worker(&self, workspace_id: &str, idempotency_key: &str) -> Result<()> {
+        let response = self
+            .send_retrying_refresh(
+                reqwest::Method::DELETE,
+                &format!("/api/v1/runtime/workspaces/{workspace_id}"),
+                None,
+                Some(idempotency_key),
+            )
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            bail!("worker delete request failed with {}", response.status())
+        }
+    }
+
     pub async fn create_chat(
         &self,
         workspace_id: &str,
@@ -287,6 +328,39 @@ impl RuntimeControlClient {
             .json()
             .await
             .context("invalid runtime chat response")
+    }
+
+    /// Deliver a durable, idempotent follow-up to a Manager-owned Coder Chat.
+    /// The message key is scoped to the chat, so controller retries cannot
+    /// enqueue the same lifecycle transition or review round twice.
+    pub async fn send_chat_message(
+        &self,
+        chat_id: &str,
+        message_key: &str,
+        prompt: &str,
+    ) -> Result<()> {
+        let response = self
+            .send_retrying_refresh(
+                reqwest::Method::POST,
+                &format!("/api/v1/runtime/chats/{chat_id}/messages"),
+                Some(serde_json::json!({
+                    "message_key": message_key,
+                    "prompt": prompt,
+                })),
+                None,
+            )
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            let code = body
+                .pointer("/error/code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("CODER_CHAT_UNAVAILABLE");
+            bail!("managed chat message failed with {status} ({code})")
+        }
     }
 }
 
@@ -326,6 +400,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_chat_follow_up_carries_durable_message_key() {
+        let mut server = Server::new_async().await;
+        let request = server
+            .mock("POST", "/api/v1/runtime/chats/chat-id/messages")
+            .match_header("authorization", "Bearer runtime-access")
+            .match_body(Matcher::Json(serde_json::json!({
+                "message_key":"sentinel:planning:1:1", "prompt":"Review revision one"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"queued":true,"duplicate":false}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let runtime = RuntimeControlClient {
+            base_url: server.url(),
+            http: reqwest::Client::new(),
+            tokens: Arc::new(Mutex::new(RuntimeTokens {
+                access: "runtime-access".into(),
+                refresh: "runtime-refresh".into(),
+            })),
+        };
+
+        runtime
+            .send_chat_message("chat-id", "sentinel:planning:1:1", "Review revision one")
+            .await
+            .unwrap();
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn broker_api_token_uses_runtime_auth_and_api_purpose() {
         let mut server = Server::new_async().await;
         let exchange = server
@@ -351,6 +456,32 @@ mod tests {
             "installation-token"
         );
         exchange.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn managed_worker_delete_uses_runtime_route_and_idempotency_key() {
+        let mut server = Server::new_async().await;
+        let request = server
+            .mock("DELETE", "/api/v1/runtime/workspaces/worker-id")
+            .match_header("authorization", "Bearer runtime-access")
+            .match_header("idempotency-key", "runtime-delete:worker-id")
+            .with_status(202)
+            .create_async()
+            .await;
+        let runtime = RuntimeControlClient {
+            base_url: server.url(),
+            http: reqwest::Client::new(),
+            tokens: Arc::new(Mutex::new(RuntimeTokens {
+                access: "runtime-access".into(),
+                refresh: "runtime-refresh".into(),
+            })),
+        };
+
+        runtime
+            .delete_worker("worker-id", "runtime-delete:worker-id")
+            .await
+            .unwrap();
+        request.assert_async().await;
     }
 
     #[tokio::test]

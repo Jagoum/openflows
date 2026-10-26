@@ -165,13 +165,10 @@ impl RuntimeRepository {
         .bind(expires_at)
         .execute(&mut *tx)
         .await?;
-        // The workspace row points at the stable mounted bundle, not the
-        // short-lived bootstrap object. Provisioning updates that bundle in
-        // place after this transaction commits.
-        sqlx::query("UPDATE workspaces SET registered_at = NULL, updated_at = now() WHERE id = $1")
-            .bind(workspace_id.0)
-            .execute(&mut *tx)
-            .await?;
+        // Issuing a replacement bootstrap does not revoke an already
+        // authenticated session. Keep its registration marker until a real
+        // stop or credential revocation; otherwise a provisioning retry can
+        // strand a live workspace between registration and readiness.
         tx.commit().await?;
         Ok(())
     }
@@ -583,8 +580,7 @@ impl RuntimeRepository {
               AND (
                     w.observed_state = 'running'
                     OR (
-                        w.observed_state = 'provisioning'
-                        AND w.desired_state = 'provisioning'
+                        w.observed_state IN ('provisioning', 'stopped')
                         AND w.registered_at IS NOT NULL
                     )
               )

@@ -267,12 +267,25 @@ impl TenantRuntimeRepository {
         org_id: OrganizationId,
         tenant_id: TenantId,
     ) -> Result<u64, ManagerError> {
-        let credential = self
-            .redis_credential(org_id, tenant_id)
-            .await?
-            .ok_or_else(|| ManagerError::not_found("tenant Redis credential"))?;
+        let Some(credential) = self.redis_credential_any(org_id, tenant_id).await? else {
+            return Ok(0);
+        };
         self.redis_isolation
             .clear_namespace(&credential.namespace)
+            .await
+    }
+
+    pub async fn clean_redis_namespace(
+        &self,
+        org_id: OrganizationId,
+        tenant_id: TenantId,
+        reset_all: bool,
+    ) -> Result<super::redis::NamespaceCleanResult, ManagerError> {
+        let Some(credential) = self.redis_credential(org_id, tenant_id).await? else {
+            return Ok(super::redis::NamespaceCleanResult::default());
+        };
+        self.redis_isolation
+            .clean_namespace(&credential.namespace, reset_all)
             .await
     }
 

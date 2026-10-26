@@ -451,20 +451,33 @@ impl LeaseGuard {
     /// attempt. This is used when a per-organization concurrency slot is
     /// temporarily occupied by another live operation.
     pub async fn requeue(&self, waiting_step: &str) -> Result<bool, ManagerError> {
+        self.requeue_after(waiting_step, Duration::zero()).await
+    }
+
+    /// Return an operation to the queue without consuming an attempt, but do
+    /// not make it claimable until `delay` has elapsed. Controller/readiness
+    /// waits use this to avoid repeatedly winning oldest-first queue ordering
+    /// and starving unrelated tenant operations.
+    pub async fn requeue_after(
+        &self,
+        waiting_step: &str,
+        delay: Duration,
+    ) -> Result<bool, ManagerError> {
         let affected = sqlx::query(
             "UPDATE operations
                 SET state = 'queued',
                     current_step = $1,
                     attempt_count = GREATEST(attempt_count - 1, 0),
-                    retry_at = NULL,
+                    retry_at = clock_timestamp() + make_interval(secs => $2),
                     lease_owner = NULL,
                     lease_token = NULL,
                     lease_expires_at = NULL,
                     updated_at = now()
-              WHERE id = $2 AND lease_owner = $3 AND lease_token = $4
+              WHERE id = $3 AND lease_owner = $4 AND lease_token = $5
                 AND state = 'running' AND lease_expires_at > clock_timestamp()",
         )
         .bind(waiting_step)
+        .bind(delay.num_seconds().max(0) as i32)
         .bind(self.operation_id.0)
         .bind(&self.owner)
         .bind(self.token)

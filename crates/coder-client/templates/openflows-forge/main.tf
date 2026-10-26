@@ -282,14 +282,21 @@ PYEOF
     # open PRs as. This is a REQUIRED, verified identity: startup fails loudly
     # if it cannot be established — never a silent REST-API fallback.
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      test -r "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" || { log "FATAL: runtime secret is not mounted"; exit 1; }
-      eval "$(python3 - "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" <<'PY'
+      RUNTIME_CREDENTIAL_COPY=$(mktemp)
+      chmod 600 "$RUNTIME_CREDENTIAL_COPY"
+      if ! sudo cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY"; then
+        rm -f "$RUNTIME_CREDENTIAL_COPY"
+        log "FATAL: runtime secret is not mounted"
+        exit 1
+      fi
+      eval "$(python3 - "$RUNTIME_CREDENTIAL_COPY" <<'PY'
 import json, shlex, sys
 d=json.load(open(sys.argv[1]))
 for env,key in [('OF_MANAGER_URL','manager_url'),('OF_BOOTSTRAP','bootstrap_token'),('REDIS_URL','redis_url'),('OPENFLOWS_TENANT','redis_namespace')]:
     print('export %s=%s' % (env, shlex.quote(str(d[key]))))
 PY
 )"
+      rm -f "$RUNTIME_CREDENTIAL_COPY"
       SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register")
       eval "$(python3 - "$SESSION" <<'PY'
 import json, shlex, sys
@@ -298,14 +305,20 @@ print('export OF_RUNTIME_ACCESS_TOKEN=%s' % shlex.quote(d['access_token']))
 print('export OF_RUNTIME_REFRESH_TOKEN=%s' % shlex.quote(d['refresh_token']))
 PY
 )"
-      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
       GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
       GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
+      API_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"api"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
+      API_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$API_RESPONSE")
     else
       GIT_TOKEN="${data.coder_parameter.hosted.value == "true" ? "" : data.coder_external_auth.github[0].access_token}"
+      API_TOKEN="$GIT_TOKEN"
     fi
     if [ -z "$GIT_TOKEN" ]; then
       log "FATAL: no inherited GitHub credential for the controller-spawner (workspace owner external auth is not linked)"
+      exit 1
+    fi
+    if [ -z "$API_TOKEN" ]; then
+      log "FATAL: no GitHub API credential for pull request operations"
       exit 1
     fi
 
@@ -354,16 +367,15 @@ PY
     fi
 
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      # Store the installation token in gh's protected config instead of an
-      # inherited GH_TOKEN environment variable. The refresh daemon rewrites
-      # this file together with Git's credential store, so every later gh
-      # invocation reads the current broker token rather than the startup one.
+      # Store the API-purpose installation token in gh's protected config.
+      # Git keeps its separate contents-scoped token in the credential store;
+      # the refresh daemon rotates both profiles independently.
       unset GH_TOKEN GH_ENTERPRISE_TOKEN
       if [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
         mkdir -p /home/coder/.config/gh
         {
           printf '%s:\n' "$GITHUB_CLI_HOST"
-          printf '    oauth_token: %s\n' "$GIT_TOKEN"
+          printf '    oauth_token: %s\n' "$API_TOKEN"
           printf '    git_protocol: https\n'
         } > /home/coder/.config/gh/hosts.yml
         chmod 600 /home/coder/.config/gh/hosts.yml
@@ -550,29 +562,45 @@ PY
     # Broker-backed git credential refresh. The startup installation token is
     # short-lived, so a long-running worker's push can outlive it. Refresh the
     # runtime session and re-fetch a fresh installation token from the Manager
-    # broker, then rewrite both Git's credential store and gh's protected
-    # hosts file so pushes and API/PR commands keep authenticating mid-task.
+    # broker, then rewrite Git's credential store with the git-purpose token
+    # and gh's protected hosts file with the API-purpose token.
     # Runs in the background for the workspace lifetime; harmless when the
     # Manager is unreachable.
     mkdir -p /home/coder/.local/state/openflows
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      rm -f /tmp/openflows-manager-ready
       nohup bash -c '
+        ACCESS="$${OF_RUNTIME_ACCESS_TOKEN}"
         REFRESH="$${OF_RUNTIME_REFRESH_TOKEN}"
+        TICKS=0
         while true; do
-          sleep 480
+          sleep 30
+          if [ ! -f /tmp/openflows-manager-ready ]; then continue; fi
+          TICKS=$((TICKS + 1))
+          HEARTBEAT_STATUS=$(curl -s -o /dev/null -w "%%{http_code}" -X POST -H "Authorization: Bearer $${ACCESS}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat")
+          if [ "$${HEARTBEAT_STATUS}" = "401" ]; then
+            RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
+            ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
+            REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
+            curl -fsS -X POST -H "Authorization: Bearer $${ACCESS}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null || true
+          fi
+          if [ "$TICKS" -lt 16 ]; then continue; fi
+          TICKS=0
           RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
           ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
           REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
           GIT=$(curl -fsS -H "Authorization: Bearer $${ACCESS}" -H "Content-Type: application/json" --data "{\"purpose\":\"git\"}" "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials" 2>/dev/null) || continue
-          TOKEN=$(printf "%s" "$${GIT}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
-          echo "https://x-access-token:$${TOKEN}@github.com" > /home/coder/.git-credentials
+          API=$(curl -fsS -H "Authorization: Bearer $${ACCESS}" -H "Content-Type: application/json" --data "{\"purpose\":\"api\"}" "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials" 2>/dev/null) || continue
+          GIT_TOKEN=$(printf "%s" "$${GIT}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
+          API_TOKEN=$(printf "%s" "$${API}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
+          echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
           sudo cp /home/coder/.git-credentials /root/.git-credentials
           sudo chmod 600 /root/.git-credentials
           if [ -n "$1" ]; then
             mkdir -p /home/coder/.config/gh
             {
               printf "%s:\n" "$1"
-              printf "    oauth_token: %s\n" "$${TOKEN}"
+              printf "    oauth_token: %s\n" "$${API_TOKEN}"
               printf "    git_protocol: https\n"
             } > /home/coder/.config/gh/hosts.yml
             chmod 600 /home/coder/.config/gh/hosts.yml
@@ -584,6 +612,45 @@ PY
       ' _ "$GITHUB_CLI_HOST" >>/home/coder/.local/state/openflows/git-refresh.log 2>&1 &
     fi
 
+    if [ ! -d /home/coder/workspace/.git ]; then
+      log "FATAL: repository bootstrap did not produce /home/coder/workspace/.git"
+      exit 1
+    fi
+
+    INSTRUCTION_ROOT="/home/coder/.openflows/artifacts/orchestration"
+    PERSONA="$INSTRUCTION_ROOT/agent/agents/$ROLE_BASE.agent.md"
+    if [ ! -f "$PERSONA" ]; then
+      log "FATAL: hosted instruction bundle is missing $PERSONA"
+      exit 1
+    fi
+    sudo cp "$PERSONA" /home/coder/workspace/AGENTS.md
+    sudo cp "$PERSONA" "/home/coder/workspace/$ROLE_BASE.agent.md"
+    sudo mkdir -p /home/coder/workspace/.agents/skills /home/coder/workspace/.agents/commands
+    SKILL_MANIFEST="$INSTRUCTION_ROOT/agent/roles/$ROLE_BASE.skills"
+    if [ ! -f "$SKILL_MANIFEST" ]; then
+      log "FATAL: hosted skill manifest is missing $SKILL_MANIFEST"
+      exit 1
+    fi
+    while IFS= read -r skill; do
+      [ -z "$skill" ] && continue
+      sudo mkdir -p "/home/coder/workspace/.agents/skills/$skill"
+      sudo cp "$INSTRUCTION_ROOT/plugin/skills/$skill/SKILL.md" "/home/coder/workspace/.agents/skills/$skill/SKILL.md"
+    done < "$SKILL_MANIFEST"
+    sudo cp -a "$INSTRUCTION_ROOT/plugin/commands/." /home/coder/workspace/.agents/commands/
+    for standard in CODING.md SECURITY.md REVIEW.md; do
+      [ ! -f "$INSTRUCTION_ROOT/agent/standards/$standard" ] || sudo cp "$INSTRUCTION_ROOT/agent/standards/$standard" /home/coder/workspace/
+    done
+    sudo chown -R coder:coder /home/coder/workspace
+    EXCLUDE=$(git -C /home/coder/workspace rev-parse --absolute-git-dir)/info/exclude
+    sudo mkdir -p "$(dirname "$EXCLUDE")"
+    sudo touch "$EXCLUDE"
+    for pattern in /AGENTS.md "/$ROLE_BASE.agent.md" '/.agents/skills/' '/.agents/commands/' /CODING.md /SECURITY.md /REVIEW.md; do
+      sudo grep -qxF -- "$pattern" "$EXCLUDE" || printf '\n%s\n' "$pattern" | sudo tee -a "$EXCLUDE" >/dev/null
+    done
+    log "Installed hosted instructions for $ROLE_BASE"
+
+    # Start heartbeat only after repository and branch bootstrap completes.
+    # Manager uses this heartbeat as the readiness boundary before creating a Chat.
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
     # OPENFLOWS_ROLE must be the BASE role (forge), not the worker id
     # (forge-1): the controller writes dispatch and reads heartbeats under
@@ -600,6 +667,11 @@ PY
     export A2A_RELAY_ADDR="${data.coder_parameter.a2a_relay_addr.value}"
     export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
+      log "Manager readiness heartbeat sent after bootstrap"
+      touch /tmp/openflows-manager-ready
+    fi
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
 
@@ -655,6 +727,7 @@ resource "docker_volume" "workspace" {
 }
 
 resource "docker_container" "workspace" {
+  count = data.coder_workspace.me.start_count
   name  = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
   image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.

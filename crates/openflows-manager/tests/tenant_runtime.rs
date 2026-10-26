@@ -24,6 +24,7 @@ use openflows_manager::operations;
 use openflows_manager::provisioning::TenantProvisionWorker;
 use openflows_manager::quotas::TenantQuotaService;
 use openflows_manager::repositories::OrganizationsRepository;
+use openflows_manager::runtime::repository::NewCredentialLease;
 use openflows_manager::runtime::tenant::TenantRuntimeRepository;
 use openflows_manager::runtime::RuntimeCredentialService;
 use openflows_manager::secrets::SecretProvider;
@@ -103,7 +104,7 @@ async fn provision_with_runtime_registration(
     let first = harness.worker.provision(guard).await.unwrap();
     assert!(matches!(
         first,
-        openflows_manager::provisioning::TenantProvisionOutcome::NotReady(_, "NEXUS_NOT_READY")
+        openflows_manager::provisioning::TenantProvisionOutcome::WaitingForController(_)
     ));
     let workspace_id: uuid::Uuid =
         sqlx::query_scalar("SELECT resource_id FROM operations WHERE id = $1")
@@ -127,6 +128,22 @@ async fn provision_with_runtime_registration(
         .expect("provisioning must inject a live bootstrap");
     let bootstrap =
         String::from_utf8(harness.secret_provider.get(&bootstrap_ref).await.unwrap()).unwrap();
+    // Coder can report running before the startup script registers. Retrying
+    // this window must adopt the build and leave its bootstrap intact.
+    let waiting = harness.worker.provision(guard).await.unwrap();
+    assert!(matches!(
+        waiting,
+        openflows_manager::provisioning::TenantProvisionOutcome::WaitingForController(_)
+    ));
+    assert_eq!(harness.adapter.workspace_restart_count(), 0);
+    let still_live = harness
+        .runtime_credentials
+        .repo
+        .live_bootstrap_ref(workspace_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_live.0, bootstrap_ref);
     let session = harness
         .runtime_credentials
         .register(&bootstrap)
@@ -310,6 +327,78 @@ async fn create_tenant(h: &Harness, slug: &str, fleet: i32, key: &str) -> Tenant
         .await
         .expect("tenant create should succeed");
     resp.resource_id
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn registered_resuming_nexus_can_commit_a_repository_lease() {
+    let h = harness().await;
+    let tenant = create_tenant(&h, "resume-lease", 1, "resume-lease").await;
+    let guard = operations::claim_kind(&h.pool, "resume-lease-worker", Some("tenant.provision"))
+        .await
+        .unwrap()
+        .unwrap();
+    let outcome = h.worker.provision(&guard).await.unwrap();
+    assert!(matches!(
+        outcome,
+        openflows_manager::provisioning::TenantProvisionOutcome::WaitingForController(_)
+    ));
+    let workspace_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE tenant_id = $1 AND role = 'nexus'")
+            .bind(tenant.0)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    let workspace_id = openflows_manager::id::WorkspaceId::from_uuid(workspace_id);
+    let (bootstrap_ref, _) = h
+        .runtime_credentials
+        .repo
+        .live_bootstrap_ref(workspace_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let bootstrap =
+        String::from_utf8(h.secret_provider.get(&bootstrap_ref).await.unwrap()).unwrap();
+    let session = h.runtime_credentials.register(&bootstrap).await.unwrap();
+    sqlx::query(
+        "UPDATE tenants SET desired_state = 'running', observed_state = 'paused' WHERE id = $1",
+    )
+    .bind(tenant.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE workspaces SET desired_state = 'running', observed_state = 'stopped' WHERE id = $1",
+    )
+    .bind(workspace_id.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let scope = h
+        .runtime_credentials
+        .authenticate(&session.access_secret)
+        .await
+        .unwrap();
+    let lease = NewCredentialLease {
+        organization_id: scope.organization_id,
+        connection_id: scope.connection_id,
+        tenant_id: Some(scope.tenant_id),
+        workspace_id: Some(scope.workspace_id),
+        installation_id: scope.installation_id,
+        repository_id: scope.repository_id,
+        permission_profile_hash: "resume-test".into(),
+        connection_generation: scope.connection_generation,
+        workspace_generation: scope.workspace_generation,
+        purpose: "git".into(),
+        token_fingerprint: "resume-test".into(),
+        encrypted_ref: Some("test-ciphertext".into()),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+    };
+    h.runtime_credentials
+        .repo
+        .record_authorized_lease(&scope, &lease, None)
+        .await
+        .expect("registered workspace must receive a scoped lease before readiness");
 }
 
 #[tokio::test]
@@ -729,6 +818,33 @@ async fn worker_request_requires_nexus_and_enforces_fleet_limit() {
         .await
         .unwrap();
     assert_eq!(resp.status, "queued");
+
+    // Nexus may die after enqueueing the request. The executor must defer
+    // creation for every worker role until controller liveness is restored.
+    sqlx::query(
+        "UPDATE workspaces SET last_heartbeat_at = now() - interval '10 minutes' WHERE id = $1",
+    )
+    .bind(nexus_ws)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    h.worker.run_once().await.unwrap();
+    let waiting: (String, String, i32, Option<String>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT o.state, o.current_step, o.attempt_count, w.coder_workspace_id, o.retry_at FROM operations o JOIN workspaces w ON w.id=o.resource_id WHERE o.id=$1",
+    ).bind(uuid::Uuid::parse_str(&resp.operation_id).unwrap()).fetch_one(&h.pool).await.unwrap();
+    assert_eq!(waiting.0, "queued");
+    assert_eq!(waiting.1, "waiting_for_nexus");
+    assert_eq!(waiting.2, 0, "waiting must not consume an attempt");
+    assert!(
+        waiting
+            .4
+            .is_some_and(|retry_at| retry_at > chrono::Utc::now()),
+        "waiting work must yield the queue until a future retry"
+    );
+    assert!(
+        waiting.3.is_none(),
+        "a queued worker must not be created without a live Nexus"
+    );
 
     // A second worker in the same tenant is within the default fleet ceiling
     // (2); a third must be rejected as a resource-limit violation.

@@ -30,6 +30,20 @@ use std::time::Duration;
 
 /// How long the worker sleeps between claim cycles.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const CONTROLLER_WAIT_RETRY: chrono::Duration = chrono::Duration::seconds(5);
+
+type WorkerWorkspaceRow = (
+    uuid::Uuid,
+    String,
+    String,
+    uuid::Uuid,
+    String,
+    Option<String>,
+    Option<i32>,
+    i32,
+    Option<String>,
+    String,
+);
 
 /// Tenant-provision step keys (persisted as `operations.current_step`).
 pub mod step {
@@ -55,6 +69,8 @@ pub mod err {
     pub const RELEASE_NOT_RESOLVED: &str = "RELEASE_NOT_RESOLVED";
     pub const NEXUS_CREATE_FAILED: &str = "NEXUS_CREATE_FAILED";
     pub const NEXUS_NOT_READY: &str = "NEXUS_NOT_READY";
+    pub const NEXUS_START_FAILED: &str = "NEXUS_START_FAILED";
+    pub const WORKER_START_FAILED: &str = "WORKER_START_FAILED";
 }
 
 /// The outcome of one tenant-provisioning attempt, returned for tests to assert
@@ -64,6 +80,7 @@ pub enum TenantProvisionOutcome {
     Provisioned(TenantId),
     Deleted(TenantId),
     Queued(TenantId),
+    WaitingForController(TenantId),
     NotReady(TenantId, &'static str),
     Failed(TenantId, &'static str, bool),
     StaleLease,
@@ -80,6 +97,7 @@ pub struct TenantProvisionWorker {
     pub adapter: Arc<dyn CoderAdapter>,
     pub manager_url: String,
     pub runtime_redis_url: String,
+    pub local_workspace_cleanup: Option<super::local_workspace_cleanup::LocalWorkspaceCleanup>,
 }
 
 impl TenantProvisionWorker {
@@ -103,6 +121,7 @@ impl TenantProvisionWorker {
             adapter,
             manager_url: "http://127.0.0.1:3002".into(),
             runtime_redis_url: "redis://127.0.0.1:6379".into(),
+            local_workspace_cleanup: None,
         }
     }
 
@@ -113,6 +132,14 @@ impl TenantProvisionWorker {
     ) -> Self {
         self.manager_url = manager_url.into();
         self.runtime_redis_url = runtime_redis_url.into();
+        self
+    }
+
+    pub fn with_local_docker_cleanup(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.local_workspace_cleanup =
+                Some(super::local_workspace_cleanup::LocalWorkspaceCleanup::from_env());
+        }
         self
     }
 
@@ -172,7 +199,8 @@ impl TenantProvisionWorker {
             Some("tenant.workspace") => self.provision_worker_workspace(&guard).await,
             Some("tenant.start") => self.start(&guard).await,
             Some("tenant.stop") => self.stop(&guard).await,
-            Some("tenant.clean" | "tenant.clean_all") => self.clean(&guard).await,
+            Some("tenant.clean") => self.clean(&guard, false).await,
+            Some("tenant.clean_all") => self.clean(&guard, true).await,
             Some("workspace.stop") => self.mutate_worker_workspace(&guard, false).await,
             Some("workspace.delete") => self.mutate_worker_workspace(&guard, true).await,
             _ => self.provision(&guard).await,
@@ -187,8 +215,16 @@ impl TenantProvisionWorker {
         guard: &LeaseGuard,
         delete: bool,
     ) -> Result<TenantProvisionOutcome, ManagerError> {
-        let row: (uuid::Uuid, uuid::Uuid, Option<String>, String) = sqlx::query_as(
-            "SELECT w.id, w.tenant_id, w.coder_workspace_id, o.coder_organization_id
+        let row: (
+            uuid::Uuid,
+            uuid::Uuid,
+            Option<String>,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT w.id, w.tenant_id, w.coder_workspace_id, o.coder_organization_id,
+                    w.desired_state, w.observed_state
                FROM workspaces w JOIN organizations o ON o.id = w.organization_id
               WHERE w.id = (SELECT resource_id FROM operations WHERE id = $1)
                 AND w.organization_id = $2",
@@ -197,6 +233,25 @@ impl TenantProvisionWorker {
         .bind(guard.organization_id.0)
         .fetch_one(&self.pool)
         .await?;
+        if !delete && crate::runtime::workspaces::deletion_started(&row.4, &row.5) {
+            let mut tx = self.pool.begin().await?;
+            if !guard.lock_in_tx(&mut tx).await? {
+                return Ok(TenantProvisionOutcome::StaleLease);
+            }
+            if !guard
+                .complete_in_tx(
+                    &mut tx,
+                    serde_json::json!({"workspace_id": row.0, "status": "superseded_by_delete"}),
+                )
+                .await?
+            {
+                return Ok(TenantProvisionOutcome::StaleLease);
+            }
+            tx.commit().await?;
+            return Ok(TenantProvisionOutcome::Provisioned(TenantId::from_uuid(
+                row.1,
+            )));
+        }
         if let Some(coder_id) = &row.2 {
             let org = coder_client::CoderOrganizationId::new(row.3);
             if delete {
@@ -210,16 +265,31 @@ impl TenantProvisionWorker {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
         let state = if delete { "deleted" } else { "stopped" };
-        sqlx::query("UPDATE workspaces SET desired_state = $1, observed_state = $1, updated_at = now() WHERE id = $2")
-            .bind(state).bind(row.0).execute(&mut *tx).await?;
-        if delete {
+        let expected = if delete { "deleting" } else { "stopped" };
+        let changed = sqlx::query(
+            "UPDATE workspaces
+                SET desired_state = $1, observed_state = $1, updated_at = now()
+              WHERE id = $2 AND desired_state = $3
+                AND observed_state NOT IN ('deleting', 'deleted')",
+        )
+        .bind(state)
+        .bind(row.0)
+        .bind(expected)
+        .execute(&mut *tx)
+        .await?;
+        if delete && changed.rows_affected() == 1 {
             sqlx::query("UPDATE tenants SET reserved_worker_capacity = GREATEST(reserved_worker_capacity - 1, 0), updated_at = now() WHERE id = $1")
                 .bind(row.1).execute(&mut *tx).await?;
         }
+        let result_status = if changed.rows_affected() == 1 {
+            state
+        } else {
+            "superseded"
+        };
         if !guard
             .complete_in_tx(
                 &mut tx,
-                serde_json::json!({"workspace_id": row.0, "status": state}),
+                serde_json::json!({"workspace_id": row.0, "status": result_status}),
             )
             .await?
         {
@@ -280,20 +350,72 @@ impl TenantProvisionWorker {
             .resource_tenant(guard)
             .await?
             .ok_or_else(|| ManagerError::not_found("tenant"))?;
+        let desired_state: Option<String> = sqlx::query_scalar(
+            "SELECT desired_state FROM tenants WHERE id = $1 AND organization_id = $2",
+        )
+        .bind(tenant_id.0)
+        .bind(guard.organization_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        if desired_state.as_deref() != Some("running") {
+            return Ok(TenantProvisionOutcome::NotReady(
+                tenant_id,
+                err::TENANT_STATE_CHANGED,
+            ));
+        }
         let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
             "SELECT w.id, w.coder_workspace_id, o.coder_organization_id
                FROM workspaces w JOIN organizations o ON o.id = w.organization_id
               WHERE w.tenant_id = $1 AND w.organization_id = $2
-                AND w.coder_workspace_id IS NOT NULL AND w.desired_state <> 'deleted'",
+                AND w.coder_workspace_id IS NOT NULL AND w.desired_state <> 'deleted'
+              ORDER BY CASE WHEN w.role = 'nexus' THEN 0 ELSE 1 END, w.id",
         )
         .bind(tenant_id.0)
         .bind(guard.organization_id.0)
         .fetch_all(&self.pool)
         .await?;
+        let nexus: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM workspaces WHERE tenant_id = $1 AND role = 'nexus' AND desired_state <> 'deleted'",
+        )
+        .bind(tenant_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
         for (id, workspace, org) in &rows {
             let workspace_id = crate::id::WorkspaceId::from_uuid(*id);
-            if self.runtime_registered_and_healthy(workspace_id).await? {
+            if Some(*id) != nexus {
+                let ready = match nexus {
+                    Some(nexus) => {
+                        self.runtime_heartbeat_fresh(crate::id::WorkspaceId::from_uuid(nexus))
+                            .await?
+                    }
+                    None => false,
+                };
+                if !ready {
+                    return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
+                }
+            }
+            if self.runtime_heartbeat_fresh(workspace_id).await? {
                 continue;
+            }
+            if self.runtime_session_pending_readiness(workspace_id).await? {
+                if self
+                    .adapter
+                    .workspace_startup_failed(
+                        &coder_client::CoderOrganizationId::new(org.clone()),
+                        workspace,
+                    )
+                    .await?
+                {
+                    return Ok(TenantProvisionOutcome::NotReady(
+                        tenant_id,
+                        if Some(*id) == nexus {
+                            err::NEXUS_START_FAILED
+                        } else {
+                            err::WORKER_START_FAILED
+                        },
+                    ));
+                }
+                return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
             }
             let bootstrap_ref = self
                 .runtime_credentials
@@ -312,27 +434,19 @@ impl TenantProvisionWorker {
             self.adapter
                 .start_workspace(&coder_client::CoderOrganizationId::new(org), workspace)
                 .await?;
+            // Coder accepts the transition before the build and agent startup
+            // finish. Do not mark the tenant running until this workspace has
+            // registered and produced a fresh heartbeat on a later poll.
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
         }
-        let nexus: Option<uuid::Uuid> = sqlx::query_scalar(
-            "SELECT id FROM workspaces WHERE tenant_id = $1 AND role = 'nexus' AND desired_state <> 'deleted'",
-        )
-        .bind(tenant_id.0)
-        .fetch_optional(&self.pool)
-        .await?;
         let Some(nexus) = nexus else {
-            return Ok(TenantProvisionOutcome::NotReady(
-                tenant_id,
-                err::NEXUS_NOT_READY,
-            ));
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
         };
         if !self
-            .runtime_registered_and_healthy(crate::id::WorkspaceId::from_uuid(nexus))
+            .runtime_heartbeat_fresh(crate::id::WorkspaceId::from_uuid(nexus))
             .await?
         {
-            return Ok(TenantProvisionOutcome::NotReady(
-                tenant_id,
-                err::NEXUS_NOT_READY,
-            ));
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
         }
         let mut tx = self.pool.begin().await?;
         if !guard.lock_in_tx(&mut tx).await? {
@@ -356,14 +470,18 @@ impl TenantProvisionWorker {
         Ok(TenantProvisionOutcome::Provisioned(tenant_id))
     }
 
-    async fn clean(&self, guard: &LeaseGuard) -> Result<TenantProvisionOutcome, ManagerError> {
+    async fn clean(
+        &self,
+        guard: &LeaseGuard,
+        reset_all: bool,
+    ) -> Result<TenantProvisionOutcome, ManagerError> {
         let tenant_id = self
             .resource_tenant(guard)
             .await?
             .ok_or_else(|| ManagerError::not_found("tenant"))?;
-        let deleted = self
+        let cleaned = self
             .tenant_runtime
-            .clear_redis_namespace(guard.organization_id, tenant_id)
+            .clean_redis_namespace(guard.organization_id, tenant_id, reset_all)
             .await?;
         let mut tx = self.pool.begin().await?;
         if !guard.lock_in_tx(&mut tx).await? {
@@ -372,7 +490,12 @@ impl TenantProvisionWorker {
         if !guard
             .complete_in_tx(
                 &mut tx,
-                serde_json::json!({"tenant_id": tenant_id, "keys_deleted": deleted}),
+                serde_json::json!({
+                    "tenant_id": tenant_id,
+                    "tickets_reset": cleaned.tickets_reset,
+                    "worker_slots_cleared": cleaned.worker_slots_cleared,
+                    "recovery_counters_cleared": cleaned.recovery_counters_cleared,
+                }),
             )
             .await?
         {
@@ -386,19 +509,10 @@ impl TenantProvisionWorker {
         &self,
         guard: &LeaseGuard,
     ) -> Result<TenantProvisionOutcome, ManagerError> {
-        let row: (
-            uuid::Uuid,
-            String,
-            String,
-            uuid::Uuid,
-            String,
-            Option<String>,
-            Option<i32>,
-            i32,
-            Option<String>,
-        ) = sqlx::query_as(
+        let row: WorkerWorkspaceRow = sqlx::query_as(
             "SELECT w.id, w.role, o.coder_organization_id, w.tenant_id,
-            r.full_name, w.branch, w.slot, t.fleet_size, w.a2a_pair_token
+            r.full_name, w.branch, w.slot, t.fleet_size, w.a2a_pair_token,
+            t.desired_state
                FROM workspaces w JOIN organizations o ON o.id = w.organization_id
                JOIN tenants t ON t.id = w.tenant_id AND t.organization_id = w.organization_id
                JOIN github_repositories r ON r.organization_id = t.organization_id
@@ -413,14 +527,45 @@ impl TenantProvisionWorker {
         .await?;
         let workspace_id = crate::id::WorkspaceId::from_uuid(row.0);
         let tenant_id = TenantId::from_uuid(row.3);
+        if matches!(row.9.as_str(), "deleting" | "deleted") {
+            return self
+                .complete_worker_creation_superseded(guard, tenant_id, workspace_id)
+                .await;
+        }
+        // A request can wait in the durable queue after its controller dies.
+        // Recheck liveness when executing it, not only when accepting it.
+        let nexus: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM workspaces WHERE tenant_id = $1 AND organization_id = $2
+               AND role = 'nexus' AND desired_state NOT IN ('deleted', 'stopped')",
+        )
+        .bind(tenant_id.0)
+        .bind(guard.organization_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        let nexus_ready = match nexus {
+            Some(id) => {
+                self.runtime_heartbeat_fresh(crate::id::WorkspaceId::from_uuid(id))
+                    .await?
+            }
+            None => false,
+        };
+        if !nexus_ready {
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
+        }
         // A previous attempt may have completed runtime registration and its
         // readiness heartbeat before losing the operation lease. Preserve that
         // successful runtime instead of issuing another single-use bootstrap,
         // which would clear registration and strand the adopted workspace.
-        if self.runtime_registered_and_healthy(workspace_id).await? {
+        if self.runtime_readiness_confirmed(workspace_id).await? {
             return self
                 .mark_worker_running(guard, tenant_id, workspace_id)
                 .await;
+        }
+        // Registration can finish before the startup script sends its readiness
+        // heartbeat. Do not replace a consumed bootstrap while that same
+        // authenticated runtime is completing startup.
+        if self.runtime_session_pending_readiness(workspace_id).await? {
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
         }
         let owner: (String,) = sqlx::query_as(
             "SELECT coder_owner_id FROM runtime_identities WHERE tenant_id = (SELECT tenant_id FROM workspaces WHERE id = $1) AND organization_id = $2",
@@ -544,20 +689,98 @@ impl TenantProvisionWorker {
                 "worker workspace scope mismatch",
             ));
         }
-        // Persist the upstream identifier before waiting for readiness so a
-        // failed build can still be deleted during tenant cleanup.
-        self.tenant_runtime
-            .set_coder_workspace_id(workspace_id, &created.id)
-            .await?;
-        self.adapter.wait_workspace_ready(&org, &created.id).await?;
-        if !self.runtime_registered_and_healthy(workspace_id).await? {
-            return Ok(TenantProvisionOutcome::NotReady(
-                tenant_id,
-                err::NEXUS_NOT_READY,
-            ));
+        // Publish the upstream identifier only while both the workspace and
+        // tenant still accept this creation. This update is the serialization
+        // point with tenant deletion: if it wins first, delete the just-created
+        // Coder workspace ourselves; if this update wins, deletion's later scan
+        // observes the identifier and tears it down.
+        let attached = sqlx::query(
+            "UPDATE workspaces w SET coder_workspace_id = $1, updated_at = now()
+              WHERE w.id = $2 AND w.desired_state = 'provisioning'
+                AND EXISTS (
+                    SELECT 1 FROM tenants t
+                     WHERE t.id = w.tenant_id
+                       AND t.organization_id = w.organization_id
+                       AND t.desired_state NOT IN ('deleting', 'deleted'))",
+        )
+        .bind(&created.id)
+        .bind(workspace_id.0)
+        .execute(&self.pool)
+        .await?;
+        if attached.rows_affected() != 1 {
+            self.adapter
+                .delete_workspace(&org, &created.id)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        tenant_id = %tenant_id.0,
+                        workspace_id = %workspace_id.0,
+                        coder_workspace_id = %created.id,
+                        %error,
+                        "Late worker creation cleanup failed"
+                    );
+                    ManagerError::api(
+                        "CODER_WORKSPACE_DELETE_FAILED",
+                        "Coder workspace created during tenant deletion could not be removed",
+                    )
+                    .retryable(true)
+                })?;
+            if let Some(cleanup) = &self.local_workspace_cleanup {
+                cleanup.remove_workspace(&row.1, &created.id).await?;
+            }
+            return self
+                .complete_worker_creation_superseded(guard, tenant_id, workspace_id)
+                .await;
+        }
+        if self
+            .adapter
+            .wait_workspace_ready(&org, &created.id)
+            .await
+            .is_err()
+        {
+            if self
+                .adapter
+                .workspace_startup_failed(&org, &created.id)
+                .await?
+            {
+                return Ok(TenantProvisionOutcome::NotReady(
+                    tenant_id,
+                    err::WORKER_START_FAILED,
+                ));
+            }
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
+        }
+        if !self.runtime_readiness_confirmed(workspace_id).await? {
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
         }
         self.mark_worker_running(guard, tenant_id, workspace_id)
             .await
+    }
+
+    async fn complete_worker_creation_superseded(
+        &self,
+        guard: &LeaseGuard,
+        tenant_id: TenantId,
+        workspace_id: crate::id::WorkspaceId,
+    ) -> Result<TenantProvisionOutcome, ManagerError> {
+        let mut tx = self.pool.begin().await?;
+        if !guard.lock_in_tx(&mut tx).await? {
+            return Ok(TenantProvisionOutcome::StaleLease);
+        }
+        if !guard
+            .complete_in_tx(
+                &mut tx,
+                serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "status": "superseded_by_tenant_delete",
+                }),
+            )
+            .await?
+        {
+            return Ok(TenantProvisionOutcome::StaleLease);
+        }
+        tx.commit().await?;
+        Ok(TenantProvisionOutcome::Provisioned(tenant_id))
     }
 
     async fn mark_worker_running(
@@ -724,12 +947,16 @@ impl TenantProvisionWorker {
             .tenant_runtime
             .ensure_workspace(org_id, tenant_id, "nexus", None)
             .await?;
-        // A previous attempt may have created the workspace and its runtime
-        // may already be healthy. Do not issue another bootstrap credential in
-        // that case: issuing one deliberately clears `registered_at`, which
-        // would make a successful runtime look unregistered on every retry.
-        if self.runtime_registered_and_healthy(nexus_ws).await? {
+        // Adopt a healthy runtime without replacing its credentials. Only a
+        // fresh controller heartbeat can complete tenant provisioning.
+        if self.runtime_heartbeat_fresh(nexus_ws).await? {
             return self.mark_tenant_running(guard, tenant_id, nexus_ws).await;
+        }
+        if self.runtime_session_pending_readiness(nexus_ws).await? {
+            return Ok(TenantProvisionOutcome::NotReady(
+                tenant_id,
+                err::NEXUS_NOT_READY,
+            ));
         }
         let existing_coder_workspace_id: Option<String> =
             sqlx::query_scalar("SELECT coder_workspace_id FROM workspaces WHERE id = $1")
@@ -737,6 +964,37 @@ impl TenantProvisionWorker {
                 .fetch_optional(&self.pool)
                 .await?
                 .flatten();
+        if let Some(existing) = existing_coder_workspace_id.as_deref() {
+            // Retrying creation is adoption, not a restart. The first startup
+            // may consume its bootstrap while this attempt waits for Coder.
+            // Rewriting the bundle or restarting here races that registration
+            // and makes the next startup replay a consumed bootstrap.
+            if !guard.set_step(step::WAIT_NEXUS).await? {
+                return Ok(TenantProvisionOutcome::StaleLease);
+            }
+            if self
+                .adapter
+                .wait_workspace_ready(&coder_org, existing)
+                .await
+                .is_err()
+            {
+                if self
+                    .adapter
+                    .workspace_startup_failed(&coder_org, existing)
+                    .await?
+                {
+                    return Ok(TenantProvisionOutcome::NotReady(
+                        tenant_id,
+                        err::NEXUS_START_FAILED,
+                    ));
+                }
+                return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
+            }
+            if self.runtime_heartbeat_fresh(nexus_ws).await? {
+                return self.mark_tenant_running(guard, tenant_id, nexus_ws).await;
+            }
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
+        }
         let runtime_secret_ref = self
             .ensure_workspace_runtime_secret(org_id, tenant_id, nexus_ws)
             .await?;
@@ -832,11 +1090,6 @@ impl TenantProvisionWorker {
         self.tenant_runtime
             .set_coder_workspace_id(nexus_ws, &created.id)
             .await?;
-        if existing_coder_workspace_id.as_deref() == Some(created.id.as_str()) {
-            self.adapter
-                .restart_workspace(&coder_org, &created.id)
-                .await?;
-        }
 
         // Wait for build success + agent connection (bounded).
         if !guard.set_step(step::WAIT_NEXUS).await? {
@@ -848,20 +1101,22 @@ impl TenantProvisionWorker {
             .await
             .is_err()
         {
-            self.record_error(guard, tenant_id, err::NEXUS_NOT_READY)
-                .await?;
-            return Ok(TenantProvisionOutcome::NotReady(
-                tenant_id,
-                err::NEXUS_NOT_READY,
-            ));
+            if self
+                .adapter
+                .workspace_startup_failed(&coder_org, &created.id)
+                .await?
+            {
+                self.record_error(guard, tenant_id, err::NEXUS_START_FAILED)
+                    .await?;
+                return Ok(TenantProvisionOutcome::NotReady(
+                    tenant_id,
+                    err::NEXUS_START_FAILED,
+                ));
+            }
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
         }
-        if !self.runtime_registered_and_healthy(nexus_ws).await? {
-            self.record_error(guard, tenant_id, err::NEXUS_NOT_READY)
-                .await?;
-            return Ok(TenantProvisionOutcome::NotReady(
-                tenant_id,
-                err::NEXUS_NOT_READY,
-            ));
+        if !self.runtime_heartbeat_fresh(nexus_ws).await? {
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
         }
 
         self.mark_tenant_running(guard, tenant_id, nexus_ws).await
@@ -948,17 +1203,36 @@ impl TenantProvisionWorker {
         if !guard.set_step(step::RECHECK).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
+        // A workspace operation may be outside PostgreSQL while Coder creates
+        // the upstream resource. Do not let tenant deletion report success
+        // until every such operation has either attached its Coder id (so the
+        // scan below sees it) or deleted the late-created workspace itself.
+        let unfinished_worker_creation: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM operations op
+                JOIN workspaces w ON w.id = op.resource_id
+                 WHERE w.tenant_id = $1 AND w.organization_id = $2
+                   AND op.kind = 'tenant.workspace'
+                   AND op.state IN ('queued', 'running', 'retryable_failed'))",
+        )
+        .bind(tenant_id.0)
+        .bind(org_id.0)
+        .fetch_one(&self.pool)
+        .await?;
+        if unfinished_worker_creation {
+            return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
+        }
         // Stop/delete workspaces (real Coder workspace teardown is a live-required
         // adapter operation; we record the row transitions here).
         if !guard.set_step(step::STOP_WORKSPACES).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
-        let upstream: Vec<(String, String)> = sqlx::query_as(
-            "SELECT w.coder_workspace_id, o.coder_organization_id
+        let upstream: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT w.coder_workspace_id, o.coder_organization_id, w.role
                FROM workspaces w JOIN organizations o ON o.id = w.organization_id
               WHERE w.tenant_id = $1 AND w.organization_id = $2 AND w.coder_workspace_id IS NOT NULL",
         ).bind(tenant_id.0).bind(org_id.0).fetch_all(&self.pool).await?;
-        for (workspace_id, coder_org) in upstream {
+        for (workspace_id, coder_org, role) in upstream {
             self.adapter
                 .delete_workspace(
                     &coder_client::CoderOrganizationId::new(coder_org),
@@ -974,9 +1248,18 @@ impl TenantProvisionWorker {
                     )
                     .retryable(true)
                 })?;
+            if let Some(cleanup) = &self.local_workspace_cleanup {
+                cleanup.remove_workspace(&role, &workspace_id).await?;
+            }
+        }
+        if let Some(cleanup) = &self.local_workspace_cleanup {
+            cleanup.remove_artifacts(tenant_id.0).await?;
         }
         self.tenant_runtime
             .revoke_redis_credential(org_id, tenant_id)
+            .await?;
+        self.tenant_runtime
+            .clear_redis_namespace(org_id, tenant_id)
             .await?;
         self.tenant_runtime
             .delete_tenant_secrets(org_id, tenant_id)
@@ -1004,6 +1287,45 @@ impl TenantProvisionWorker {
         if !guard.lock_in_tx(&mut tx).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
+        // Remove runtime-only records only after upstream resources and secret
+        // objects are gone. Keep tenant/workspace tombstones and operations as
+        // a sanitized audit trail, but never retain usable credentials,
+        // pending hooks, Chat mappings, or mounted-secret references.
+        sqlx::query("DELETE FROM runtime_chats WHERE workspace_id IN (SELECT id FROM workspaces WHERE tenant_id = $1 AND organization_id = $2)")
+            .bind(tenant_id.0).bind(org_id.0).execute(&mut *tx).await?;
+        sqlx::query(
+            "DELETE FROM tenant_hook_deliveries WHERE tenant_id = $1 AND organization_id = $2",
+        )
+        .bind(tenant_id.0)
+        .bind(org_id.0)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM runtime_credentials WHERE workspace_id IN (SELECT id FROM workspaces WHERE tenant_id = $1 AND organization_id = $2)")
+            .bind(tenant_id.0).bind(org_id.0).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM workspace_bootstrap_credentials WHERE workspace_id IN (SELECT id FROM workspaces WHERE tenant_id = $1 AND organization_id = $2)")
+            .bind(tenant_id.0).bind(org_id.0).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM credential_leases WHERE tenant_id = $1 AND organization_id = $2")
+            .bind(tenant_id.0)
+            .bind(org_id.0)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM tenant_hook_keys WHERE tenant_id = $1 AND organization_id = $2")
+            .bind(tenant_id.0)
+            .bind(org_id.0)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM tenant_redis_credentials WHERE tenant_id = $1 AND organization_id = $2",
+        )
+        .bind(tenant_id.0)
+        .bind(org_id.0)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM runtime_identities WHERE tenant_id = $1 AND organization_id = $2")
+            .bind(tenant_id.0)
+            .bind(org_id.0)
+            .execute(&mut *tx)
+            .await?;
         // Release worker reservations and mark tenant deleted.
         sqlx::query(
             "UPDATE tenants SET reserved_worker_capacity = 0, updated_at = now()
@@ -1014,7 +1336,10 @@ impl TenantProvisionWorker {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE workspaces SET desired_state = 'deleted', observed_state = 'deleted', updated_at = now()
+            "UPDATE workspaces SET desired_state = 'deleted', observed_state = 'deleted',
+                    coder_workspace_id = NULL, runtime_secret_ref = NULL,
+                    a2a_pair_token = NULL, registered_at = NULL, last_heartbeat_at = NULL,
+                    updated_at = now()
               WHERE tenant_id = $1 AND organization_id = $2",
         )
         .bind(tenant_id.0)
@@ -1056,6 +1381,11 @@ impl TenantProvisionWorker {
                 // lease so the active operation can finish and this one can be
                 // claimed later without inflating its attempt count.
                 let _ = guard.requeue("waiting_for_provisioning_slot").await?;
+            }
+            Ok(TenantProvisionOutcome::WaitingForController(_)) => {
+                let _ = guard
+                    .requeue_after("waiting_for_nexus", CONTROLLER_WAIT_RETRY)
+                    .await?;
             }
             Ok(TenantProvisionOutcome::NotReady(_, code)) => {
                 let _ = guard
@@ -1288,9 +1618,9 @@ impl TenantProvisionWorker {
     ) -> Result<String, ManagerError> {
         // A workspace can be rebuilt after its single-use bootstrap has been
         // consumed. The mounted bundle is then deliberately scrubbed, so
-        // reusing it would make the next startup fail with AUTH_FAILED. Ensure
-        // there is a fresh live bootstrap for every provisioning attempt and
-        // rewrite the mounted bundle before asking Coder to start the build.
+        // reusing it would make the next startup fail with AUTH_FAILED. This
+        // is called when preparing a new startup, never while adopting an
+        // existing Nexus startup during a provisioning retry.
         let bootstrap_ref = self
             .runtime_credentials
             .ensure_bootstrap_ref(workspace_id)
@@ -1327,23 +1657,67 @@ impl TenantProvisionWorker {
         Ok(())
     }
 
-    async fn runtime_registered_and_healthy(
+    async fn runtime_readiness_confirmed(
         &self,
         workspace_id: crate::id::WorkspaceId,
     ) -> Result<bool, ManagerError> {
         let ready: bool = sqlx::query_scalar(
             "SELECT COALESCE(
-                    registered_at IS NOT NULL
-                    AND last_heartbeat_at > clock_timestamp() - interval '2 minutes',
-                    false
-                )
-               FROM workspaces WHERE id = $1",
+                    w.last_heartbeat_at IS NOT NULL
+                    AND w.last_heartbeat_at >= COALESCE(
+                        (SELECT max(b.created_at) FROM workspace_bootstrap_credentials b
+                          WHERE b.workspace_id = w.id), w.created_at)
+                    AND EXISTS (
+                        SELECT 1 FROM runtime_credentials rc
+                         WHERE rc.workspace_id = w.id AND rc.audience = 'openflows-workspace-refresh'
+                           AND rc.generation = w.credential_generation
+                           AND rc.revoked_at IS NULL AND rc.expires_at > clock_timestamp()
+                    ), false)
+               FROM workspaces w WHERE w.id = $1",
         )
         .bind(workspace_id.0)
         .fetch_optional(&self.pool)
         .await?
         .unwrap_or(false);
         Ok(ready)
+    }
+
+    async fn runtime_heartbeat_fresh(
+        &self,
+        workspace_id: crate::id::WorkspaceId,
+    ) -> Result<bool, ManagerError> {
+        if !self.runtime_readiness_confirmed(workspace_id).await? {
+            return Ok(false);
+        }
+        let fresh: bool = sqlx::query_scalar(
+            "SELECT COALESCE(last_heartbeat_at > clock_timestamp() - interval '2 minutes', false)
+               FROM workspaces WHERE id = $1",
+        )
+        .bind(workspace_id.0)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false);
+        Ok(fresh)
+    }
+
+    async fn runtime_session_pending_readiness(
+        &self,
+        workspace_id: crate::id::WorkspaceId,
+    ) -> Result<bool, ManagerError> {
+        let pending: bool = sqlx::query_scalar(
+            "SELECT COALESCE(w.coder_workspace_id IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM runtime_credentials rc
+                     WHERE rc.workspace_id = w.id AND rc.audience = 'openflows-workspace-refresh'
+                       AND rc.generation = w.credential_generation
+                       AND rc.revoked_at IS NULL AND rc.expires_at > clock_timestamp()
+                ), false)
+               FROM workspaces w WHERE w.id = $1",
+        )
+        .bind(workspace_id.0)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false);
+        Ok(pending)
     }
 }
 

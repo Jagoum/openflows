@@ -225,7 +225,7 @@ fn random_key() -> Zeroizing<Vec<u8>> {
 }
 
 fn random_hook_key() -> Zeroizing<String> {
-    Zeroizing::new(base64::engine::general_purpose::STANDARD_NO_PAD.encode(&random_key()))
+    Zeroizing::new(base64::engine::general_purpose::STANDARD_NO_PAD.encode(random_key()))
 }
 
 fn validate_hook_key(value: &[u8]) -> Result<()> {
@@ -433,9 +433,12 @@ async fn bootstrap(
     bail!("authorize setup with 'coder login <CODER_URL>' or OPENFLOWS_CODER_BOOTSTRAP_TOKEN_FILE; for an empty managed deployment use --initialize-coder --admin-email <email>");
 }
 
-// The user link identifies the tenant creator. Chat creation is a privileged
-// Manager operation with an explicit owner_id, not a delegated user OAuth call.
-pub(crate) const CODER_USER_SCOPES: &str = "user:read_personal workspace:read";
+// The user link identifies the tenant creator and lets Manager send Chat
+// follow-ups as that owner. Coder keeps chat:update internal-only, so its
+// OAuth provider offers no narrower grant that can send a Chat message.
+// coder:all remains bounded by the linked user's Coder permissions; never
+// expose its access or refresh token to a runtime or browser.
+pub(crate) const CODER_USER_SCOPES: &str = "coder:all";
 
 /// Operator-only recovery for a hosted workspace whose single-use bootstrap
 /// was consumed and whose process no longer has its rotating refresh token.
@@ -1487,6 +1490,16 @@ mod tests {
         let app = json!({"id":uuid::Uuid::new_v4(),"redirect_uris":["https://flows.test/auth/coder/callback"]});
         assert!(verify_app(&app, "https://flows.test/auth/coder/callback").is_ok());
         assert!(verify_app(&app, "https://other.test/auth/coder/callback").is_err());
+    }
+
+    #[test]
+    fn coder_user_grant_allows_managed_chat_handoffs() {
+        assert_eq!(CODER_USER_SCOPES, "coder:all");
+        assert!(verify_identity_scopes(&json!({"scope":"coder:all"})).is_ok());
+        assert!(verify_identity_scopes(
+            &json!({"scope":"user:read user:read_personal workspace:read"})
+        )
+        .is_err());
     }
 
     struct CountingProvider {

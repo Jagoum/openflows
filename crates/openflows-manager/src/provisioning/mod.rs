@@ -10,6 +10,7 @@
 //! never from customer-supplied URLs.
 
 pub mod docker;
+pub mod local_workspace_cleanup;
 pub mod release_provider;
 pub mod source;
 pub mod tenant_worker;

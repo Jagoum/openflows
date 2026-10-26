@@ -135,8 +135,7 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
     targets.extend(tee_targets(&words));
     targets.extend(command_operand_targets(&words));
     let cmd = command.to_lowercase();
-    if cmd.contains("python ")
-        || cmd.contains("python3 ")
+    if (cmd.contains("python ") || cmd.contains("python3 "))
         || cmd.contains("node ")
         || cmd.contains("cargo fmt")
         || cmd.contains("git apply")

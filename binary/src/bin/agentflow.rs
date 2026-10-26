@@ -255,18 +255,6 @@ async fn run_controller(reset_store: bool) -> Result<()> {
         pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(tenant.clone()))
             .await?;
     let runtime_control = agent_nexus::runtime_control::RuntimeControlClient::from_env()?;
-    if let Some(runtime) = runtime_control.clone() {
-        // Registration establishes identity. Periodic heartbeats establish
-        // controller liveness after Redis and tenant configuration are ready.
-        tokio::spawn(async move {
-            loop {
-                if let Err(error) = runtime.heartbeat().await {
-                    tracing::warn!(%error, "Manager runtime heartbeat failed");
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            }
-        });
-    }
     if reset_store {
         let cleared = reset_tenant_runtime_state(&store).await;
         tracing::info!(
@@ -324,8 +312,11 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let orch_dir = resolver.ensure_orchestration_dir()?;
     resolver.validate()?;
     if let Some(artifacts_dir) = std::env::var_os("ARTIFACTS_DIR") {
-        openflows::orchestration::publish_worker_hooks(std::path::Path::new(&artifacts_dir))
+        let artifacts_dir = std::path::Path::new(&artifacts_dir);
+        openflows::orchestration::publish_worker_hooks(artifacts_dir)
             .context("Failed to publish hooks to the shared worker artifacts volume")?;
+        openflows::orchestration::publish_worker_instructions(artifacts_dir)
+            .context("Failed to publish instructions to the shared worker artifacts volume")?;
     }
 
     let registry_path = resolver.registry_path();
@@ -418,7 +409,7 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     // ── Build flow nodes ────────────────────────────────────────────────
     let nexus_persona = resolver.persona_path("nexus.agent.md");
     let mut nexus_node = openflows::nodes::NexusNode::new(nexus_persona, registry_path.clone());
-    if let Some(runtime) = runtime_control {
+    if let Some(runtime) = runtime_control.clone() {
         nexus_node = nexus_node.with_runtime_control(runtime);
     }
     if let Some(ref relay) = a2a_relay {
@@ -535,6 +526,36 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     // The per-node cycle detector catches tight ping-pong (nexus→forge_pair→nexus→…)
     // within ~40 steps instead of burning all 1000.
     let flow = flow.max_steps(1000).max_visits_per_node(20);
+
+    // Report readiness only after controller initialization has succeeded.
+    // Keep the task scoped to this function so exiting the controller also
+    // stops heartbeats, including when initialization or the loop fails.
+    let mut runtime_heartbeats = tokio::task::JoinSet::new();
+    if let Some(runtime) = runtime_control.clone() {
+        let mut retry_delay = std::time::Duration::from_secs(1);
+        loop {
+            match runtime.heartbeat().await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        retry_delay_secs = retry_delay.as_secs(),
+                        "Initial Manager runtime heartbeat failed; retaining session and retrying"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+        runtime_heartbeats.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if let Err(error) = runtime.heartbeat().await {
+                    tracing::warn!(%error, "Manager runtime heartbeat failed");
+                }
+            }
+        });
+    }
 
     // ── Run controller poll loop ────────────────────────────────────────
     tracing::info!(

@@ -292,6 +292,27 @@ impl NexusNode {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
+    fn managed_worker_request_key(worker_id: &str, ticket_id: &str) -> String {
+        format!("runtime:worker-request:{worker_id}:{ticket_id}")
+    }
+
+    fn managed_rework_message_key(ticket_id: &str, directive: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"openflows-managed-rework-v1\0");
+        hasher.update(ticket_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(directive.as_bytes());
+        format!("rework:{:x}", hasher.finalize())
+    }
+
+    fn rework_prompt(ticket_id: &str, directive: &str) -> String {
+        format!(
+            "You are resuming existing work on ticket {ticket_id}.\n\n{directive}\n\n\
+             Address the rework directive above. Re-check `openflows-harness status get` \
+             and `openflows-harness dispatch read` for context.\n"
+        )
+    }
+
     fn resolve_github_token(&self) -> Result<String> {
         let registry = self.load_registry()?;
         registry.resolve_github_token("nexus")
@@ -1212,7 +1233,10 @@ Before significant work, read the relevant skill file to understand the workflow
 
         if let Some(workspace_id) = slot.workspace_id.as_deref() {
             let status = runtime.worker_status(workspace_id).await?;
-            if status.desired_state == "running" && status.observed_state == "running" {
+            if status.desired_state == "running"
+                && status.observed_state == "running"
+                && status.last_heartbeat_at.is_some()
+            {
                 info!(
                     worker_id,
                     workspace_id,
@@ -1223,10 +1247,15 @@ Before significant work, read the relevant skill file to understand the workflow
                 return Ok(Some(workspace_id.to_string()));
             }
             anyhow::bail!(
-                "managed worker workspace {} is still {} / {}",
+                "managed worker workspace {} is still {} / {} (bootstrap heartbeat: {})",
                 workspace_id,
                 status.desired_state,
-                status.observed_state
+                status.observed_state,
+                if status.last_heartbeat_at.is_some() {
+                    "ready"
+                } else {
+                    "pending"
+                }
             );
         }
 
@@ -1243,7 +1272,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 json!(crate::a2a::A2ARelay::hash_pair_token(&a2a_pair_token)),
             )
             .await;
-        let idempotency_store_key = format!("runtime:worker-request:{worker_id}:{ticket_id}");
+        let idempotency_store_key = Self::managed_worker_request_key(worker_id, ticket_id);
         let idempotency_key: String = store
             .get_typed(&idempotency_store_key)
             .await
@@ -1331,6 +1360,44 @@ Before significant work, read the relevant skill file to understand the workflow
             role, workspace_id, "Workspace instructions provisioned"
         );
         Ok(())
+    }
+
+    /// Destroy a worker through its owning control plane. Hosted slot ids are
+    /// OpenFlows workspace ids and must go through Manager; local ids belong
+    /// to Coder directly.
+    async fn destroy_worker_workspace(
+        &self,
+        store: &SharedStore,
+        workspace_id: &str,
+    ) -> Result<()> {
+        if let Some(runtime) = &self.runtime_control {
+            let request_key = store
+                .get_typed::<HashMap<String, WorkerSlot>>(KEY_WORKER_SLOTS)
+                .await
+                .and_then(|slots| {
+                    slots.into_iter().find_map(|(worker_id, slot)| {
+                        (slot.workspace_id.as_deref() == Some(workspace_id))
+                            .then(|| {
+                                slot.status.ticket_id().map(|ticket_id| {
+                                    Self::managed_worker_request_key(&worker_id, ticket_id)
+                                })
+                            })
+                            .flatten()
+                    })
+                });
+            runtime
+                .delete_worker(workspace_id, &format!("runtime-delete:{workspace_id}"))
+                .await
+                .context("Failed to request managed workspace deletion")?;
+            if let Some(request_key) = request_key {
+                // The key deduplicates retries of one creation attempt. Once
+                // that workspace is successfully deleted, the next assignment
+                // is a replacement attempt and must receive a fresh key.
+                store.del(&request_key).await;
+            }
+            return Ok(());
+        }
+        self.destroy_coder_workspace(store, workspace_id).await
     }
 
     /// Destroy a Coder workspace and archive all associated chats.
@@ -1786,12 +1853,7 @@ Use `openflows-harness` for all coordination:
         // full ticket-assignment blast — the agent resumes its existing branch/work.
         let had_rework_directive = rework_directive.is_some();
         let initial_prompt = match rework_directive {
-            Some(directive) => format!(
-                "You are resuming existing work on ticket {}.\n\n{}\n\n\
-                 Address the rework directive above. Re-check `openflows-harness status get` \
-                 and `openflows-harness dispatch read` for context.\n",
-                ticket_id, directive
-            ),
+            Some(directive) => Self::rework_prompt(ticket_id, &directive),
             None => format!(
                 "{}\n\n**Begin work immediately.** Read harness status and dispatch, inspect source files and existing deployment/runtime configuration without modifying source, then write a grounded plan at the exact chat-specific path supplied by Coder or the startup hook. Run `openflows-harness plan write --file <absolute-plan-path>` and `openflows-harness status set plan_ready` and wait for SENTINEL gate approval before implementation.\n",
                 base_prompt
@@ -1968,15 +2030,35 @@ Use `openflows-harness` for all coordination:
         let role = Self::worker_role(worker_id);
         let chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, role);
         let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, role);
-        let prompt = format!(
-            "You are the OpenFlows {role} agent for ticket {id}.\n\nTitle: {title}\n\n{body}\n\nRead /home/coder/workspace/AGENTS.md and /home/coder/workspace/{role}.agent.md if present. Read `openflows-harness dispatch read` and `openflows-harness status get`, then write a plan and report `plan_ready` before implementation.",
-            id=ticket.id, title=ticket.title, body=ticket.body,
-        );
+        let rework_key = full_ticket_key(&ticket.id, KEY_TICKET_REWORK_DIRECTIVE, role);
+        let rework_directive = store.get_typed::<String>(&rework_key).await;
+        let prompt = match rework_directive.as_deref() {
+            Some(directive) => Self::rework_prompt(&ticket.id, directive),
+            None => format!(
+                "You are the OpenFlows {role} agent for ticket {id}.\n\nTitle: {title}\n\n{body}\n\nRead /home/coder/workspace/AGENTS.md and /home/coder/workspace/{role}.agent.md if present. Read `openflows-harness dispatch read` and `openflows-harness status get`, then write a plan and report `plan_ready` before implementation.",
+                id=ticket.id, title=ticket.title, body=ticket.body,
+            ),
+        };
         let chat = runtime
             .create_chat(workspace_id, &ticket.id, &prompt)
             .await?;
         if chat.workspace_id != workspace_id {
             anyhow::bail!("Manager returned a Chat for a different workspace");
+        }
+        if let Some(directive) = rework_directive.as_deref() {
+            if !chat.created {
+                runtime
+                    .send_chat_message(
+                        &chat.chat_id,
+                        &Self::managed_rework_message_key(&ticket.id, directive),
+                        &prompt,
+                    )
+                    .await?;
+            }
+            // A newly created Chat received the directive as its first prompt;
+            // an existing Chat received it through the durable message API.
+            // Preserve the key on either failure so reconciliation retries it.
+            store.del(&rework_key).await;
         }
         store.set(&chat_key, json!(chat.chat_id)).await;
         // Preserve same-Chat recovery: do not unconditionally mark a returned
@@ -2087,6 +2169,11 @@ Use `openflows-harness` for all coordination:
         store: &SharedStore,
         tickets: &[Ticket],
     ) {
+        if let Some(runtime) = &self.runtime_control {
+            self.poll_managed_harness_status_and_spawn_agents(store, tickets, runtime)
+                .await;
+            return;
+        }
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
             None => {
@@ -3104,6 +3191,381 @@ Use `openflows-harness` for all coordination:
         }
     }
 
+    /// Hosted review orchestration. All Coder authority remains in Manager;
+    /// Nexus supplies tenant-scoped scheduling information and durable message
+    /// keys only. This mirrors the direct-Coder lifecycle without requiring an
+    /// operator credential in the Nexus workspace.
+    async fn poll_managed_harness_status_and_spawn_agents(
+        &self,
+        store: &SharedStore,
+        tickets: &[Ticket],
+        runtime: &crate::runtime_control::RuntimeControlClient,
+    ) {
+        let slots: HashMap<String, WorkerSlot> = match store.get_typed(KEY_WORKER_SLOTS).await {
+            Some(slots) => slots,
+            None => {
+                info!("poll_harness_status: no worker slots stored — cannot spawn reviewers");
+                return;
+            }
+        };
+        info!(
+            total = tickets.len(),
+            active = tickets
+                .iter()
+                .filter(|ticket| matches!(
+                    &ticket.status,
+                    TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
+                ) || matches!(
+                    &ticket.status,
+                    TicketStatus::Completed { outcome, .. } if outcome == "pr_opened"
+                ))
+                .count(),
+            "poll_harness_status: scanning managed tickets for harness phase"
+        );
+
+        for ticket in tickets {
+            let active = matches!(
+                &ticket.status,
+                TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
+            ) || matches!(
+                &ticket.status,
+                TicketStatus::Completed { outcome, .. } if outcome == "pr_opened"
+            );
+            if !active {
+                continue;
+            }
+            let lifecycle = match store.lifecycle(&ticket.id).await {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(ticket_id=%ticket.id, %error, "Cannot load managed ticket lifecycle");
+                    continue;
+                }
+            };
+
+            match lifecycle.phase {
+                config::lifecycle::Phase::Building | config::lifecycle::Phase::PlanRejected => {
+                    // Gate decisions move the shared lifecycle atomically. By the
+                    // next poll it is no longer PlanReady/Testing, so those arms
+                    // cannot wake a Forge chat that stopped at the review gate.
+                    if let Some(feedback) = lifecycle.feedback.as_deref() {
+                        let key = format!(
+                            "review-feedback:{}:{}:{}",
+                            lifecycle.phase.as_str(),
+                            lifecycle.revision,
+                            lifecycle.review_round
+                        );
+                        let prompt = format!(
+                            "Review rejected: {feedback}. Read `openflows-harness status get`. If plan_rejected, return to planning, revise the plan, and request another review. If building, fix the implementation and return through testing."
+                        );
+                        self.notify_managed_forge(store, runtime, ticket, &key, &prompt)
+                            .await;
+                    } else if lifecycle.phase == config::lifecycle::Phase::Building {
+                        if let Some(decision) =
+                            lifecycle.plan_decision.as_ref().filter(|decision| {
+                                decision.approved && decision.revision == lifecycle.revision
+                            })
+                        {
+                            let key =
+                                format!("plan-approved:{}:{}", decision.revision, decision.round);
+                            self.notify_managed_forge(
+                                store,
+                                runtime,
+                                ticket,
+                                &key,
+                                "SENTINEL approved the plan. Shared state is already building. Read `openflows-harness status get`, then implement the approved revision; do not replay the phase transition.",
+                            )
+                            .await;
+                        }
+                    }
+                }
+                config::lifecycle::Phase::PlanReady | config::lifecycle::Phase::Testing => {
+                    let testing = lifecycle.phase == config::lifecycle::Phase::Testing;
+                    let approved = if testing {
+                        lifecycle
+                            .test_decision
+                            .as_ref()
+                            .is_some_and(|decision| decision.approved)
+                    } else {
+                        lifecycle
+                            .plan_decision
+                            .as_ref()
+                            .is_some_and(|decision| decision.approved)
+                    };
+                    if approved {
+                        let prompt = if testing {
+                            "Testing review gates passed. Read `openflows-harness status get`; continue through submit, open or update the PR, and record it with `openflows-harness pr opened`."
+                        } else {
+                            "Plan review passed. Run `openflows-harness status set building`, read the approved revision with `openflows-harness status get`, and continue implementation."
+                        };
+                        let key = format!(
+                            "gate:{}:{}:{}:{}",
+                            lifecycle.phase.as_str(),
+                            lifecycle.revision,
+                            lifecycle.head.as_deref().unwrap_or("plan"),
+                            lifecycle.review_round
+                        );
+                        self.notify_managed_forge(store, runtime, ticket, &key, prompt)
+                            .await;
+                        continue;
+                    }
+
+                    let namespace = format!(
+                        "{}:{}:{}:{}",
+                        if testing { "testing" } else { "planning_gate" },
+                        lifecycle.revision,
+                        lifecycle.head.as_deref().unwrap_or("plan"),
+                        lifecycle.review_round
+                    );
+                    let prompt = if testing {
+                        format!(
+                            "Testing review for {}. Read `openflows-harness plan read` and `status get`. Verify approved plan revision {} at head {} through the A2A executor. Write review.md and run `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict <approve|reject> --report review.md`.",
+                            ticket.id,
+                            lifecycle.revision,
+                            lifecycle.head.as_deref().unwrap_or(""),
+                            lifecycle.revision,
+                            lifecycle.head.as_deref().unwrap_or(""),
+                            lifecycle.review_round,
+                        )
+                    } else {
+                        format!(
+                            "Review plan revision {} for {}. Read `openflows-harness plan read` and `status get`. Write review.md, then run `openflows-harness gate decide --phase plan_ready --revision {} --round {} --verdict <approve|reject> --report review.md`. Do not modify source.",
+                            lifecycle.revision,
+                            ticket.id,
+                            lifecycle.revision,
+                            lifecycle.review_round,
+                        )
+                    };
+                    self.ensure_managed_sentinel_review(
+                        store,
+                        runtime,
+                        ticket,
+                        &slots,
+                        &namespace,
+                        if testing { "testing" } else { "planning_gate" },
+                        &prompt,
+                        &lifecycle,
+                    )
+                    .await;
+                }
+                config::lifecycle::Phase::Blocked => {
+                    let feedback = lifecycle
+                        .feedback
+                        .as_deref()
+                        .unwrap_or("A blocker was recorded; inspect lifecycle status for details.");
+                    let key = format!("blocked:{}", lifecycle.version);
+                    let prompt = format!(
+                        "Your ticket is BLOCKED. Blocker: {feedback}\n\
+                         Read `openflows-harness status get` for the exact blocker and evidence.\n\
+                         Recovery returns through planning: once the blocker is resolved, run \
+                         `openflows-harness status set planning`, revise/upload the plan, and set \
+                         `plan_ready` for a fresh review."
+                    );
+                    self.notify_managed_forge(store, runtime, ticket, &key, &prompt)
+                        .await;
+                }
+                config::lifecycle::Phase::Submit => {
+                    if lifecycle.pr_number.is_none() {
+                        if lifecycle
+                            .test_decision
+                            .as_ref()
+                            .is_some_and(|decision| decision.approved)
+                        {
+                            let key = format!(
+                                "submit:{}:{}:{}",
+                                lifecycle.revision,
+                                lifecycle.head.as_deref().unwrap_or(""),
+                                lifecycle.review_round
+                            );
+                            self.notify_managed_forge(
+                                store,
+                                runtime,
+                                ticket,
+                                &key,
+                                "Testing is approved and lifecycle is at submit. Open or update the PR and record it with `openflows-harness pr opened`.",
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                    if lifecycle.pr_decision.is_some() {
+                        continue;
+                    }
+                    let namespace = pr_review_namespace(
+                        lifecycle.revision,
+                        lifecycle.head.as_deref().unwrap_or(""),
+                        lifecycle.review_round,
+                    );
+                    let prompt = format!(
+                        "PR review for ticket {}. Read `openflows-harness dispatch read`, `plan read`, and `status get`. Review the recorded PR against revision {} at head {}. Write review.md and run `openflows-harness review submit --verdict <approve|reject> --report review.md --revision {} --round {} --head {}`.",
+                        ticket.id,
+                        lifecycle.revision,
+                        lifecycle.head.as_deref().unwrap_or(""),
+                        lifecycle.revision,
+                        lifecycle.review_round,
+                        lifecycle.head.as_deref().unwrap_or(""),
+                    );
+                    self.ensure_managed_sentinel_review(
+                        store,
+                        runtime,
+                        ticket,
+                        &slots,
+                        &namespace,
+                        "pr_review",
+                        &prompt,
+                        &lifecycle,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn notify_managed_forge(
+        &self,
+        store: &SharedStore,
+        runtime: &crate::runtime_control::RuntimeControlClient,
+        ticket: &Ticket,
+        message_key: &str,
+        prompt: &str,
+    ) {
+        let Some(chat_id) = store
+            .get_typed::<String>(&full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "forge"))
+            .await
+        else {
+            return;
+        };
+        if let Err(error) = runtime
+            .send_chat_message(&chat_id, message_key, prompt)
+            .await
+        {
+            warn!(ticket_id=%ticket.id, chat_id, %error, "Could not notify managed Forge Chat");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_managed_sentinel_review(
+        &self,
+        store: &SharedStore,
+        runtime: &crate::runtime_control::RuntimeControlClient,
+        ticket: &Ticket,
+        slots_snapshot: &HashMap<String, WorkerSlot>,
+        namespace: &str,
+        review_type: &str,
+        prompt: &str,
+        lifecycle: &config::lifecycle::Lifecycle,
+    ) {
+        let chat_key = review_chat_key(&ticket.id, namespace);
+        if store.get(&chat_key).await.is_some() {
+            return;
+        }
+        let live_slots: HashMap<String, WorkerSlot> = store
+            .get_typed(KEY_WORKER_SLOTS)
+            .await
+            .unwrap_or_else(|| slots_snapshot.clone());
+        let forge_worker_id = match &ticket.status {
+            TicketStatus::Assigned { worker_id }
+            | TicketStatus::InProgress { worker_id }
+            | TicketStatus::Completed { worker_id, .. }
+                if worker_id != "nexus-reconciliation" =>
+            {
+                worker_id.clone()
+            }
+            _ => live_slots
+                .iter()
+                .find(|(id, slot)| {
+                    Self::worker_role(id) == "forge"
+                        && matches!(
+                            &slot.status,
+                            WorkerStatus::Assigned { ticket_id, .. }
+                                | WorkerStatus::Working { ticket_id, .. }
+                                if ticket_id == &ticket.id
+                        )
+                })
+                .map(|(id, _)| id.clone())
+                .unwrap_or_default(),
+        };
+        let Some((sentinel_worker_id, sentinel_slot)) =
+            Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots)
+        else {
+            info!(ticket_id=%ticket.id, "No Sentinel slot available for managed review");
+            return;
+        };
+        let workspace_id = match sentinel_slot.workspace_id {
+            Some(id) => match runtime.worker_status(&id).await {
+                Ok(status)
+                    if status.desired_state == "running"
+                        && status.observed_state == "running"
+                        && status.last_heartbeat_at.is_some() =>
+                {
+                    id
+                }
+                Ok(_) | Err(_) => return,
+            },
+            None => match self
+                .provision_coder_workspace(store, &sentinel_worker_id, &ticket.id)
+                .await
+            {
+                Ok(Some(id)) => id,
+                Ok(None) | Err(_) => return,
+            },
+        };
+
+        let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, "sentinel");
+        store
+            .set(
+                &dispatch_key,
+                json!({
+                    "ticket_id": ticket.id,
+                    "title": ticket.title,
+                    "body": ticket.body,
+                    "branch": ticket.branch,
+                    "review_type": review_type,
+                    "plan": lifecycle.plan,
+                    "revision": lifecycle.revision,
+                    "review_round": lifecycle.review_round,
+                    "head": lifecycle.head,
+                }),
+            )
+            .await;
+
+        match runtime.create_chat(&workspace_id, &ticket.id, prompt).await {
+            Ok(chat) => {
+                if !chat.created {
+                    let message_key = format!("sentinel:{namespace}");
+                    if let Err(error) = runtime
+                        .send_chat_message(&chat.chat_id, &message_key, prompt)
+                        .await
+                    {
+                        warn!(ticket_id=%ticket.id, %error, "Could not continue managed Sentinel review");
+                        return;
+                    }
+                }
+                let mut slots: HashMap<String, WorkerSlot> =
+                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                if let Some(slot) = slots.get_mut(&sentinel_worker_id) {
+                    slot.status = WorkerStatus::Assigned {
+                        ticket_id: ticket.id.clone(),
+                        issue_url: ticket.issue_url.clone(),
+                    };
+                    slot.workspace_id = Some(workspace_id);
+                }
+                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+                store.set(&chat_key, json!(chat.chat_id.clone())).await;
+                store
+                    .set(
+                        &format!("ticket:{}:sentinel_session", ticket.id),
+                        json!(chat.chat_id),
+                    )
+                    .await;
+                info!(ticket_id=%ticket.id, sentinel_worker_id, review_type, "Managed Sentinel review Chat ready");
+            }
+            Err(error) => {
+                warn!(ticket_id=%ticket.id, sentinel_worker_id, %error, "Managed Sentinel review Chat deferred");
+            }
+        }
+    }
+
     async fn check_ci_readiness(
         &self,
         store: &SharedStore,
@@ -3567,7 +4029,7 @@ Use `openflows-harness` for all coordination:
         });
     }
 
-    async fn recover_orphans(store: &SharedStore) -> Result<()> {
+    async fn recover_orphans(&self, store: &SharedStore) -> Result<()> {
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
@@ -3620,12 +4082,35 @@ Use `openflows-harness` for all coordination:
                             .ok()
                             .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
                     if ticket_done {
+                        let ticket_id = ticket_id.clone();
+                        if let Some(workspace_id) = slot.workspace_id.as_deref() {
+                            if let Err(error) =
+                                self.destroy_worker_workspace(store, workspace_id).await
+                            {
+                                warn!(
+                                    worker_id = slot.id,
+                                    %ticket_id,
+                                    %workspace_id,
+                                    %error,
+                                    "Failed to delete terminal worker workspace; keeping slot reserved"
+                                );
+                                continue;
+                            }
+                            store
+                                .del(&full_ticket_key(
+                                    &ticket_id,
+                                    KEY_TICKET_WORKSPACE,
+                                    Self::worker_role(&slot.id),
+                                ))
+                                .await;
+                        }
                         info!(
                             worker_id = slot.id,
                             ticket_id,
                             "Recovering stale worker — ticket completed, recycling to Idle"
                         );
                         slot.status = WorkerStatus::Idle;
+                        slot.workspace_id = None;
                         changed_slots = true;
                     }
                 }
@@ -3642,6 +4127,28 @@ Use `openflows-harness` for all coordination:
                             .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
 
                     if complete {
+                        let ticket_id = ticket_id.clone();
+                        if let Some(workspace_id) = slot.workspace_id.as_deref() {
+                            if let Err(error) =
+                                self.destroy_worker_workspace(store, workspace_id).await
+                            {
+                                warn!(
+                                    worker_id = slot.id,
+                                    %ticket_id,
+                                    %workspace_id,
+                                    %error,
+                                    "Failed to delete terminal worker workspace; keeping slot reserved"
+                                );
+                                continue;
+                            }
+                            store
+                                .del(&full_ticket_key(
+                                    &ticket_id,
+                                    KEY_TICKET_WORKSPACE,
+                                    Self::worker_role(&slot.id),
+                                ))
+                                .await;
+                        }
                         info!(
                             worker_id = slot.id,
                             ticket_id,
@@ -3657,12 +4164,35 @@ Use `openflows-harness` for all coordination:
                         .iter()
                         .any(|t| t.id == *ticket_id && matches!(t.status, TicketStatus::Open));
                     if ticket_open {
+                        let ticket_id = ticket_id.clone();
+                        if let Some(workspace_id) = slot.workspace_id.as_deref() {
+                            if let Err(error) =
+                                self.destroy_worker_workspace(store, workspace_id).await
+                            {
+                                warn!(
+                                    worker_id = slot.id,
+                                    %ticket_id,
+                                    %workspace_id,
+                                    %error,
+                                    "Failed to delete reset worker workspace; keeping slot reserved"
+                                );
+                                continue;
+                            }
+                            store
+                                .del(&full_ticket_key(
+                                    &ticket_id,
+                                    KEY_TICKET_WORKSPACE,
+                                    Self::worker_role(&slot.id),
+                                ))
+                                .await;
+                        }
                         info!(
                             worker_id = slot.id,
                             ticket_id,
                             "Recovering stale worker — ticket reset to Open, recycling to Idle"
                         );
                         slot.status = WorkerStatus::Idle;
+                        slot.workspace_id = None;
                         changed_slots = true;
                     }
                 }
@@ -3680,48 +4210,39 @@ Use `openflows-harness` for all coordination:
         }
 
         // Retry deleting any lingering workspaces for terminal tickets whose deletion failed
-        if let Some(client) = Self::coder_client_from_store(store).await {
-            for ticket in &tickets {
-                if ticket.status.is_terminal()
-                    || store
-                        .lifecycle(&ticket.id)
-                        .await
-                        .ok()
-                        .is_some_and(|s| s.phase == config::lifecycle::Phase::Done)
-                {
-                    for role in ["forge", "sentinel"] {
-                        let ws_key = full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, role);
-                        if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
-                            // Archive all chats associated with this workspace before deletion
-                            if let Ok(chats) = client.list_chats().await {
-                                for chat in chats.iter().filter(|c| c.workspace_id == ws_id) {
-                                    let _ = client.archive_chat(&chat.id).await;
+        for ticket in &tickets {
+            if ticket.status.is_terminal()
+                || store
+                    .lifecycle(&ticket.id)
+                    .await
+                    .ok()
+                    .is_some_and(|s| s.phase == config::lifecycle::Phase::Done)
+            {
+                for role in ["forge", "sentinel"] {
+                    let ws_key = full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, role);
+                    if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                        match self.destroy_worker_workspace(store, &ws_id).await {
+                            Ok(()) => {
+                                info!(
+                                    ticket_id = %ticket.id,
+                                    role,
+                                    workspace_id = %ws_id,
+                                    "Recovered and deleted lingering workspace for terminal ticket"
+                                );
+                                if store.get_typed::<String>(&ws_key).await.as_deref()
+                                    == Some(&ws_id)
+                                {
+                                    store.del(&ws_key).await;
                                 }
                             }
-
-                            match client.delete_workspace(&ws_id).await {
-                                Ok(_) => {
-                                    info!(
-                                        ticket_id = %ticket.id,
-                                        role,
-                                        workspace_id = %ws_id,
-                                        "Recovered and deleted lingering workspace for terminal ticket"
-                                    );
-                                    if store.get_typed::<String>(&ws_key).await.as_deref()
-                                        == Some(&ws_id)
-                                    {
-                                        store.del(&ws_key).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        ticket_id = %ticket.id,
-                                        role,
-                                        workspace_id = %ws_id,
-                                        error = %e,
-                                        "Failed to delete lingering workspace during orphan recovery; will retry"
-                                    );
-                                }
+                            Err(e) => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    role,
+                                    workspace_id = %ws_id,
+                                    error = %e,
+                                    "Failed to delete lingering workspace during orphan recovery; will retry"
+                                );
                             }
                         }
                     }
@@ -4223,29 +4744,43 @@ Use `openflows-harness` for all coordination:
     /// Return a worker slot to Idle and detach (best-effort destroy) any
     /// workspace still associated with it.
     async fn release_worker_slot(&self, store: &SharedStore, worker_id: &str) {
-        let mut slots: HashMap<String, WorkerSlot> =
+        let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        let Some(slot) = slots.get_mut(worker_id) else {
+        let Some(slot) = slots.get(worker_id) else {
             return;
         };
         if matches!(slot.status, WorkerStatus::Idle) && slot.workspace_id.is_none() {
             return;
         }
-        let workspace_id = slot.workspace_id.take();
-        slot.status = WorkerStatus::Idle;
-        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
-        info!(worker_id, workspace_id = ?workspace_id, "Released worker slot back to Idle");
-
-        if let Some(workspace_id) = workspace_id {
-            if let Err(e) = self.destroy_coder_workspace(store, &workspace_id).await {
+        let workspace_id = slot.workspace_id.clone();
+        if let Some(workspace_id) = workspace_id.as_deref() {
+            if let Err(e) = self.destroy_worker_workspace(store, workspace_id).await {
                 warn!(
                     worker_id,
                     workspace_id = %workspace_id,
                     error = %e,
                     "Failed to destroy workspace while releasing worker slot"
                 );
+                return;
             }
         }
+
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        if let Some(slot) = slots.get_mut(worker_id) {
+            // Do not erase a replacement workspace assigned while deletion was
+            // in flight. Direct Coder cleanup has already cleared the old id,
+            // while Manager cleanup leaves it in place until we commit this
+            // slot transition.
+            if slot.workspace_id == workspace_id
+                || (workspace_id.is_some() && slot.workspace_id.is_none())
+            {
+                slot.workspace_id = None;
+                slot.status = WorkerStatus::Idle;
+            }
+        }
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+        info!(worker_id, workspace_id = ?workspace_id, "Released worker slot back to Idle");
     }
 
     async fn reset_recovery_attempts(&self, store: &SharedStore, ticket_id: &str) {
@@ -4804,33 +5339,32 @@ impl Node for NexusNode {
 
         let has_assignable = tickets.iter().any(|t| t.is_assignable());
 
-        let mut worker_slots: HashMap<String, WorkerSlot> =
+        let worker_slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
-        let mut recycled = false;
         if has_assignable {
-            for slot in worker_slots.values_mut() {
-                let is_done = matches!(slot.status, WorkerStatus::Done { .. });
-                let is_terminal = match &slot.status {
-                    WorkerStatus::Assigned { ticket_id, .. }
-                    | WorkerStatus::Working { ticket_id, .. } => tickets
-                        .iter()
-                        .any(|t| t.id == *ticket_id && t.status.is_terminal()),
-                    _ => false,
-                };
-                if is_done || is_terminal {
-                    info!(
-                        worker_id = slot.id,
-                        "Recycling worker to Idle — assignable tickets exist and worker is Done or ticket is terminal"
-                    );
-                    slot.status = WorkerStatus::Idle;
-                    slot.workspace_id = None;
-                    recycled = true;
-                }
+            let recycle: Vec<String> = worker_slots
+                .values()
+                .filter(|slot| {
+                    let is_done = matches!(slot.status, WorkerStatus::Done { .. });
+                    let is_terminal = match &slot.status {
+                        WorkerStatus::Assigned { ticket_id, .. }
+                        | WorkerStatus::Working { ticket_id, .. } => tickets
+                            .iter()
+                            .any(|t| t.id == *ticket_id && t.status.is_terminal()),
+                        _ => false,
+                    };
+                    is_done || is_terminal
+                })
+                .map(|slot| slot.id.clone())
+                .collect();
+            for worker_id in recycle {
+                info!(
+                    worker_id,
+                    "Recycling worker to Idle — assignable tickets exist and worker is Done or ticket is terminal"
+                );
+                self.release_worker_slot(store, &worker_id).await;
             }
-        }
-        if recycled {
-            store.set(KEY_WORKER_SLOTS, json!(worker_slots)).await;
         }
 
         let pending_prs_snapshot = store.get(KEY_PENDING_PRS).await.unwrap_or(json!([]));
@@ -5454,7 +5988,7 @@ impl Node for NexusNode {
         // while the flow is stuck routing to `sentinel_spawned`; if recycling only
         // ran on `work_assigned` it would never run in that state and the stale
         // binding would churn forever, starving idle forge slots of paired sentinels.
-        Self::recover_orphans(store).await?;
+        self.recover_orphans(store).await?;
 
         if decision.action == ACTION_MERGE_PRS {
             store.set(KEY_NO_WORK_COUNT, json!(0)).await;
@@ -6263,6 +6797,254 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_plan_approval_wakes_forge_after_atomic_phase_transition() {
+        let mut server = mockito::Server::new_async().await;
+        let notify = server
+            .mock("POST", "/api/v1/runtime/chats/forge-chat/messages")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "message_key":"plan-approved:1:1"
+            })))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set(KEY_WORKER_SLOTS, json!({})).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-003", "title":"Validate notebooks", "body":"CI",
+            "priority":0, "branch":"main",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        let state = config::lifecycle::Lifecycle {
+            phase: config::lifecycle::Phase::Building,
+            revision: 1,
+            review_round: 1,
+            version: 3,
+            plan: "# Plan".into(),
+            plan_decision: Some(config::lifecycle::Decision {
+                pr_number: None,
+                round: 1,
+                actor: "sentinel".into(),
+                approved: true,
+                report: "approved".into(),
+                revision: 1,
+                head: None,
+            }),
+            ..Default::default()
+        };
+        store
+            .set(
+                &full_ticket_key_flat("T-003", KEY_TICKET_STATUS),
+                json!(state),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key("T-003", KEY_TICKET_CHAT, "forge"),
+                json!("forge-chat"),
+            )
+            .await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+        node.poll_harness_status_and_spawn_agents(&store, &[ticket])
+            .await;
+        notify.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn hosted_blocked_ticket_notifies_forge_with_versioned_recovery_key() {
+        let mut server = mockito::Server::new_async().await;
+        let notify = server
+            .mock("POST", "/api/v1/runtime/chats/forge-chat/messages")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "message_key":"blocked:7"
+            })))
+            .match_body(mockito::Matcher::Regex(
+                "credential permission.*status set planning".into(),
+            ))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set(KEY_WORKER_SLOTS, json!({})).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-003", "title":"Update CI", "body":"CI",
+            "priority":0, "branch":"main",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        let state = config::lifecycle::Lifecycle {
+            phase: config::lifecycle::Phase::Blocked,
+            version: 7,
+            feedback: Some("credential permission is missing".into()),
+            ..Default::default()
+        };
+        store
+            .set(
+                &full_ticket_key_flat("T-003", KEY_TICKET_STATUS),
+                json!(state),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key("T-003", KEY_TICKET_CHAT, "forge"),
+                json!("forge-chat"),
+            )
+            .await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+        node.poll_harness_status_and_spawn_agents(&store, &[ticket])
+            .await;
+        notify.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn managed_existing_chat_receives_and_consumes_rework_directive() {
+        let mut server = mockito::Server::new_async().await;
+        let directive = "/address_review pr: 454\nFix the remaining findings.";
+        let prompt = NexusNode::rework_prompt("T-454", directive);
+        let create = server
+            .mock("POST", "/api/v1/runtime/chats")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "workspace_id":"managed-workspace",
+                "ticket_id":"T-454",
+                "prompt":prompt,
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"chat_id":"forge-chat","workspace_id":"managed-workspace","created":false}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let message = server
+            .mock("POST", "/api/v1/runtime/chats/forge-chat/messages")
+            .match_body(mockito::Matcher::Json(json!({
+                "message_key":NexusNode::managed_rework_message_key("T-454", directive),
+                "prompt":NexusNode::rework_prompt("T-454", directive),
+            })))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-454", "title":"Address review", "body":"Review feedback",
+            "priority":0, "branch":"codex/fix",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": WorkerSlot {
+                        id: "forge-1".into(),
+                        status: WorkerStatus::Assigned {
+                            ticket_id: ticket.id.clone(),
+                            issue_url: None,
+                        },
+                        workspace_id: Some("managed-workspace".into()),
+                    }
+                }),
+            )
+            .await;
+        let rework_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DIRECTIVE, "forge");
+        store.set(&rework_key, json!(directive)).await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+
+        node.create_managed_chat_for_assignment(
+            &store,
+            node.runtime_control.as_ref().unwrap(),
+            "forge-1",
+            &ticket,
+        )
+        .await
+        .unwrap();
+
+        create.assert_async().await;
+        message.assert_async().await;
+        assert!(store.get(&rework_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_rework_directive_survives_failed_delivery() {
+        let mut server = mockito::Server::new_async().await;
+        let directive = "/ci_fix pr: 454\nRepair CI.";
+        let create = server
+            .mock("POST", "/api/v1/runtime/chats")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"chat_id":"forge-chat","workspace_id":"managed-workspace","created":false}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let message = server
+            .mock("POST", "/api/v1/runtime/chats/forge-chat/messages")
+            .with_status(503)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-454", "title":"Fix CI", "body":"CI feedback",
+            "priority":0, "branch":"codex/fix",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": WorkerSlot {
+                        id: "forge-1".into(),
+                        status: WorkerStatus::Assigned {
+                            ticket_id: ticket.id.clone(),
+                            issue_url: None,
+                        },
+                        workspace_id: Some("managed-workspace".into()),
+                    }
+                }),
+            )
+            .await;
+        let rework_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DIRECTIVE, "forge");
+        store.set(&rework_key, json!(directive)).await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+
+        assert!(node
+            .create_managed_chat_for_assignment(
+                &store,
+                node.runtime_control.as_ref().unwrap(),
+                "forge-1",
+                &ticket,
+            )
+            .await
+            .is_err());
+
+        create.assert_async().await;
+        message.assert_async().await;
+        assert_eq!(
+            store.get_typed::<String>(&rework_key).await.as_deref(),
+            Some(directive)
+        );
+    }
+
+    #[tokio::test]
     async fn approved_building_notifies_forge_once_without_requesting_a_transition() {
         let mut server = mockito::Server::new_async().await;
         let notify = server
@@ -6984,7 +7766,10 @@ mod tests {
         );
         store.set(KEY_WORKER_SLOTS, json!(slots)).await;
 
-        NexusNode::recover_orphans(&store).await.unwrap();
+        NexusNode::new("missing-persona", "missing-registry")
+            .recover_orphans(&store)
+            .await
+            .unwrap();
 
         let updated_slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
@@ -7002,6 +7787,68 @@ mod tests {
             "Sentinel slot must be recycled to Idle when ticket is Merged"
         );
         assert_eq!(sentinel_slot.workspace_id, None);
+    }
+
+    #[tokio::test]
+    async fn managed_terminal_worker_is_deleted_through_manager_before_slot_release() {
+        let mut server = mockito::Server::new_async().await;
+        let deletion = server
+            .mock("DELETE", "/api/v1/runtime/workspaces/managed-workspace")
+            .match_header("authorization", "Bearer test-access")
+            .match_header("idempotency-key", "runtime-delete:managed-workspace")
+            .with_status(202)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        let ticket = Ticket {
+            id: "T-006".to_string(),
+            title: "Task 6".to_string(),
+            body: "Body".to_string(),
+            priority: 1,
+            branch: Some("forge-1/T-006".to_string()),
+            status: TicketStatus::Merged {
+                pr_number: 7,
+                worker_id: "forge-1".to_string(),
+            },
+            issue_url: None,
+            attempts: 0,
+        };
+        store.set(KEY_TICKETS, json!([ticket])).await;
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": WorkerSlot {
+                        id: "forge-1".to_string(),
+                        status: WorkerStatus::Assigned {
+                            ticket_id: "T-006".to_string(),
+                            issue_url: None,
+                        },
+                        workspace_id: Some("managed-workspace".to_string()),
+                    }
+                }),
+            )
+            .await;
+        let workspace_key = full_ticket_key("T-006", KEY_TICKET_WORKSPACE, "forge");
+        store.set(&workspace_key, json!("managed-workspace")).await;
+        let request_key = NexusNode::managed_worker_request_key("forge-1", "T-006");
+        store.set(&request_key, json!("original-attempt")).await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            crate::runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+
+        node.recover_orphans(&store).await.unwrap();
+
+        deletion.assert_async().await;
+        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        assert!(matches!(slots["forge-1"].status, WorkerStatus::Idle));
+        assert!(slots["forge-1"].workspace_id.is_none());
+        assert!(store.get(&workspace_key).await.is_none());
+        assert!(
+            store.get(&request_key).await.is_none(),
+            "replacement workspace must receive a fresh idempotency key"
+        );
     }
 
     #[tokio::test]
@@ -7037,7 +7884,10 @@ mod tests {
         );
         store.set(KEY_WORKER_SLOTS, json!(slots)).await;
 
-        NexusNode::recover_orphans(&store).await.unwrap();
+        NexusNode::new("missing-persona", "missing-registry")
+            .recover_orphans(&store)
+            .await
+            .unwrap();
 
         let updated_slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap();

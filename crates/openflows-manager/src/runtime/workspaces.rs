@@ -29,6 +29,11 @@ type WorkspaceStatusRow = (
     Option<chrono::DateTime<chrono::Utc>>,
 );
 
+pub(crate) fn deletion_started(desired_state: &str, observed_state: &str) -> bool {
+    matches!(desired_state, "deleting" | "deleted")
+        || matches!(observed_state, "deleting" | "deleted")
+}
+
 /// Worker roles a Nexus controller may request. Nexus itself is never a
 /// worker role a runtime can request.
 pub const WORKER_ROLES: &[&str] = &["forge", "sentinel", "vessel", "lore"];
@@ -89,6 +94,7 @@ impl RuntimeWorkspaceService {
     /// and the slot must be free. Worker capacity is reserved against the
     /// tenant's fleet ceiling transactionally. Returns 202 with a durable
     /// operation reference.
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_worker(
         &self,
         scope: &RuntimeScope,
@@ -225,8 +231,11 @@ impl RuntimeWorkspaceService {
     pub async fn heartbeat(&self, scope: &RuntimeScope) -> Result<HeartbeatResponse, ManagerError> {
         let affected = sqlx::query(
             "UPDATE workspaces SET observed_state = 'running',
+                    registered_at = COALESCE(registered_at, clock_timestamp()),
                     last_heartbeat_at = clock_timestamp(), updated_at = now()
-              WHERE id = $1 AND organization_id = $2 AND tenant_id = $3",
+              WHERE id = $1 AND organization_id = $2 AND tenant_id = $3
+                AND desired_state NOT IN ('deleting', 'deleted')
+                AND observed_state NOT IN ('deleting', 'deleted')",
         )
         .bind(scope.workspace_id.0)
         .bind(scope.organization_id.0)
@@ -319,8 +328,8 @@ impl RuntimeWorkspaceService {
             });
         }
         let mut tx = self.pool.begin().await?;
-        let role: String = sqlx::query_scalar(
-            "SELECT role FROM workspaces
+        let (role, desired_state, observed_state): (String, String, String) = sqlx::query_as(
+            "SELECT role, desired_state, observed_state FROM workspaces
               WHERE id = $1 AND organization_id = $2 AND tenant_id = $3 FOR UPDATE",
         )
         .bind(workspace_id.0)
@@ -333,6 +342,11 @@ impl RuntimeWorkspaceService {
             return Err(ManagerError::api(
                 "INVALID_INPUT",
                 "Nexus cannot delete or stop itself through the worker API",
+            ));
+        }
+        if deletion_started(&desired_state, &observed_state) {
+            return Err(ManagerError::Conflict(
+                "workspace is being deleted or has already been deleted".into(),
             ));
         }
         let desired = if delete { "deleting" } else { "stopped" };
@@ -368,4 +382,17 @@ impl RuntimeWorkspaceService {
 pub fn parse_workspace_id(s: &str) -> Result<WorkspaceId, ManagerError> {
     s.parse::<WorkspaceId>()
         .map_err(|_| ManagerError::not_found("workspace"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deletion_started;
+
+    #[test]
+    fn deleting_or_deleted_state_is_terminal_for_worker_mutations() {
+        assert!(deletion_started("deleting", "running"));
+        assert!(deletion_started("deleted", "deleted"));
+        assert!(deletion_started("stopped", "deleted"));
+        assert!(!deletion_started("stopped", "running"));
+    }
 }

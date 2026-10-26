@@ -190,19 +190,25 @@ resource "coder_agent" "main" {
     # GitHub App token). PAT flow removed — external auth is the sole source.
     mkdir -p /home/coder/.local/state/openflows
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      test -r "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" || { log "FATAL: runtime secret is not mounted"; exit 1; }
-      eval "$(python3 - "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" <<'PY'
+      RUNTIME_CREDENTIAL_COPY=$(mktemp)
+      chmod 600 "$RUNTIME_CREDENTIAL_COPY"
+      if ! sudo cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY"; then
+        rm -f "$RUNTIME_CREDENTIAL_COPY"
+        log "FATAL: runtime secret is not mounted"
+        exit 1
+      fi
+      eval "$(python3 - "$RUNTIME_CREDENTIAL_COPY" <<'PY'
 import json, shlex, sys
 d=json.load(open(sys.argv[1]))
 for env,key in [('OF_MANAGER_URL','manager_url'),('OF_BOOTSTRAP','bootstrap_token'),('REDIS_URL','redis_url'),('OPENFLOWS_TENANT','redis_namespace')]: print('export %s=%s' % (env,shlex.quote(str(d[key]))))
 PY
 )"
+      rm -f "$RUNTIME_CREDENTIAL_COPY"
       SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register")
       OF_RUNTIME_ACCESS_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["access_token"])' "$SESSION")
       export OF_RUNTIME_ACCESS_TOKEN
       OF_RUNTIME_REFRESH_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["refresh_token"])' "$SESSION")
       export OF_RUNTIME_REFRESH_TOKEN
-      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
       GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
       GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
     else
@@ -239,9 +245,9 @@ PY
       cd /home/coder/workspace
       git fetch --all --prune 2>/dev/null || true
       git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
-    elif [ -n "${var.repo_url}" ]; then
+    elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
       log "WARNING: no golden repo seed at $GOLDEN_REPO — falling back to direct clone"
-      if sudo git clone ${var.repo_url} /home/coder/workspace 2>/tmp/sentinel_clone_err.log; then
+      if sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/sentinel_clone_err.log; then
         sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
         log "Cloned repository into /home/coder/workspace"
       else
@@ -308,10 +314,24 @@ PY
     # authenticating mid-task. Runs in the background for the workspace
     # lifetime; harmless when the Manager is unreachable.
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      rm -f /tmp/openflows-manager-ready
       nohup bash -c '
+        ACCESS="$${OF_RUNTIME_ACCESS_TOKEN}"
         REFRESH="$${OF_RUNTIME_REFRESH_TOKEN}"
+        TICKS=0
         while true; do
-          sleep 480
+          sleep 30
+          if [ ! -f /tmp/openflows-manager-ready ]; then continue; fi
+          TICKS=$((TICKS + 1))
+          HEARTBEAT_STATUS=$(curl -s -o /dev/null -w "%%{http_code}" -X POST -H "Authorization: Bearer $${ACCESS}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat")
+          if [ "$${HEARTBEAT_STATUS}" = "401" ]; then
+            RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
+            ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
+            REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
+            curl -fsS -X POST -H "Authorization: Bearer $${ACCESS}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null || true
+          fi
+          if [ "$TICKS" -lt 16 ]; then continue; fi
+          TICKS=0
           RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
           ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
           REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
@@ -324,6 +344,45 @@ PY
       ' >>/home/coder/.local/state/openflows/git-refresh.log 2>&1 &
     fi
 
+    if [ ! -d /home/coder/workspace/.git ]; then
+      log "FATAL: repository bootstrap did not produce /home/coder/workspace/.git"
+      exit 1
+    fi
+
+    INSTRUCTION_ROOT="/home/coder/.openflows/artifacts/orchestration"
+    PERSONA="$INSTRUCTION_ROOT/agent/agents/sentinel.agent.md"
+    if [ ! -f "$PERSONA" ]; then
+      log "FATAL: hosted instruction bundle is missing $PERSONA"
+      exit 1
+    fi
+    sudo cp "$PERSONA" /home/coder/workspace/AGENTS.md
+    sudo cp "$PERSONA" /home/coder/workspace/sentinel.agent.md
+    sudo mkdir -p /home/coder/workspace/.agents/skills /home/coder/workspace/.agents/commands
+    SKILL_MANIFEST="$INSTRUCTION_ROOT/agent/roles/sentinel.skills"
+    if [ ! -f "$SKILL_MANIFEST" ]; then
+      log "FATAL: hosted skill manifest is missing $SKILL_MANIFEST"
+      exit 1
+    fi
+    while IFS= read -r skill; do
+      [ -z "$skill" ] && continue
+      sudo mkdir -p "/home/coder/workspace/.agents/skills/$skill"
+      sudo cp "$INSTRUCTION_ROOT/plugin/skills/$skill/SKILL.md" "/home/coder/workspace/.agents/skills/$skill/SKILL.md"
+    done < "$SKILL_MANIFEST"
+    sudo cp -a "$INSTRUCTION_ROOT/plugin/commands/." /home/coder/workspace/.agents/commands/
+    for standard in CODING.md SECURITY.md REVIEW.md; do
+      [ ! -f "$INSTRUCTION_ROOT/agent/standards/$standard" ] || sudo cp "$INSTRUCTION_ROOT/agent/standards/$standard" /home/coder/workspace/
+    done
+    sudo chown -R coder:coder /home/coder/workspace
+    EXCLUDE=$(git -C /home/coder/workspace rev-parse --absolute-git-dir)/info/exclude
+    sudo mkdir -p "$(dirname "$EXCLUDE")"
+    sudo touch "$EXCLUDE"
+    for pattern in /AGENTS.md /sentinel.agent.md '/.agents/skills/' '/.agents/commands/' /CODING.md /SECURITY.md /REVIEW.md; do
+      sudo grep -qxF -- "$pattern" "$EXCLUDE" || printf '\n%s\n' "$pattern" | sudo tee -a "$EXCLUDE" >/dev/null
+    done
+    log "Installed hosted instructions for sentinel"
+
+    # Start heartbeat only after repository bootstrap completes. Manager uses
+    # this as the readiness boundary before creating a reviewer Chat.
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
     # Use the BASE role so the controller can find the heartbeat under the
     # base-role key (not the worker id — sentinel always matches base role).
@@ -336,6 +395,11 @@ PY
     export A2A_RELAY_ADDR="${data.coder_parameter.a2a_relay_addr.value}"
     export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
+      log "Manager readiness heartbeat sent after bootstrap"
+      touch /tmp/openflows-manager-ready
+    fi
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
   EOT
 }
@@ -345,6 +409,7 @@ resource "docker_volume" "workspace" {
 }
 
 resource "docker_container" "workspace" {
+  count = data.coder_workspace.me.start_count
   name  = "openflows-${var.role}-${data.coder_workspace.me.id}"
   image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.

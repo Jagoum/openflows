@@ -149,6 +149,17 @@ pub trait CoderAdapter: Send + Sync {
         ))
     }
 
+    /// Report a terminal Coder agent startup error so the Manager does not
+    /// leave the tenant start operation queued indefinitely for a heartbeat
+    /// that the failed startup script cannot send.
+    async fn workspace_startup_failed(
+        &self,
+        _org: &CoderOrganizationId,
+        _workspace_id: &str,
+    ) -> Result<bool, ManagerError> {
+        Ok(false)
+    }
+
     async fn delete_workspace(
         &self,
         _org: &CoderOrganizationId,
@@ -773,6 +784,22 @@ impl CoderAdapter for RealCoderAdapter {
             }
             tokio::time::sleep(IMPORT_POLL_INTERVAL).await;
         }
+    }
+
+    async fn workspace_startup_failed(
+        &self,
+        _org: &CoderOrganizationId,
+        workspace_id: &str,
+    ) -> Result<bool, ManagerError> {
+        let workspace = self
+            .client
+            .get_workspace(workspace_id)
+            .await
+            .map_err(ManagerError::from)?;
+        Ok(matches!(
+            workspace.workspace_status(),
+            coder_client::types::WorkspaceStatus::Failed
+        ) || matches!(workspace.agent_lifecycle_state(), coder_client::types::AgentLifecycleState::Unknown(ref state) if state == "start_error"))
     }
 
     async fn delete_workspace(

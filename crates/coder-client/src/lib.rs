@@ -1624,21 +1624,14 @@ impl CoderClient {
 
     /// Start a stopped workspace.
     pub async fn start_workspace(&self, id: &str) -> Result<CoderWorkspace> {
-        let resp = self
-            .authenticated_request(
-                reqwest::Method::POST,
-                &format!("/api/v2/workspaces/{}/start", id),
-            )
-            .send()
-            .await
-            .context("Failed to start workspace")?;
-
-        if resp.status().is_success() {
-            info!(workspace_id = id, "Started workspace");
-            Ok(resp.json().await?)
-        } else {
-            bail!("Failed to start workspace: {}", resp.status())
+        let status = self.wait_workspace_build_terminal(id).await?;
+        if matches!(status.as_str(), "deleted" | "deleting") {
+            bail!("Cannot start a deleted workspace");
         }
+        if status != "running" {
+            self.submit_workspace_transition(id, "start").await?;
+        }
+        self.get_workspace(id).await
     }
 
     /// Restart through a stop build followed by a start build. A start-only
@@ -1706,29 +1699,16 @@ impl CoderClient {
 
     /// Stop a running workspace.
     pub async fn stop_workspace(&self, id: &str) -> Result<()> {
-        let resp = self
-            .authenticated_request(
-                reqwest::Method::POST,
-                &format!("/api/v2/workspaces/{}/stop", id),
-            )
-            .send()
-            .await
-            .context("Failed to stop workspace")?;
-
-        if resp.status().is_success()
-            || resp.status() == reqwest::StatusCode::NOT_FOUND
-            || resp.status() == reqwest::StatusCode::GONE
-        {
-            info!(
-                workspace_id = id,
-                status = %resp.status(),
-                "Stopped workspace"
-            );
-            Ok(())
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Failed to stop workspace: {}", body)
+        let status = self.wait_workspace_build_terminal(id).await?;
+        if matches!(status.as_str(), "stopped" | "deleted") {
+            return Ok(());
         }
+        self.submit_workspace_transition(id, "stop").await?;
+        let status = self.wait_workspace_build_terminal(id).await?;
+        if status != "stopped" {
+            bail!("Workspace stop did not succeed: {}", status);
+        }
+        Ok(())
     }
 
     /// Delete a workspace by triggering a delete build and waiting for deletion to complete.
@@ -2482,7 +2462,7 @@ impl CoderClient {
 
         if resp.status().is_success() {
             let body: serde_json::Value = resp.json().await?;
-            let messages = body
+            let mut messages: Vec<crate::types::ChatMessage> = body
                 .get("messages")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
@@ -2491,6 +2471,17 @@ impl CoderClient {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Queued follow-ups are accepted deliveries too. Include them so
+            // callers can reconcile an uncertain POST response before retrying
+            // and avoid scheduling the same agent turn twice.
+            if let Some(queued) = body.get("queued_messages").and_then(|v| v.as_array()) {
+                messages.extend(queued.iter().filter_map(|value| {
+                    let mut message: crate::types::ChatMessage =
+                        serde_json::from_value(value.clone()).ok()?;
+                    message.role = "user".into();
+                    Some(message)
+                }));
+            }
             Ok(messages)
         } else {
             let status = resp.status();
@@ -2970,10 +2961,20 @@ mod http_mock {
                     ("200 OK", serde_json::json!({"id":"ws-delete-me", "status":state, "latest_build":{"status":build_state, "transition": if submitted { "delete" } else { "start" }}}).to_string())
                 } else if path == "/api/v2/workspaces/ws-restart" {
                     let requests = requests.lock().await;
-                    let stopped = requests.iter().any(|r| {
-                        r.method == "POST" && r.path == "/api/v2/workspaces/ws-restart/builds"
-                    });
-                    let state = if stopped { "stopped" } else { "running" };
+                    let transition = requests
+                        .iter()
+                        .rev()
+                        .find(|r| {
+                            r.method == "POST" && r.path == "/api/v2/workspaces/ws-restart/builds"
+                        })
+                        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok());
+                    let state = if transition.as_ref().and_then(|v| v["transition"].as_str())
+                        == Some("stop")
+                    {
+                        "stopped"
+                    } else {
+                        "running"
+                    };
                     (
                         "200 OK",
                         serde_json::json!({"id":"ws-restart", "latest_build":{"status":state}})
@@ -3034,6 +3035,10 @@ mod http_mock {
             ),
             ("POST", "/api/v2/chats/rejected/messages") => (
                 "403 Forbidden", r#"{"message":"chat access denied"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/chats/history/messages?limit=200") => (
+                "200 OK",
+                r#"{"messages":[{"id":44,"chat_id":"history","role":"assistant","content":[{"type":"text","text":"working"}]}],"queued_messages":[{"id":45,"chat_id":"history","content":[{"type":"text","text":"follow-up marker"}]}]}"#.to_string(),
             ),
             ("POST", "/api/v2/files") => (
                 "201 Created",
@@ -3188,6 +3193,18 @@ mod tests {
             .to_string();
         assert!(error.contains("403"));
         assert!(error.contains("chat access denied"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn chat_history_includes_queued_messages_for_delivery_reconciliation() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        let messages = client.get_chat_messages("history", 200).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].id, "45");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content_raw[0]["text"], "follow-up marker");
         server.shutdown().await;
     }
 
@@ -3483,6 +3500,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_uses_builds_and_retries_do_not_restart_running_workspaces() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        client.stop_workspace("ws-restart").await.unwrap();
+        client.stop_workspace("ws-restart").await.unwrap();
+        client.start_workspace("ws-restart").await.unwrap();
+        client.start_workspace("ws-restart").await.unwrap();
+        let requests = server.requests().await;
+        let mutations: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+        assert_eq!(mutations.len(), 2);
+        assert!(mutations.iter().all(|r| r.path.ends_with("/builds")));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&mutations[0].body).unwrap()["transition"],
+            "stop"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&mutations[1].body).unwrap()["transition"],
+            "start"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn restart_workspace_stops_before_starting() {
         let server = super::http_mock::HttpMock::new().await.unwrap();
         let client = crate::CoderClient::new(&server.url(), "test-token");
@@ -3603,5 +3643,62 @@ mod tests {
         assert_eq!(coder.status, reqwest::StatusCode::FORBIDDEN);
         assert!(!err.to_string().contains("operator credential expired"));
         server.shutdown().await;
+    }
+
+    #[test]
+    fn every_worker_signals_manager_readiness_only_after_bootstrap() {
+        let templates = [
+            (
+                "forge",
+                include_str!("../templates/openflows-forge/main.tf"),
+            ),
+            (
+                "sentinel",
+                include_str!("../templates/openflows-sentinel/main.tf"),
+            ),
+            (
+                "vessel",
+                include_str!("../templates/openflows-vessel/main.tf"),
+            ),
+            ("lore", include_str!("../templates/openflows-lore/main.tf")),
+        ];
+        for (role, template) in templates {
+            let repo_ready = template
+                .find("repository bootstrap did not produce")
+                .unwrap_or_else(|| panic!("{role} does not verify repository bootstrap"));
+            let instructions_ready = template
+                .find("Installed hosted instructions")
+                .unwrap_or_else(|| panic!("{role} does not install hosted instructions"));
+            let heartbeat = template
+                .find("Manager readiness heartbeat sent after bootstrap")
+                .unwrap_or_else(|| panic!("{role} does not signal Manager readiness"));
+            assert!(
+                repo_ready < instructions_ready,
+                "{role} installs instructions before repository bootstrap"
+            );
+            assert!(
+                instructions_ready < heartbeat,
+                "{role} signals readiness before instructions are installed"
+            );
+            let periodic_ready = template
+                .find("touch /tmp/openflows-manager-ready")
+                .unwrap_or_else(|| panic!("{role} does not enable periodic heartbeats"));
+            assert!(
+                heartbeat < periodic_ready,
+                "{role} enables periodic heartbeats before readiness"
+            );
+            assert!(
+                template.contains("if [ ! -f /tmp/openflows-manager-ready ]; then continue; fi"),
+                "{role} can report periodic liveness before readiness"
+            );
+            assert!(
+                template.matches("/api/v1/runtime/heartbeat").count() >= 2,
+                "{role} does not maintain Manager liveness after readiness"
+            );
+            assert!(
+                template.contains("-w \"%%{http_code}\""),
+                "{role} must escape curl's HTTP status format in Terraform strings"
+            );
+        }
     }
 }

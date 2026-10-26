@@ -218,6 +218,39 @@ pub struct CreateRuntimeChatRequest {
     pub prompt: String,
 }
 
+#[derive(Deserialize)]
+pub struct SendRuntimeChatMessageRequest {
+    pub message_key: String,
+    pub prompt: String,
+}
+
+fn chat_delivery_marker(chat: &str, message_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(format!("{chat}\0{message_key}").as_bytes());
+    format!("<!-- openflows-delivery:{digest:x} -->")
+}
+
+fn chat_message_contains_marker(message: &coder_client::types::ChatMessage, marker: &str) -> bool {
+    message.content_raw.as_array().is_some_and(|parts| {
+        parts.iter().any(|part| {
+            part.get("text")
+                .or_else(|| part.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains(marker))
+        })
+    })
+}
+
+type RuntimeChatWorkspaceRow = (
+    Option<String>,
+    Option<String>,
+    Option<uuid::Uuid>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
 /// Nexus asks Manager to create a Chat owned by the tenant creator. Manager
 /// uses its operator credential; Coder verifies impersonation authority and
 /// executes the Chat with the creator's permissions. No Coder token reaches
@@ -250,14 +283,7 @@ pub async fn create_chat(
         .bind(workspace_id.0)
         .execute(&mut *tx)
         .await?;
-    let row: Option<(
-        Option<String>,
-        Option<String>,
-        Option<uuid::Uuid>,
-        Option<String>,
-        Option<String>,
-        String,
-    )> = sqlx::query_as(
+    let row: Option<RuntimeChatWorkspaceRow> = sqlx::query_as(
         "SELECT w.coder_workspace_id, w.ticket_id, t.owner_user_id,
                 o.coder_organization_id, l.coder_user_id, w.role
            FROM workspaces w
@@ -289,7 +315,7 @@ pub async fn create_chat(
             "tenant creator must link a Coder account",
         )
     })?;
-    user_id.ok_or_else(|| {
+    let owner_user_id = user_id.ok_or_else(|| {
         ManagerError::api(
             "CODER_REAUTH_REQUIRED",
             "tenant creator must link a Coder account",
@@ -357,18 +383,30 @@ pub async fn create_chat(
                     coder_client::types::ChatStatus::Error
                         | coder_client::types::ChatStatus::RequiresAction
                 ) {
-                    let _ = client
+                    let owner_token = super::coder_identity::user_access_token(
+                        services,
+                        crate::id::UserId::from_uuid(owner_user_id),
+                    )
+                    .await?;
+                    let owner_client =
+                        coder_client::CoderClient::new(&coder_url, owner_token.trim());
+                    owner_client
                         .send_chat_message(
                             &chat_id,
                             vec![coder_client::types::ChatInputPart::text(
                                 "Resume work on this ticket. Check your phase with `openflows-harness status get` and dispatch with `openflows-harness dispatch read`. Continue from there.",
                             )],
                         )
-                        .await;
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(%error, chat_id=%chat_id, "Coder Chat recovery failed");
+                            ManagerError::api("CODER_CHAT_UNAVAILABLE", "could not resume the worker Chat")
+                                .retryable(true)
+                        })?;
                 }
                 tx.commit().await?;
                 return Ok(Json(
-                    serde_json::json!({"chat_id":chat_id,"workspace_id":body.workspace_id}),
+                    serde_json::json!({"chat_id":chat_id,"workspace_id":body.workspace_id,"created":false}),
                 )
                 .into_response());
             }
@@ -385,14 +423,15 @@ pub async fn create_chat(
         tracing::warn!(%error, workspace_id = %body.workspace_id, "Coder Chat reconciliation failed");
         ManagerError::api("CODER_CHAT_UNAVAILABLE", "could not inspect the tenant creator's Coder chats").retryable(true)
     })?;
-    let chat = if let Some(chat) = chats.into_iter().find(|chat| {
+    let (chat, created) = if let Some(chat) = chats.into_iter().find(|chat| {
         chat.workspace_id == coder_workspace
             && chat.owner_id == coder_owner
             && chat.labels == labels
     }) {
-        chat
+        (chat, false)
     } else {
-        client
+        (
+            client
             .create_chat(&coder_client::types::CreateChatRequest {
                 organization_id: Some(coder_org),
                 owner_id: Some(coder_owner.clone()),
@@ -409,7 +448,9 @@ pub async fn create_chat(
                 } else {
                     ManagerError::api("CODER_CHAT_UNAVAILABLE", "Coder could not create the worker Chat").retryable(true)
                 }
-            })?
+            })?,
+            true,
+        )
     };
     if chat.owner_id != coder_owner {
         return Err(ManagerError::api(
@@ -425,10 +466,141 @@ pub async fn create_chat(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(
-        Json(serde_json::json!({"chat_id":chat.id,"workspace_id":body.workspace_id}))
-            .into_response(),
+    Ok(Json(
+        serde_json::json!({"chat_id":chat.id,"workspace_id":body.workspace_id,"created":created}),
     )
+    .into_response())
+}
+
+/// Send a lifecycle or review follow-up to a Chat already bound to this tenant.
+/// Nexus never receives the Coder operator credential. The durable message key
+/// makes repeated controller polls idempotent.
+pub async fn send_chat_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chat): Path<String>,
+    Json(body): Json<SendRuntimeChatMessageRequest>,
+) -> Result<Response, ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let scope = authenticate_runtime(services, &headers).await?;
+    if scope.workspace_role != "nexus" {
+        return Err(ManagerError::api(
+            "FORBIDDEN",
+            "only Nexus can message worker chats",
+        ));
+    }
+    if uuid::Uuid::parse_str(&chat).is_err()
+        || body.message_key.is_empty()
+        || body.message_key.len() > 256
+        || body.prompt.trim().is_empty()
+        || body.prompt.len() > 32_768
+    {
+        return Err(ManagerError::InvalidInput("invalid chat message".into()));
+    }
+
+    let mut tx = services.db.pool().begin().await?;
+    let delivery_lock = format!("{chat}:{}", body.message_key);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&delivery_lock)
+        .execute(&mut *tx)
+        .await?;
+    let scoped: Option<(String, Option<uuid::Uuid>)> = sqlx::query_as(
+        "SELECT rc.coder_chat_id, t.owner_user_id FROM runtime_chats rc
+           JOIN workspaces w ON w.id=rc.workspace_id
+           JOIN tenants t ON t.id=w.tenant_id AND t.organization_id=w.organization_id
+          WHERE rc.coder_chat_id=$1 AND w.tenant_id=$2 AND w.organization_id=$3",
+    )
+    .bind(&chat)
+    .bind(scope.tenant_id.0)
+    .bind(scope.organization_id.0)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (_, owner_user_id) = scoped.ok_or_else(|| ManagerError::not_found("runtime Chat"))?;
+    let owner_user_id = owner_user_id.ok_or_else(|| {
+        ManagerError::api(
+            "CODER_REAUTH_REQUIRED",
+            "tenant creator must link a Coder account",
+        )
+    })?;
+
+    let delivered: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM runtime_chat_messages
+             WHERE coder_chat_id=$1 AND message_key=$2
+        )",
+    )
+    .bind(&chat)
+    .bind(&body.message_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    if delivered {
+        tx.commit().await?;
+        return Ok(Json(serde_json::json!({"queued":false,"duplicate":true})).into_response());
+    }
+
+    // Coder permits only the Chat owner to append messages. The operator may
+    // provision a Chat on behalf of that owner, but its token cannot resume it.
+    // Exchange the tenant creator's retained OAuth refresh credential inside
+    // Manager; never expose the resulting token to Nexus or the workspace.
+    let token = super::coder_identity::user_access_token(
+        services,
+        crate::id::UserId::from_uuid(owner_user_id),
+    )
+    .await?;
+    let coder_url = std::env::var("CODER_URL")
+        .map_err(|_| ManagerError::Config("CODER_URL is required".into()))?;
+    let coder = coder_client::CoderClient::new(&coder_url, token.trim());
+    let delivery_marker = chat_delivery_marker(&chat, &body.message_key);
+    let already_received = coder
+        .get_chat_messages(&chat, 200)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, chat_id=%chat, "Coder Chat delivery reconciliation failed");
+            ManagerError::api(
+                "CODER_CHAT_UNAVAILABLE",
+                "Coder could not reconcile the worker Chat",
+            )
+            .retryable(true)
+        })?
+        .iter()
+        .any(|message| chat_message_contains_marker(message, &delivery_marker));
+    if already_received {
+        sqlx::query(
+            "INSERT INTO runtime_chat_messages(coder_chat_id,message_key) VALUES($1,$2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&chat)
+        .bind(&body.message_key)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(Json(serde_json::json!({"queued":false,"duplicate":true})).into_response());
+    }
+
+    let delivery_prompt = format!("{}\n\n{}", body.prompt.trim_end(), delivery_marker);
+    coder
+        .send_chat_message(
+            &chat,
+            vec![coder_client::types::ChatInputPart::text(delivery_prompt)],
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, chat_id=%chat, "Coder Chat follow-up failed");
+            ManagerError::api(
+                "CODER_CHAT_UNAVAILABLE",
+                "Coder could not message the worker Chat",
+            )
+            .retryable(true)
+        })?;
+    sqlx::query("INSERT INTO runtime_chat_messages(coder_chat_id,message_key) VALUES($1,$2)")
+        .bind(&chat)
+        .bind(&body.message_key)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({"queued":true,"duplicate":false})).into_response())
 }
 
 pub async fn get_workspace(
@@ -570,4 +742,24 @@ fn safe_branch(branch: &str) -> bool {
         && branch
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'/' || b == b'.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_markers_are_stable_and_detected_in_chat_content() {
+        let marker = chat_delivery_marker("chat-1", "blocked:7");
+        assert_eq!(marker, chat_delivery_marker("chat-1", "blocked:7"));
+        assert_ne!(marker, chat_delivery_marker("chat-1", "blocked:8"));
+        let message = coder_client::types::ChatMessage {
+            id: "42".into(),
+            chat_id: "chat-1".into(),
+            role: "user".into(),
+            content_raw: serde_json::json!([{"type":"text","text":format!("resume\n{marker}")}]),
+            created_at_raw: String::new(),
+        };
+        assert!(chat_message_contains_marker(&message, &marker));
+    }
 }

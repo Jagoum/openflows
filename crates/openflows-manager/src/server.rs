@@ -800,6 +800,9 @@ impl ManagerServices {
                 .runtime_redis_url
                 .clone()
                 .unwrap_or_else(|| "redis://127.0.0.1:6379".into()),
+        )
+        .with_local_docker_cleanup(
+            config.mode == crate::config::Mode::Local && config.provisioner_backend == "docker",
         );
         self.tenant_provision = Some(tenant_worker);
         Ok(self)

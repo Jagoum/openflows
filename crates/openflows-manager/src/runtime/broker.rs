@@ -273,14 +273,19 @@ pub(crate) fn validate_resource_state(scope: &RuntimeScope) -> Result<(), Manage
             scope.workspace_desired_state.as_str(),
             "running" | "provisioning"
         );
-    // A newly registered workspace must obtain its first repository token
-    // before it can send its first readiness heartbeat. Allow that narrow
-    // registration window while the tenant is provisioning; subsequent
-    // requests still require an observed heartbeat or an authenticated
-    // runtime registration created for this workspace.
+    // A newly registered workspace needs its repository token before it can
+    // report readiness. On tenant resume, observed_state is still `stopped`
+    // until the controller is ready; rejecting that state deadlocks startup.
+    // Registration is bound to the current workspace credential generation.
     let workspace_is_registering = scope.workspace_registered_at.is_some()
-        && scope.workspace_desired_state == "provisioning"
-        && scope.workspace_observed_state == "provisioning";
+        && matches!(
+            scope.workspace_desired_state.as_str(),
+            "provisioning" | "running"
+        )
+        && matches!(
+            scope.workspace_observed_state.as_str(),
+            "provisioning" | "stopped"
+        );
     if !workspace_is_running && !workspace_is_registering {
         return Err(ManagerError::api(
             "WORKSPACE_UNAVAILABLE",
@@ -355,5 +360,59 @@ impl std::fmt::Debug for BrokerCredential {
             .field("permissions", &self.permissions)
             .field("token", &"[REDACTED]")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::{ConnectionId, OrganizationId, TenantId, WorkspaceId};
+
+    fn scope() -> RuntimeScope {
+        let now = Utc::now();
+        RuntimeScope {
+            credential_id: uuid::Uuid::new_v4(),
+            workspace_id: WorkspaceId::from_uuid(uuid::Uuid::new_v4()),
+            workspace_role: "nexus".into(),
+            workspace_generation: 2,
+            workspace_observed_state: "stopped".into(),
+            workspace_desired_state: "running".into(),
+            workspace_registered_at: Some(now),
+            tenant_id: TenantId::from_uuid(uuid::Uuid::new_v4()),
+            tenant_desired_state: "running".into(),
+            tenant_observed_state: "paused".into(),
+            organization_id: OrganizationId::from_uuid(uuid::Uuid::new_v4()),
+            organization_status: "ready".into(),
+            connection_id: ConnectionId::from_uuid(uuid::Uuid::new_v4()),
+            connection_status: "active".into(),
+            connection_generation: 1,
+            installation_id: 1,
+            repository_id: 1,
+            repository_accessible: true,
+            credential_generation: 2,
+            credential_expires_at: now + Duration::minutes(15),
+            credential_revoked_at: None,
+            credential_audience: "openflows-workspace".into(),
+            credential_family_id: uuid::Uuid::new_v4(),
+            credential_family_expires_at: now + Duration::days(1),
+        }
+    }
+
+    #[test]
+    fn registered_runtime_may_fetch_git_credential_during_resume() {
+        assert!(validate_resource_state(&scope()).is_ok());
+    }
+
+    #[test]
+    fn stopped_or_unregistered_runtime_cannot_fetch_git_credential() {
+        let mut scope = scope();
+        scope.workspace_registered_at = None;
+        assert!(validate_resource_state(&scope).is_err());
+        scope.workspace_registered_at = Some(Utc::now());
+        scope.workspace_desired_state = "stopped".into();
+        assert!(validate_resource_state(&scope).is_err());
+        scope.workspace_desired_state = "running".into();
+        scope.tenant_desired_state = "paused".into();
+        assert!(validate_resource_state(&scope).is_err());
     }
 }
