@@ -245,6 +245,27 @@ enum VerifyAction {
     },
 }
 
+/// Resolve the tenant-authenticated Redis URL from the mounted runtime
+/// credential file (`OPENFLOWS_RUNTIME_CREDENTIAL_FILE`, e.g.
+/// /run/openflows/runtime.json). Returns `Ok(None)` when the variable or file
+/// is absent so callers can fall back to their normal error path.
+fn runtime_file_redis_url() -> Result<Option<String>> {
+    let Ok(path) = std::env::var("OPENFLOWS_RUNTIME_CREDENTIAL_FILE") else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("cannot read mounted runtime credential file {path}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("cannot parse runtime credential file {path}"))?;
+    Ok(value
+        .get("redis_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -269,11 +290,17 @@ async fn main() -> Result<()> {
     }
 
     let env = config::EnvConfig::from_env().context("failed to load environment configuration")?;
-    let redis_url = env
-        .infra
-        .redis_url
-        .clone()
-        .context("REDIS_URL is not set. This must be injected by the workspace template.")?;
+    let redis_url = match env.infra.redis_url.clone() {
+        Some(url) => url,
+        // Hosted workspaces run the harness from a Coder Chat, whose tool
+        // environment does not inherit the startup shell's variables. Fall back
+        // to the tenant runtime credential file mounted at
+        // `OPENFLOWS_RUNTIME_CREDENTIAL_FILE` (e.g. /run/openflows/runtime.json),
+        // which carries the tenant-authenticated Redis URL.
+        None => runtime_file_redis_url()?.context(
+            "REDIS_URL is not set. This must be injected by the workspace template or the mounted runtime file.",
+        )?,
+    };
     let tenant =
         env.tenant.tenant.clone().context(
             "OPENFLOWS_TENANT is not set. This must be injected by the workspace template.",

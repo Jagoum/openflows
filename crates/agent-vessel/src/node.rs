@@ -11,7 +11,8 @@ use config::{
         address_review_attempts_key, address_review_dispatched_at_key,
         address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
         full_ticket_key_flat, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
-        KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
+        KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DELIVERY_ID, KEY_TICKET_REWORK_DIRECTIVE,
+        KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_ADDRESS_REVIEW_DISPATCHED,
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_REWORK_PROVISION_NEEDED,
@@ -3560,6 +3561,15 @@ impl VesselNode {
         directive: &str,
     ) {
         let key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, role);
+        let delivery_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DELIVERY_ID, role);
+        // Keep the same delivery id while an existing directive is retried, but
+        // allocate a new one after the prior directive was consumed. The
+        // Manager uses this value as its durable message idempotency key.
+        if store.get(&key).await.is_none() {
+            store
+                .set(&delivery_key, json!(uuid::Uuid::new_v4().to_string()))
+                .await;
+        }
         store.set(&key, json!(directive)).await;
         info!(
             ticket_id,
@@ -4029,6 +4039,32 @@ mod tests {
         node.reconcile_github_approval(store, "T-42", &state, "org", "repo", 42, "head")
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn persisted_rework_delivery_id_is_stable_for_retries_and_fresh_for_later_rounds() {
+        let node = VesselNode::new(VesselConfig::default());
+        let store = SharedStore::new_in_memory();
+        let directive_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DIRECTIVE, "forge");
+        let delivery_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DELIVERY_ID, "forge");
+
+        node.persist_rework_directive(&store, "T-454", "forge", "/address_review")
+            .await;
+        let first: String = store.get_typed(&delivery_key).await.unwrap();
+        node.persist_rework_directive(&store, "T-454", "forge", "/address_review")
+            .await;
+        assert_eq!(
+            store.get_typed::<String>(&delivery_key).await.unwrap(),
+            first
+        );
+
+        store.del(&directive_key).await;
+        node.persist_rework_directive(&store, "T-454", "forge", "/address_review")
+            .await;
+        assert_ne!(
+            store.get_typed::<String>(&delivery_key).await.unwrap(),
+            first
+        );
     }
 
     #[tokio::test]
