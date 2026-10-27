@@ -272,19 +272,6 @@ pub const RELEASE_TIMEOUT_SECS_ENV: &str = "OPENFLOWS_RELEASE_TIMEOUT_SECS";
 /// `.openflows/release-cache`).
 pub const RELEASE_CACHE_DIR_ENV: &str = "OPENFLOWS_RELEASE_CACHE_DIR";
 
-// ---------------------------------------------------------------------------
-// Zep context-layer configuration.
-// ---------------------------------------------------------------------------
-/// Zep API key. Never committed; load from the environment. When absent, Zep
-/// integration is disabled and all Zep calls become no-ops.
-pub const ZEP_API_KEY_ENV: &str = "ZEP_API_KEY";
-/// Optional override for the Zep API base URL (defaults to the Zep v3 REST
-/// endpoint). Useful for Zep Enterprise / self-hosted deployments.
-pub const ZEP_API_URL_ENV: &str = "ZEP_API_URL";
-/// The shared organization-knowledge graph id. Every user's agent can draw on
-/// knowledge added to this graph.
-pub const ZEP_ORG_GRAPH_ID_ENV: &str = "ZEP_ORG_GRAPH_ID";
-
 /// Default maximum downloaded artifact size: 256 MiB.
 pub const DEFAULT_RELEASE_MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
 /// Default per-request download timeout.
@@ -770,46 +757,6 @@ fn parse_positive(env: &str, default: i32) -> Result<i32, String> {
     }
 }
 
-/// Zep context-layer configuration.
-///
-/// Zep is optional: when no `ZEP_API_KEY` is configured, the Manager runs
-/// without Zep and all integration calls become no-ops. When configured, the
-/// API key is held in memory for outbound HTTP calls and never committed,
-/// logged, or exposed in responses.
-#[derive(Debug, Clone)]
-pub struct ZepConfig {
-    /// The Zep API key (from `ZEP_API_KEY`).
-    pub api_key: String,
-    /// Base URL for the Zep v3 REST API.
-    pub api_url: String,
-    /// The shared organization-knowledge graph id.
-    pub org_graph_id: String,
-}
-
-impl ZepConfig {
-    /// Load Zep configuration from the environment. Returns `None` when Zep is
-    /// not configured (no API key), which disables the integration.
-    pub fn from_env() -> Result<Option<Self>, String> {
-        let api_key = match std::env::var(ZEP_API_KEY_ENV).ok() {
-            Some(v) if !v.trim().is_empty() => v,
-            _ => return Ok(None),
-        };
-        let api_url = std::env::var(ZEP_API_URL_ENV)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| crate::zep::DEFAULT_ZEP_API_URL.to_string());
-        let org_graph_id = std::env::var(ZEP_ORG_GRAPH_ID_ENV)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| crate::zep::ontology::ORG_GRAPH_ID.to_string());
-        Ok(Some(ZepConfig {
-            api_key,
-            api_url,
-            org_graph_id,
-        }))
-    }
-}
-
 /// The foundational Manager configuration.
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
@@ -851,8 +798,6 @@ pub struct ManagerConfig {
     pub release_source: ReleaseSourceConfig,
     /// Tenant runtime limits (minimal infrastructure safeguards).
     pub tenant_limits: TenantLimits,
-    /// Zep context-layer configuration. `None` disables Zep integration.
-    pub zep: Option<ZepConfig>,
 }
 
 impl ManagerConfig {
@@ -907,8 +852,6 @@ impl ManagerConfig {
         let auth = auth_from_env(mode == Mode::Hosted, crypto_master_key_ref.clone())?;
 
         let tenant_limits = TenantLimits::from_env()?;
-
-        let zep = ZepConfig::from_env()?;
 
         if mode == Mode::Hosted || !auth.client_id.is_empty() {
             auth.validate_origin()?;
@@ -986,7 +929,6 @@ impl ManagerConfig {
                     runtime_redis_url: Some(runtime_redis_url),
                     release_source,
                     tenant_limits,
-                    zep,
                 })
             }
             Mode::Local => Ok(ManagerConfig {
@@ -1007,7 +949,6 @@ impl ManagerConfig {
                 runtime_redis_url,
                 release_source,
                 tenant_limits,
-                zep,
             }),
         }
     }
@@ -1055,7 +996,6 @@ pub fn local_test_config() -> ManagerConfig {
             max_workers_per_tenant: DEFAULT_TENANT_MAX_WORKERS,
             max_concurrent_provisioning_ops: DEFAULT_TENANT_MAX_PROVISIONING_OPS,
         },
-        zep: None,
     }
 }
 
@@ -1128,9 +1068,6 @@ mod tests {
         TENANT_MAX_PER_ORG_ENV,
         TENANT_MAX_WORKERS_ENV,
         TENANT_MAX_PROVISIONING_OPS_ENV,
-        ZEP_API_KEY_ENV,
-        ZEP_API_URL_ENV,
-        ZEP_ORG_GRAPH_ID_ENV,
     ];
 
     #[test]
@@ -1509,44 +1446,5 @@ mod tests {
         assert!(ManagerConfig::from_env().is_err());
         std::env::set_var(TENANT_MAX_PER_ORG_ENV, "abc");
         assert!(ManagerConfig::from_env().is_err());
-    }
-
-    #[test]
-    fn zep_is_disabled_without_an_api_key() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture(ALL_KEYS);
-        std::env::remove_var(ZEP_API_KEY_ENV);
-        std::env::remove_var(ZEP_API_URL_ENV);
-        std::env::remove_var(ZEP_ORG_GRAPH_ID_ENV);
-        assert!(ZepConfig::from_env().unwrap().is_none());
-        let cfg = ManagerConfig::from_env().unwrap();
-        assert!(cfg.zep.is_none());
-    }
-
-    #[test]
-    fn zep_defaults_apply_when_only_the_api_key_is_set() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture(ALL_KEYS);
-        std::env::set_var(ZEP_API_KEY_ENV, "zep_test_key");
-        std::env::remove_var(ZEP_API_URL_ENV);
-        std::env::remove_var(ZEP_ORG_GRAPH_ID_ENV);
-        let zep = ZepConfig::from_env().unwrap().expect("zep configured");
-        assert_eq!(zep.api_key, "zep_test_key");
-        assert_eq!(zep.api_url, crate::zep::DEFAULT_ZEP_API_URL);
-        assert_eq!(zep.org_graph_id, crate::zep::ontology::ORG_GRAPH_ID);
-        let cfg = ManagerConfig::from_env().unwrap();
-        assert!(cfg.zep.is_some());
-    }
-
-    #[test]
-    fn zep_url_and_org_graph_override_are_honored() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture(ALL_KEYS);
-        std::env::set_var(ZEP_API_KEY_ENV, "zep_test_key");
-        std::env::set_var(ZEP_API_URL_ENV, "https://zep.example.com/api/v2");
-        std::env::set_var(ZEP_ORG_GRAPH_ID_ENV, "custom-org-graph");
-        let zep = ZepConfig::from_env().unwrap().expect("zep configured");
-        assert_eq!(zep.api_url, "https://zep.example.com/api/v2");
-        assert_eq!(zep.org_graph_id, "custom-org-graph");
     }
 }

@@ -117,28 +117,6 @@ pub async fn receive(
     let (_organization_id, tenant_id, hook_secret_ref) =
         target.ok_or_else(|| ManagerError::not_found("hook workspace"))?;
 
-    // Best-effort: ensure a Zep thread exists for this conversation so the
-    // agents can persist and later recall the discussion. Keyed by our chat id
-    // and the Coder owner id. Non-fatal; Zep is never on the relay path.
-    if let Some(zep) = services.zep.clone() {
-        let chat_id = envelope.meta.chat_id.clone();
-        let owner_id = envelope.meta.owner_id.clone();
-        let db = services.db.pool().clone();
-        tokio::spawn(async move {
-            let user_id: Option<uuid::Uuid> = sqlx::query_scalar(
-                "SELECT user_id FROM coder_user_links WHERE coder_user_id = $1 LIMIT 1",
-            )
-            .bind(owner_id)
-            .fetch_optional(&db)
-            .await
-            .ok()
-            .flatten();
-            if let Some(user_id) = user_id {
-                zep.thread_create(&chat_id, &user_id.to_string()).await;
-            }
-        });
-    }
-
     let tenant_secret = zeroize::Zeroizing::new(
         services
             .secret_provider

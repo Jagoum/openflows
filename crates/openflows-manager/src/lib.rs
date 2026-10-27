@@ -27,7 +27,6 @@ pub mod secrets;
 pub mod server;
 pub mod templates;
 pub mod tenants;
-pub mod zep;
 
 pub use config::{ManagerConfig, Mode};
 pub use db::Db;

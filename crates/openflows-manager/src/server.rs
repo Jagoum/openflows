@@ -132,9 +132,6 @@ pub struct ManagerServices {
     /// Durable tenant-provisioning worker, present alongside the org worker
     /// when a Coder adapter is configured. `None` in pure local/test mode.
     pub tenant_provision: Option<crate::provisioning::TenantProvisionWorker>,
-    /// Zep context-layer integration. `None` when Zep is not configured; all
-    /// Zep calls become no-ops.
-    pub zep: Option<crate::zep::service::ZepService>,
 }
 
 /// The secret-provider adapter name for the isolated in-memory provider.
@@ -362,7 +359,6 @@ impl ManagerServices {
             session_manager: session_manager.clone(),
             github: github.clone(),
             auth_config: auth_config.clone(),
-            zep: None,
         };
         let device = crate::auth::device::DeviceFlowService::new(
             pool.clone(),
@@ -507,7 +503,6 @@ impl ManagerServices {
             release_approvals,
             org_provision: None,
             tenant_provision: None,
-            zep: None,
         }
     }
 
@@ -627,27 +622,6 @@ impl ManagerServices {
             services.tenant_runtime.clone(),
             services.quotas.clone(),
         );
-        // Attach the Zep context layer when configured. Zep is best-effort:
-        // if the API key is present we build the service and seed the shared
-        // org knowledge graph's ontology, but a Zep outage never fails startup
-        // (the graph data is ingested asynchronously and enrichment is
-        // non-critical).
-        if let Some(zep_cfg) = &config.zep {
-            let zep = crate::zep::service::ZepService::new(
-                crate::zep::ZepClient::new(zep_cfg.api_key.clone(), Some(zep_cfg.api_url.clone())),
-                zep_cfg.org_graph_id.clone(),
-            );
-            // Apply the custom domain ontology project-wide and to the org
-            // knowledge graph, then seed shared organizational knowledge.
-            if let Err(e) = zep.apply_project_ontology().await {
-                tracing::warn!(error = %e, "Zep project ontology seeding failed");
-            }
-            if let Err(e) = zep.apply_org_ontology().await {
-                tracing::warn!(error = %e, "Zep org ontology seeding failed");
-            }
-            services.login.zep = Some(zep.clone());
-            services.zep = Some(zep);
-        }
         services.with_org_provision(config, provider).await
     }
 
