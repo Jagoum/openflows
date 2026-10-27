@@ -689,25 +689,32 @@ impl TenantProvisionWorker {
                 "worker workspace scope mismatch",
             ));
         }
-        // Publish the upstream identifier only while both the workspace and
-        // tenant still accept this creation. This update is the serialization
-        // point with tenant deletion: if it wins first, delete the just-created
-        // Coder workspace ourselves; if this update wins, deletion's later scan
-        // observes the identifier and tears it down.
-        let attached = sqlx::query(
-            "UPDATE workspaces w SET coder_workspace_id = $1, updated_at = now()
-              WHERE w.id = $2 AND w.desired_state = 'provisioning'
-                AND EXISTS (
-                    SELECT 1 FROM tenants t
-                     WHERE t.id = w.tenant_id
-                       AND t.organization_id = w.organization_id
-                       AND t.desired_state NOT IN ('deleting', 'deleted'))",
+        // Fence this attempt before deciding whether the new upstream resource
+        // belongs to us. A stale attempt must never delete a workspace that a
+        // replacement lease holder has already adopted and marked running.
+        let mut tx = self.pool.begin().await?;
+        if !guard.lock_in_tx(&mut tx).await? {
+            return Ok(TenantProvisionOutcome::StaleLease);
+        }
+        let current: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT w.desired_state, t.desired_state, w.coder_workspace_id
+               FROM workspaces w
+               JOIN tenants t ON t.id = w.tenant_id
+                AND t.organization_id = w.organization_id
+              WHERE w.id = $1 AND w.organization_id = $2
+              FOR UPDATE OF w, t",
         )
-        .bind(&created.id)
         .bind(workspace_id.0)
-        .execute(&self.pool)
+        .bind(guard.organization_id.0)
+        .fetch_optional(&mut *tx)
         .await?;
-        if attached.rows_affected() != 1 {
+        let Some((workspace_state, tenant_state, attached_id)) = current else {
+            return Ok(TenantProvisionOutcome::StaleLease);
+        };
+        let superseded = matches!(tenant_state.as_str(), "deleting" | "deleted")
+            || matches!(workspace_state.as_str(), "stopped" | "deleting" | "deleted");
+        if superseded {
+            tx.commit().await?;
             self.adapter
                 .delete_workspace(&org, &created.id)
                 .await
@@ -732,6 +739,23 @@ impl TenantProvisionWorker {
                 .complete_worker_creation_superseded(guard, tenant_id, workspace_id)
                 .await;
         }
+        if workspace_state != "provisioning" {
+            return Ok(TenantProvisionOutcome::StaleLease);
+        }
+        if attached_id.as_deref().is_some_and(|id| id != created.id) {
+            return Err(ManagerError::api(
+                "CODER_SCOPE_MISMATCH",
+                "worker workspace is already attached to a different Coder workspace",
+            ));
+        }
+        sqlx::query(
+            "UPDATE workspaces SET coder_workspace_id = $1, updated_at = now() WHERE id = $2",
+        )
+        .bind(&created.id)
+        .bind(workspace_id.0)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         if self
             .adapter
             .wait_workspace_ready(&org, &created.id)
@@ -1207,13 +1231,34 @@ impl TenantProvisionWorker {
         // the upstream resource. Do not let tenant deletion report success
         // until every such operation has either attached its Coder id (so the
         // scan below sees it) or deleted the late-created workspace itself.
+        // Exhausted retryable failures have no retry_at and therefore cannot be
+        // claimed again. Cancel those abandoned creations during deletion so
+        // they cannot hold the tenant in `deleting` forever.
+        sqlx::query(
+            "UPDATE operations op
+                SET state = 'cancelled', retry_at = NULL, lease_owner = NULL,
+                    lease_token = NULL, lease_expires_at = NULL,
+                    sanitized_result = jsonb_build_object(
+                        'status', 'superseded_by_tenant_delete'),
+                    error_code = NULL, updated_at = now()
+               FROM workspaces w
+              WHERE w.id = op.resource_id
+                AND w.tenant_id = $1 AND w.organization_id = $2
+                AND op.kind = 'tenant.workspace'
+                AND op.state = 'retryable_failed' AND op.retry_at IS NULL",
+        )
+        .bind(tenant_id.0)
+        .bind(org_id.0)
+        .execute(&self.pool)
+        .await?;
         let unfinished_worker_creation: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                 SELECT 1 FROM operations op
                 JOIN workspaces w ON w.id = op.resource_id
                  WHERE w.tenant_id = $1 AND w.organization_id = $2
                    AND op.kind = 'tenant.workspace'
-                   AND op.state IN ('queued', 'running', 'retryable_failed'))",
+                   AND (op.state IN ('queued', 'running')
+                        OR (op.state = 'retryable_failed' AND op.retry_at IS NOT NULL)))",
         )
         .bind(tenant_id.0)
         .bind(org_id.0)

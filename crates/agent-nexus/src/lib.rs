@@ -12,7 +12,8 @@ use config::{
         pr_review_namespace, review_action_key, review_chat_key, review_verdict_key,
         HeartbeatRecord, KEY_COMMAND_GATE, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS,
         KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
-        KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
+        KEY_TICKET_REWORK_DELIVERY_ID, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS,
+        KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -296,13 +297,25 @@ impl NexusNode {
         format!("runtime:worker-request:{worker_id}:{ticket_id}")
     }
 
-    fn managed_rework_message_key(ticket_id: &str, directive: &str) -> String {
+    fn managed_rework_message_key(ticket_id: &str, delivery_id: &str) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"openflows-managed-rework-v1\0");
+        hasher.update(b"openflows-managed-rework-v2\0");
         hasher.update(ticket_id.as_bytes());
         hasher.update(b"\0");
-        hasher.update(directive.as_bytes());
+        hasher.update(delivery_id.as_bytes());
         format!("rework:{:x}", hasher.finalize())
+    }
+
+    async fn ensure_rework_delivery_id(store: &SharedStore, ticket_id: &str, role: &str) -> String {
+        let key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DELIVERY_ID, role);
+        if let Some(id) = store.get_typed::<String>(&key).await {
+            return id;
+        }
+        // Backward compatibility for directives persisted before delivery ids
+        // existed. Persist before attempting delivery so retries stay stable.
+        let id = uuid::Uuid::new_v4().to_string();
+        store.set(&key, json!(id)).await;
+        id
     }
 
     fn rework_prompt(ticket_id: &str, directive: &str) -> String {
@@ -1780,6 +1793,7 @@ Before significant work, read the relevant skill file to understand the workflow
         // cleared only AFTER the chat is successfully created below, so a failed chat
         // creation does not lose the rework request.
         let rework_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, role);
+        let rework_delivery_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DELIVERY_ID, role);
         let rework_directive = store.get_typed::<String>(&rework_key).await;
 
         // Build ticket content with full context
@@ -1927,6 +1941,7 @@ Use `openflows-harness` for all coordination:
         // the next reconciliation attempt.
         if had_rework_directive {
             store.del(&rework_key).await;
+            store.del(&rework_delivery_key).await;
             info!(
                 ticket_id,
                 role,
@@ -2032,6 +2047,10 @@ Use `openflows-harness` for all coordination:
         let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, role);
         let rework_key = full_ticket_key(&ticket.id, KEY_TICKET_REWORK_DIRECTIVE, role);
         let rework_directive = store.get_typed::<String>(&rework_key).await;
+        let rework_delivery_id = match rework_directive.as_ref() {
+            Some(_) => Some(Self::ensure_rework_delivery_id(store, &ticket.id, role).await),
+            None => None,
+        };
         let prompt = match rework_directive.as_deref() {
             Some(directive) => Self::rework_prompt(&ticket.id, directive),
             None => format!(
@@ -2045,12 +2064,17 @@ Use `openflows-harness` for all coordination:
         if chat.workspace_id != workspace_id {
             anyhow::bail!("Manager returned a Chat for a different workspace");
         }
-        if let Some(directive) = rework_directive.as_deref() {
+        if rework_directive.is_some() {
             if !chat.created {
                 runtime
                     .send_chat_message(
                         &chat.chat_id,
-                        &Self::managed_rework_message_key(&ticket.id, directive),
+                        &Self::managed_rework_message_key(
+                            &ticket.id,
+                            rework_delivery_id
+                                .as_deref()
+                                .expect("delivery id exists for a rework directive"),
+                        ),
                         &prompt,
                     )
                     .await?;
@@ -2059,6 +2083,13 @@ Use `openflows-harness` for all coordination:
             // an existing Chat received it through the durable message API.
             // Preserve the key on either failure so reconciliation retries it.
             store.del(&rework_key).await;
+            store
+                .del(&full_ticket_key(
+                    &ticket.id,
+                    KEY_TICKET_REWORK_DELIVERY_ID,
+                    role,
+                ))
+                .await;
         }
         store.set(&chat_key, json!(chat.chat_id)).await;
         // Preserve same-Chat recovery: do not unconditionally mark a returned
@@ -6908,6 +6939,7 @@ mod tests {
     async fn managed_existing_chat_receives_and_consumes_rework_directive() {
         let mut server = mockito::Server::new_async().await;
         let directive = "/address_review pr: 454\nFix the remaining findings.";
+        let delivery_id = "review-round-2";
         let prompt = NexusNode::rework_prompt("T-454", directive);
         let create = server
             .mock("POST", "/api/v1/runtime/chats")
@@ -6927,7 +6959,7 @@ mod tests {
         let message = server
             .mock("POST", "/api/v1/runtime/chats/forge-chat/messages")
             .match_body(mockito::Matcher::Json(json!({
-                "message_key":NexusNode::managed_rework_message_key("T-454", directive),
+                "message_key":NexusNode::managed_rework_message_key("T-454", delivery_id),
                 "prompt":NexusNode::rework_prompt("T-454", directive),
             })))
             .with_status(200)
@@ -6958,7 +6990,9 @@ mod tests {
             )
             .await;
         let rework_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DIRECTIVE, "forge");
+        let delivery_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DELIVERY_ID, "forge");
         store.set(&rework_key, json!(directive)).await;
+        store.set(&delivery_key, json!(delivery_id)).await;
         let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
             runtime_control::RuntimeControlClient::for_test(server.url()),
         );
@@ -6975,6 +7009,7 @@ mod tests {
         create.assert_async().await;
         message.assert_async().await;
         assert!(store.get(&rework_key).await.is_none());
+        assert!(store.get(&delivery_key).await.is_none());
     }
 
     #[tokio::test]
@@ -7041,6 +7076,20 @@ mod tests {
         assert_eq!(
             store.get_typed::<String>(&rework_key).await.as_deref(),
             Some(directive)
+        );
+        let delivery_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DELIVERY_ID, "forge");
+        assert!(store.get_typed::<String>(&delivery_key).await.is_some());
+    }
+
+    #[test]
+    fn identical_rework_directives_in_later_rounds_have_distinct_message_keys() {
+        let first = NexusNode::managed_rework_message_key("T-454", "review-round-1");
+        let retry = NexusNode::managed_rework_message_key("T-454", "review-round-1");
+        let later = NexusNode::managed_rework_message_key("T-454", "review-round-2");
+        assert_eq!(first, retry, "retries in one round must be idempotent");
+        assert_ne!(
+            first, later,
+            "identical directives in later rounds must be delivered again"
         );
     }
 

@@ -994,6 +994,84 @@ async fn exhausted_tenant_delete_is_recovered_without_manual_retry() {
     assert_eq!(op_state, "succeeded");
 }
 
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn tenant_delete_cancels_exhausted_worker_creation() {
+    let h = harness().await;
+    let tenant = create_tenant(&h, "delete-worker-recovery", 1, "delete-worker").await;
+    let owner = format!("delete-worker-{}", std::process::id());
+    let provision = operations::claim_kind(&h.pool, &owner, Some("tenant.provision"))
+        .await
+        .unwrap()
+        .unwrap();
+    provision_with_runtime_registration(&h, &provision).await;
+
+    let nexus_ws: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE tenant_id = $1 AND role = 'nexus'")
+            .bind(tenant.0)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    let issued = h
+        .runtime_credentials
+        .issue_for_workspace(openflows_manager::id::WorkspaceId::from_uuid(nexus_ws))
+        .await
+        .unwrap();
+    let scope = h
+        .runtime_credentials
+        .authenticate(&issued.raw_secret)
+        .await
+        .unwrap();
+    let workspace_service = openflows_manager::runtime::RuntimeWorkspaceService::new(
+        h.pool.clone(),
+        h.tenant_repo.clone(),
+        h.quotas.clone(),
+    );
+    let requested = workspace_service
+        .request_worker(
+            &scope,
+            "forge",
+            Some(1),
+            None,
+            None,
+            None,
+            "exhausted-worker",
+        )
+        .await
+        .unwrap();
+    let worker_operation = uuid::Uuid::parse_str(&requested.operation_id).unwrap();
+    sqlx::query(
+        "UPDATE operations SET state = 'retryable_failed', attempt_count = 8,
+            retry_at = NULL, lease_owner = NULL, lease_token = NULL,
+            lease_expires_at = NULL WHERE id = $1",
+    )
+    .bind(worker_operation)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    let delete_operation = h
+        .tenant_service
+        .delete_tenant(h.owner, h.org, tenant, "delete-with-exhausted-worker", "r")
+        .await
+        .unwrap();
+    let delete_guard = operations::claim_kind(&h.pool, "delete-worker", Some("tenant.delete"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delete_guard.operation_id, delete_operation);
+    assert_eq!(
+        h.worker.delete(&delete_guard).await.unwrap(),
+        openflows_manager::provisioning::TenantProvisionOutcome::Deleted(tenant)
+    );
+    let worker_state: String = sqlx::query_scalar("SELECT state FROM operations WHERE id = $1")
+        .bind(worker_operation)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(worker_state, "cancelled");
+}
+
 // ---------------------------------------------------------------------------
 // Tenant Redis namespace restrictions and authenticated hook relay.
 // ---------------------------------------------------------------------------
