@@ -1793,7 +1793,6 @@ Before significant work, read the relevant skill file to understand the workflow
         // cleared only AFTER the chat is successfully created below, so a failed chat
         // creation does not lose the rework request.
         let rework_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, role);
-        let rework_delivery_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DELIVERY_ID, role);
         let rework_directive = store.get_typed::<String>(&rework_key).await;
 
         // Build ticket content with full context
@@ -1941,7 +1940,6 @@ Use `openflows-harness` for all coordination:
         // the next reconciliation attempt.
         if had_rework_directive {
             store.del(&rework_key).await;
-            store.del(&rework_delivery_key).await;
             info!(
                 ticket_id,
                 role,
@@ -2083,13 +2081,6 @@ Use `openflows-harness` for all coordination:
             // an existing Chat received it through the durable message API.
             // Preserve the key on either failure so reconciliation retries it.
             store.del(&rework_key).await;
-            store
-                .del(&full_ticket_key(
-                    &ticket.id,
-                    KEY_TICKET_REWORK_DELIVERY_ID,
-                    role,
-                ))
-                .await;
         }
         store.set(&chat_key, json!(chat.chat_id)).await;
         // Preserve same-Chat recovery: do not unconditionally mark a returned
@@ -7009,7 +7000,13 @@ mod tests {
         create.assert_async().await;
         message.assert_async().await;
         assert!(store.get(&rework_key).await.is_none());
-        assert!(store.get(&delivery_key).await.is_none());
+        // Keep the id durable: if deleting the directive itself fails, the next
+        // poll must retry with the same idempotency key rather than creating a
+        // duplicate agent turn.
+        assert_eq!(
+            store.get_typed::<String>(&delivery_key).await.as_deref(),
+            Some(delivery_id)
+        );
     }
 
     #[tokio::test]
