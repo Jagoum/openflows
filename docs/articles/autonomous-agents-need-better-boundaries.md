@@ -1,6 +1,6 @@
 # The Agent That Deleted Production Was Not the Root Cause
 
-*Autonomous agents need least privilege, separation of duties, and independent review—not the full authority of a human developer.*
+*Autonomous agents need least privilege, separation of duties, and independent review, not the full authority of a human developer.*
 
 An autonomous coding agent deletes a production database from a developer's machine.
 
@@ -70,7 +70,7 @@ This matters because prompts are advisory. State transitions, credential boundar
 
 OpenFlows does not hand every workspace a broad GitHub credential and ask the agent to use it carefully.
 
-The Manager acts as a credential broker. It knows the workspace, tenant, repository, installation, and stored agent role. A runtime may request only a coarse purpose—Git transport or API access. It cannot choose its own repository or submit a custom permission set. The Manager resolves a server-controlled, versioned profile. Unknown roles fail closed.
+The Manager acts as a credential broker. It knows the workspace, tenant, repository, installation, and stored agent role. A runtime may request only a coarse purpose: Git transport or API access. It cannot choose its own repository or submit a custom permission set. The Manager resolves a server-controlled, versioned profile. Unknown roles fail closed.
 
 The current profiles are deliberately different:
 
@@ -139,7 +139,7 @@ If a builder can delete production, approve the resulting change, merge it, and 
 
 Good autonomous-agent infrastructure assumes that agents will sometimes misunderstand, overgeneralize, or choose the wrong action. It limits the blast radius of those mistakes and requires another role to validate consequential decisions.
 
-The goal is not to make agents harmless by making them useless. The goal is to give each agent enough authority to perform its job—and no authority to certify or operate beyond that job.
+The goal is not to make agents harmless by making them useless. The goal is to give each agent enough authority to perform its job, but no authority to certify or operate beyond that job.
 
 Autonomy without boundaries is root access with better prose.
 
