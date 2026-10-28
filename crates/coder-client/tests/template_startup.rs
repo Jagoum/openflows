@@ -110,43 +110,26 @@ fn sentinel_clone_fallback_uses_the_workspace_parameter() {
 }
 
 #[test]
-fn forge_hosted_cli_uses_api_token_without_personal_identity() {
+fn forge_uses_only_brokered_github_credentials() {
     let template = include_str!("../templates/openflows-forge/main.tf");
     assert!(template.contains(r#"--data '{"purpose":"git"}'"#));
     assert!(template.contains(r#"--data '{"purpose":"api"}'"#));
     assert!(template.matches(r#"purpose\":\"git"#).count() >= 1);
     assert!(template.matches(r#"purpose\":\"api"#).count() >= 1);
-    let marker = template
-        .find("# Store the API-purpose installation token in gh's protected config")
-        .unwrap();
-    let start = template[..marker].rfind("    if [").unwrap();
-    let end = template[start..]
-        .find("    # Set git author identity")
-        .unwrap()
-        + start;
-    for host in ["github.com", "github.example.com"] {
-        let body = template[start..end]
-            .replace("${data.coder_parameter.hosted.value}", "true")
-            .replace("$${", "${")
-            .replace("/home/coder", "\"$TEST_ROOT/coder\"")
-            .replace("/root", "\"$TEST_ROOT/root\"");
-        let script = format!(
-            "set -e\nlog() {{ :; }}\nsudo() {{ \"$@\"; }}\ngh() {{ echo 'unexpected personal gh request' >&2; return 97; }}\ncurl() {{ return 98; }}\nGIT_TOKEN=test-git-token\nAPI_TOKEN=test-api-token\nGITHUB_CLI_HOST={host}\n{body}\ntest -z \"${{GH_TOKEN+x}}\"\ntest -z \"${{GH_ENTERPRISE_TOKEN+x}}\"\ngrep -F \"$GITHUB_CLI_HOST:\" \"$TEST_ROOT/coder/.config/gh/hosts.yml\"\ngrep -F 'oauth_token: test-api-token' \"$TEST_ROOT/coder/.config/gh/hosts.yml\"\n! grep -F 'test-git-token' \"$TEST_ROOT/coder/.config/gh/hosts.yml\"\ncmp \"$TEST_ROOT/coder/.config/gh/hosts.yml\" \"$TEST_ROOT/root/.config/gh/hosts.yml\"\ntest \"$EXPECTED_LOGIN\" = 'openflows[bot]'\n"
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let output = Command::new("bash")
-            .args(["-c", &script])
-            .env("TEST_ROOT", dir.path())
-            .env_remove("GH_TOKEN")
-            .env_remove("GH_ENTERPRISE_TOKEN")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(template.contains(
+        "API_TOKEN_TEMP=$(mktemp /home/coder/.config/openflows/github-api-token.XXXXXX)"
+    ));
+    assert!(template.contains(
+        "OPENFLOWS_GITHUB_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token"
+    ));
+    assert!(
+        template.matches("github-api-token.XXXXXX").count() >= 2,
+        "startup and refresh must both store the API token"
+    );
+    assert!(template.contains("/home/coder/.git-credentials"));
+    assert!(!template.contains("gh auth login"));
+    assert!(!template.contains("/home/coder/.config/gh/hosts.yml"));
+    assert!(!template.contains("apt-get install -y -qq gh"));
 }
 
 #[test]

@@ -533,9 +533,14 @@ async fn successful_runtime_exchange_returns_scoped_token() {
     assert_eq!(body["token"], "ghs_fixture_broker_token");
     assert_eq!(body["repository_id"], 9001);
     assert_eq!(body["username"], "x-access-token");
-    // The requested permission profile for forge.git is contents:write.
+    // Forge's Git profile includes workflow write because its task can update
+    // workflow files. Other roles/purposes must not receive this grant.
     let requested = ctx.api.last_requested_permissions().unwrap();
     assert_eq!(requested.get("contents").map(String::as_str), Some("write"));
+    assert_eq!(
+        requested.get("workflows").map(String::as_str),
+        Some("write")
+    );
     assert_eq!(ctx.api.last_requested_repos().unwrap(), vec![9001]);
 
     // A lease was recorded with the fingerprint and generations.

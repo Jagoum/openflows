@@ -322,6 +322,14 @@ PY
       exit 1
     fi
 
+    # The harness uses the brokered API-purpose token for PR operations. Git
+    # uses the brokered Git-purpose token. Neither path uses gh authentication.
+    mkdir -p /home/coder/.config/openflows
+    chmod 700 /home/coder/.config/openflows
+    API_TOKEN_TEMP=$(mktemp /home/coder/.config/openflows/github-api-token.XXXXXX)
+    printf '%s' "$API_TOKEN" > "$API_TOKEN_TEMP"
+    mv -f "$API_TOKEN_TEMP" /home/coder/.config/openflows/github-api-token
+
     # System-level helper so git works for BOTH the agent user (pushes) and
     # the sudo'd root clone below (their $HOME differ).
     sudo git config --system credential.helper store
@@ -331,73 +339,6 @@ PY
     sudo cp /home/coder/.git-credentials /root/.git-credentials
     sudo chmod 600 /root/.git-credentials
     log "Configured git credentials for GitHub push auth"
-
-    # gh supports GitHub and HTTPS enterprise hosts; custom HTTP APIs use REST.
-    GITHUB_CLI_HOST=""
-    case "$GITHUB_API_BASE" in
-      https://api.github.com|https://api.github.com/) GITHUB_CLI_HOST=github.com ;;
-      https://*) GITHUB_CLI_HOST=$(python3 -c 'import os; from urllib.parse import urlsplit; print(urlsplit(os.environ["GITHUB_API_BASE"]).netloc)') ;;
-      http://*) log "GitHub CLI requires HTTPS; using the configured REST API for this host" ;;
-      *) log "FATAL: GitHub API base must use HTTP or HTTPS"; exit 1 ;;
-    esac
-
-    # Install the GitHub CLI so the agent can open PRs with `gh pr create`
-    # instead of hand-rolling the REST API. gh is best-effort, NOT a hard
-    # startup dependency: the git credential helper above is the real push
-    # mechanism, so a workspace with a valid repo seed still starts even if gh
-    # cannot be installed (the agent can open the PR via REST/UI instead).
-    if [ -n "$GITHUB_CLI_HOST" ] && ! command -v gh >/dev/null 2>&1; then
-      # Ubuntu base image (codercom/enterprise-base): prefer the official
-      # GitHub apt repo (always current), fall back to the distro package.
-      sudo mkdir -p -m 0755 /etc/apt/keyrings 2>/dev/null || true
-      sudo curl -fsSL --connect-timeout 5 --max-time 15 https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
-      if [ -s /etc/apt/keyrings/githubcli-archive-keyring.gpg ]; then
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-          | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-      fi
-      # Optional package installation must not hold a workspace's startup
-      # script indefinitely when an apt mirror is unreachable. Production
-      # workspace images should include gh at build time.
-      timeout -k 5s 45s sudo apt-get update -qq >/dev/null 2>&1 || true
-      timeout -k 5s 45s sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
-      if ! command -v gh >/dev/null 2>&1; then
-        log "WARNING: gh is unavailable; Git push still uses the broker credential, and PR creation must use the REST fallback"
-      fi
-    fi
-
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      # Store the API-purpose installation token in gh's protected config.
-      # Git keeps its separate contents-scoped token in the credential store;
-      # the refresh daemon rotates both profiles independently.
-      unset GH_TOKEN GH_ENTERPRISE_TOKEN
-      if [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
-        mkdir -p /home/coder/.config/gh
-        {
-          printf '%s:\n' "$GITHUB_CLI_HOST"
-          printf '    oauth_token: %s\n' "$API_TOKEN"
-          printf '    git_protocol: https\n'
-        } > /home/coder/.config/gh/hosts.yml
-        chmod 600 /home/coder/.config/gh/hosts.yml
-        sudo mkdir -p /root/.config/gh
-        sudo cp /home/coder/.config/gh/hosts.yml /root/.config/gh/hosts.yml
-        sudo chmod 600 /root/.config/gh/hosts.yml
-      fi
-      log "Hosted GitHub App installation token configured; personal gh identity check is not applicable"
-    elif [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
-      # Authenticate gh persistently as the inherited identity for BOTH the
-      # `coder` user and `root` (the sudo'd clone below uses root's $HOME).
-      # --hostname + --git-protocol make the stored credential explicit and
-      # deterministic (non-interactive). The token travels through stdin for
-      # the root login too — never embedded in a command-line argument that
-      # another process could read. Failures are fatal, never swallowed.
-      printf '%s' "$GIT_TOKEN" | gh auth login --hostname "$GITHUB_CLI_HOST" --git-protocol https --with-token \
-        || { log "FATAL: gh auth login failed for user coder"; exit 1; }
-      printf '%s' "$GIT_TOKEN" | sudo -H bash -c 'IFS= read -r tok || [ -n "$tok" ] || exit 1; printf "%s" "$tok" | gh auth login --hostname "$1" --git-protocol https --with-token' _ "$GITHUB_CLI_HOST" \
-        || { log "FATAL: gh auth login failed for user root"; exit 1; }
-    else
-      log "GitHub CLI unavailable for this host — use git push and the configured REST API to open PRs"
-    fi
 
     # Resolve the expected account from the inherited token via the GitHub API
     # (the coder_external_auth data source does not expose the login). Honor
@@ -416,21 +357,7 @@ PY
       exit 1
     fi
 
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      log "GitHub CLI uses the repository-scoped installation token"
-    elif [ -n "$GITHUB_CLI_HOST" ] && command -v gh >/dev/null 2>&1; then
-      # Verify the authed gh identity actually matches the inherited account, so
-      # gh/git act as the controller-spawner — never a dummy or mismatched login.
-      AUTHED_LOGIN=$(gh api --hostname "$GITHUB_CLI_HOST" user --jq .login) \
-        || { log "FATAL: could not query the authed gh identity"; exit 1; }
-      if [ "$AUTHED_LOGIN" != "$EXPECTED_LOGIN" ]; then
-        log "FATAL: gh authed as '$AUTHED_LOGIN' but the inherited token resolves to '$EXPECTED_LOGIN' — identity mismatch"
-        exit 1
-      fi
-      log "Inherited GitHub identity verified: $EXPECTED_LOGIN"
-    else
-      log "WARNING: gh unavailable — skipping gh identity check; git push uses the inherited token via the credential helper"
-    fi
+    log "GitHub identity resolved: $EXPECTED_LOGIN"
 
     # Set git author identity from the inherited account (the template sets
     # none today, so commits would fail or use a wrong default identity).
@@ -593,23 +520,15 @@ PY
           API=$(curl -fsS -H "Authorization: Bearer $${ACCESS}" -H "Content-Type: application/json" --data "{\"purpose\":\"api\"}" "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials" 2>/dev/null) || continue
           GIT_TOKEN=$(printf "%s" "$${GIT}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
           API_TOKEN=$(printf "%s" "$${API}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
+          if [ -z "$${GIT_TOKEN}" ] || [ -z "$${API_TOKEN}" ]; then continue; fi
           echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
           sudo cp /home/coder/.git-credentials /root/.git-credentials
           sudo chmod 600 /root/.git-credentials
-          if [ -n "$1" ]; then
-            mkdir -p /home/coder/.config/gh
-            {
-              printf "%s:\n" "$1"
-              printf "    oauth_token: %s\n" "$${API_TOKEN}"
-              printf "    git_protocol: https\n"
-            } > /home/coder/.config/gh/hosts.yml
-            chmod 600 /home/coder/.config/gh/hosts.yml
-            sudo mkdir -p /root/.config/gh
-            sudo cp /home/coder/.config/gh/hosts.yml /root/.config/gh/hosts.yml
-            sudo chmod 600 /root/.config/gh/hosts.yml
-          fi
+          API_TOKEN_TEMP=$(mktemp /home/coder/.config/openflows/github-api-token.XXXXXX) || continue
+          printf "%s" "$${API_TOKEN}" > "$${API_TOKEN_TEMP}"
+          mv -f "$${API_TOKEN_TEMP}" /home/coder/.config/openflows/github-api-token
         done
-      ' _ "$GITHUB_CLI_HOST" >>/home/coder/.local/state/openflows/git-refresh.log 2>&1 &
+      ' >>/home/coder/.local/state/openflows/git-refresh.log 2>&1 &
     fi
 
     if [ ! -d /home/coder/workspace/.git ]; then
@@ -769,6 +688,7 @@ resource "docker_container" "workspace" {
     "GITHUB_API_BASE=${var.github_api_base}",
     "GITHUB_GIT_BASE=${var.github_git_base}",
     "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
+    "OPENFLOWS_GITHUB_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
     # Base role (forge-1 -> forge): harness Redis keys are namespaced by base role

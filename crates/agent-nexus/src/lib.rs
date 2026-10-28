@@ -1822,14 +1822,15 @@ Use `openflows-harness` for all coordination:
 | `dispatch read` | Get ticket requirements |
 | `status get` | Check current phase |
 | `status set <phase>` | Update progress phase |
-| `pr opened --pr N --branch B --title T` | Record PR after opening |
+| `pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` | Create/find the GitHub PR and record it; provide a descriptive Markdown body |
+| `pr opened --pr N --branch B --title T` | Record an externally created PR only |
 | `handoff write --contract F --notes N` | Prepare for next agent |
 
 ### Phase Workflow
 1. Analyze task, write the plan at the current chat's plan path, then upload it with `plan write --file <absolute-plan-path>` and set `status set plan_ready` and wait for SENTINEL approval
 2. `building` → SENTINEL plan approval moves shared state to building; read status and implement
 3. `testing` → Run tests, verify, set `status set testing`
-4. After A2A verification and SENTINEL testing approval (human testing review is TODO), set `status set submit`, open/record PR, and wait for SENTINEL and human PR approval.
+4. After A2A verification and SENTINEL testing approval (human testing review is TODO), read `status get`; approval moves the lifecycle to `submit`. Push the assigned branch. If no PR is recorded, run `pr create` with the task's target base (or repository default), a descriptive title, and a Markdown body explaining the change and verification. That command creates/finds and records the PR. If a PR is already recorded, update its branch. Wait for SENTINEL and human PR approval.
 5. `blocked` → Stuck? Set status and explain
 "#;
 
@@ -2314,7 +2315,7 @@ Use `openflows-harness` for all coordination:
                                 .await
                             {
                                 let prompt = if testing {
-                                    "Testing review gates passed. Read status get for the approved revision and head; once lifecycle shows submit, open/record the PR and wait for PR review and human approval.".to_string()
+                                    "Testing review gates passed. Read `openflows-harness status get`; proceed only in submit. Push the assigned branch. If no PR is recorded, run `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` with a descriptive Markdown body; it creates/finds and records the PR. Use the task's target base or repository default. If a PR is already recorded, update its branch. Wait for PR review and human approval.".to_string()
                                 } else {
                                     "Review gates passed. Run `openflows-harness status set building`. Read status get for the approved revision and head.".to_string()
                                 };
@@ -2649,7 +2650,7 @@ Use `openflows-harness` for all coordination:
                                     ))
                                     .await
                                 {
-                                    let prompt = "Testing review gates passed and lifecycle is already submit. Continue work: open or update the PR, record it with `openflows-harness pr opened`, then wait for PR review, human approval, and CI.";
+                                    let prompt = "Testing review gates passed; lifecycle is already submit. Push the assigned branch. If no PR is recorded, run `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` with a descriptive Markdown body; it creates/finds and records the PR. Use the task's target base or repository default. If a PR is already recorded, update its branch. Wait for PR review, human approval, and CI.";
                                     if client
                                         .send_chat_message(
                                             &chat,
@@ -3315,7 +3316,7 @@ Use `openflows-harness` for all coordination:
                     };
                     if approved {
                         let prompt = if testing {
-                            "Testing review gates passed. Read `openflows-harness status get`; continue through submit, open or update the PR, and record it with `openflows-harness pr opened`."
+                            "Testing review gates passed. Read `openflows-harness status get`; proceed only in submit. Push the assigned branch. If no PR is recorded, run `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` with a descriptive Markdown body; it creates/finds and records the PR. Use the task's target base or repository default. If a PR is already recorded, update its branch."
                         } else {
                             "Plan review passed. Run `openflows-harness status set building`, read the approved revision with `openflows-harness status get`, and continue implementation."
                         };
@@ -3403,7 +3404,7 @@ Use `openflows-harness` for all coordination:
                                 runtime,
                                 ticket,
                                 &key,
-                                "Testing is approved and lifecycle is at submit. Open or update the PR and record it with `openflows-harness pr opened`.",
+                                "Testing is approved and lifecycle is at submit. Push the assigned branch. If no PR is recorded, run `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` with a descriptive Markdown body; it creates/finds and records the PR. Use the task's target base or repository default. If a PR is already recorded, update its branch.",
                             )
                             .await;
                         }

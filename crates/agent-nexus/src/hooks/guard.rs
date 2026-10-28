@@ -634,7 +634,7 @@ pub fn phase_guidance(phase: &str, plan_exists: bool, role: &str) -> String {
         "building" if !plan_exists => "Building has no approved plan. Return to planning and run /plan, upload it, then obtain review before implementing.".into(),
         "building" => "Building: implement the approved plan, commit all changes, then set testing with a clean checkout.".into(),
         "testing" => "Testing freezes source. Run verify serve for SENTINEL A2A tests. Wait for successful A2A verification and SENTINEL testing approval, then set submit. Human testing review is TODO and does not block submit. For fixes return to building.".into(),
-        "submit" => "Submit: open/record the PR. Wait for SENTINEL review, human approval and CI. Source fixes require returning to building and repeating testing.".into(),
+        "submit" => "Submit: push the assigned branch. If no PR is recorded, use `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body DESCRIPTION`; choose BASE from the task or repository default and write a descriptive Markdown body. This creates/finds the GitHub PR and records it. If a PR is already recorded, update its branch rather than creating another. Wait for SENTINEL review, human approval and CI. Source fixes require returning to building and repeating testing.".into(),
         "done" => "Ticket is done and terminal.".into(),
         "blocked" => "Blocked: record a blocker and wait for help. Recovery returns to planning.".into(),
         _ => "Read status get; start with planning and an uploaded plan. Unknown state cannot authorize source edits.".into(),
