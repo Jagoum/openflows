@@ -1,9 +1,62 @@
-# Manager foundations (WP-01)
+# Manager foundations and human authorization
 
-The manager owns the Openflows product database, separately from Coder. Hosted
-business endpoints and live Coder compatibility remain work for later packages.
+The manager owns the Openflows product database, separately from Coder. It adds
+GitHub human sign-in, browser and CLI sessions, device approval, organization
+membership, and invitations. GitHub installation connections, Coder
+provisioning workers, and the complete hosted CLI remain later packages.
+
+It also adds runtime authentication and the GitHub credential broker: a
+workspace runtime principal (distinct from human sessions) that obtains
+short-lived GitHub installation tokens scoped to its authorized repository and
+permission profile. See [runtime credentials and the GitHub credential
+broker](../../docs/architecture/runtime-credentials-broker.md).
 
 ## Validation
+
+Migration `0012_current_organization_release.sql` adds the organization release
+selection. Publication history is retained in `organization_release_bindings`;
+the single current selection lives in `organization_current_releases`. Existing
+bindings are backfilled by most recent creation time, with release ID breaking
+ties. Successful organization readiness, release selection, and operation
+completion are now committed together. Startup preserves retired releases.
+
+Failed template imports receive at most three attempts per organization, role,
+and release. Replacement versions use deterministic `-retry-1` / `-retry-2`
+suffixes; successful and still-running imports are reused. Coder's top-level
+job error can hide the underlying provider-download failure, so this bounded
+retry policy applies to failed imports generally. Cancelled jobs are not
+automatically replaced. Repeated failures still prevent organization readiness.
+The test console's operation ID field and **Retry operation** button can requeue
+an existing failed `org.provision` operation with `IMPORT_FAILED`, including
+operations created before this recovery support. Retrying does not reset the
+three-version import budget.
+
+With `OPENFLOWS_PROVISIONER_BACKEND=docker`, Manager automatically reserves a
+key identity, creates its Coder provisioner key, encrypts the credential in
+`managed_provisioners`, and starts an organization-specific Docker container.
+Only an `idle` or `busy` daemon authenticated with that key qualifies as ready.
+Retries reuse the key and container. Interrupted key creation is recovered by
+revoking only the uniquely reserved key before recreating it. Docker's
+`unless-stopped` policy handles process/host restarts, and a Manager loop every
+30 seconds restores missing or stopped containers for active organizations.
+
+The Docker host must be trusted: provisioners mount its Docker socket. Each
+container receives only its own credential file (0600) from
+`OPENFLOWS_PROVISIONER_SECRET_DIR` (default `.local/provisioners`, directory
+0700). Keep this directory durable and at the same absolute path for all
+Manager replicas sharing the Docker host. For a containerized Manager, mount
+the directory at the same path on host and Manager and supply Docker access.
+The master key must remain stable so stored credentials can be decrypted.
+
+`OPENFLOWS_PROVISIONER_CODER_URL` overrides the container-facing Coder URL;
+otherwise loopback addresses become `host.docker.internal`. Optional settings
+are `OPENFLOWS_PROVISIONER_NETWORK`, `OPENFLOWS_PROVISIONER_IMAGE` (defaults to
+the pinned Coder version), `OPENFLOWS_PROVISIONER_DOCKER_SOCKET`, and
+`OPENFLOWS_DOCKER_BINARY`. Docker Desktop's bundled CLI is detected on macOS.
+Other backends still require an operator-managed daemon with key name
+`openflows-provisioner-<coder-organization-id>`; Kubernetes launch automation
+is not provided by this Docker implementation. Template publication and tenant
+execution must still be validated separately from provisioner readiness.
 
 Ordinary tests require no PostgreSQL server:
 
@@ -61,9 +114,46 @@ their checksums. It enforces organization relationships and reserves tenant
 names/repositories and workspace role/slots until both desired and observed
 states are deleted. NULL workspace slots represent a singleton slot.
 
-## PR #390 review scope
+## Template release source
 
-The current PR head excludes the WP-00 Coder compatibility harness and wrapper.
-The three review comments about shell manifests, temporary credential files,
-and name-based Coder cleanup refer to files absent from this branch and its
-current PR diff. No fix to those absent tools is claimed by this change.
+Template releases come from an operator-configured source, never
+customer-supplied URLs (see
+[docs/implementation/centralized-deployment/06-hosted-template-releases.md](../../../docs/implementation/centralized-deployment/06-hosted-template-releases.md)):
+
+- **Local** (default): packages the checked-in `crates/coder-client/templates`
+  directory. For development and tests; requires no network.
+- **GitHub** (`OPENFLOWS_RELEASE_SOURCE=github`): resolves a pinned immutable
+  GitHub release, verifies the manifest and every role archive digest, rejects
+  unsafe archive contents, bounds download sizes, applies timeouts, and caches
+  verified artifacts on disk.
+
+All settings are centralized and typed in `config.rs`. The release is pinned to
+an immutable tag plus the manifest digest; never a mutable branch or `latest`.
+
+### Running the hosted source locally
+
+Publish a release with a `manifest.json` asset plus one archive per role (see
+the deployment doc for the layout), then run:
+
+```sh
+export OPENFLOWS_RELEASE_SOURCE=github
+export OPENFLOWS_GITHUB_TEMPLATE_REPOSITORY=The-AgenticFlow/openflows-templates
+export OPENFLOWS_GITHUB_TEMPLATE_TAG=2026.10.0
+export OPENFLOWS_TEMPLATE_MANIFEST_SHA256=<64-char manifest digest>
+export OPENFLOWS_RELEASE_CACHE_DIR=/tmp/openflows-release-cache
+cargo run -p openflows-manager
+```
+
+### Testing the release source
+
+```sh
+cargo test -p openflows-manager provisioning::source
+```
+
+# Deployment commands
+
+Use `openflows-manager --config .env.openflows setup`, then `doctor` and `serve`.
+From source, prefix each with `cargo run -p openflows-manager --` instead of
+`openflows-manager`. See the [operator deployment guide](../../docs/implementation/centralized-deployment/operator-deployment.md)
+for the shared configuration file, generated credentials, local Compose stack,
+and the remaining production isolation requirement.
