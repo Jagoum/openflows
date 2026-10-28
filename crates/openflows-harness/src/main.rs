@@ -11,6 +11,7 @@
 //!   OPENFLOWS_ROLE     — Current role (forge, sentinel, vessel, lore)
 
 use openflows_harness::store;
+mod github_pr;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -120,6 +121,19 @@ enum HandoffAction {
 enum PrAction {
     /// Read the recorded PR info for this ticket (empty JSON if unset)
     Get,
+    /// Create (or find) a GitHub PR using the brokered API token; then record it
+    Create {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+    },
     /// Record that a PR was opened
     Opened {
         #[arg(long)]
@@ -368,6 +382,29 @@ async fn main() -> Result<()> {
             store
                 .handoff_write(&ticket, &contract, notes.as_deref())
                 .await?;
+        }
+        Commands::Pr {
+            action:
+                PrAction::Create {
+                    repo,
+                    base,
+                    head,
+                    title,
+                    body,
+                },
+        } => {
+            store.ensure_pr_creation_allowed(&ticket, &role).await?;
+            let pr = github_pr::create_or_find(&repo, &base, &head, &title, &body).await?;
+            store
+                .pr_opened(&ticket, &pr.number, &head, &pr.title)
+                .await
+                .with_context(|| {
+                    format!(
+                        "PR #{} exists at {} but could not be recorded; use `pr opened --pr {} --branch {} --title <title>` after restoring submit phase",
+                        pr.number, pr.url, pr.number, head
+                    )
+                })?;
+            println!("PR #{}: {}", pr.number, pr.url);
         }
         Commands::Pr {
             action: PrAction::Opened { pr, branch, title },

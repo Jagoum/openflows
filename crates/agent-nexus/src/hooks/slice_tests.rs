@@ -1191,6 +1191,52 @@ async fn planning_reconnaissance_does_not_allow_hidden_source_writes() {
 }
 
 #[tokio::test]
+async fn submit_allows_pr_body_mentioning_write_commands_but_denies_real_writes() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-pr-body", "forge", "chat-pr-body").await;
+    seed_status(&store, "T-pr-body", "submit").await;
+
+    for command in [
+        "openflows-harness pr create --body 'Verified with cargo fmt and python3 -c checks'",
+        "openflows-harness pr create --body 'Run `cargo fmt` before merging'",
+        "openflows-harness pr create --body 'Verified; touch src/lib.rs was not needed'",
+        "openflows-harness pr create --body '>'",
+    ] {
+        let decision = phase_guard(
+            &store,
+            "chat-pr-body",
+            "forge",
+            "bash",
+            &json!({"command": command}),
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(!decision.deny, "quoted PR body is data: {command}");
+    }
+
+    for command in [
+        "openflows-harness pr create --body 'Verified' && cargo fmt",
+        "openflows-harness pr create --body 'Verified'; python3 -c 'print(1)'",
+        "openflows-harness pr create --body $(touch src/lib.rs)",
+        "openflows-harness pr create --body 'Verified' | xargs touch src/lib.rs",
+    ] {
+        let decision = phase_guard(
+            &store,
+            "chat-pr-body",
+            "forge",
+            "bash",
+            &json!({"command": command}),
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(
+            decision.deny,
+            "executable write remains forbidden: {command}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn forge_bootstrap_uses_current_phase_instead_of_restarting_planning() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-resume", "forge", "chat-resume").await;
