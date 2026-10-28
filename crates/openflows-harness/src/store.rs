@@ -256,11 +256,8 @@ impl HarnessStore {
                 state.phase.as_str()
             );
         }
-        if state.pr_number.is_some() {
-            bail!(
-                "This ticket already records PR #{}",
-                state.pr_number.unwrap()
-            );
+        if let Some(pr_number) = state.pr_number {
+            bail!("This ticket already records PR #{}", pr_number);
         }
         Ok(())
     }
