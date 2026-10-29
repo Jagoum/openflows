@@ -1,6 +1,6 @@
 name: Docker Publish Manager
 
-# Pushes ghcr.io/the-agenticflow/openflows-manager:<tag> (linux/amd64). release.yml dispatches it per release.
+# Pushes ghcr.io/the-agenticflow/openflows-manager (linux/amd64). A release tag also gets X.Y, X and latest.
 on:
   workflow_dispatch:
     inputs:
@@ -37,6 +37,25 @@ jobs:
         id: rev
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve image tags
+        id: tags
+        env:
+          TAG: ${{ inputs.tag }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}"
+          tags="${image}:${TAG}"
+          # Floating tags only for a release dispatch (ref is that release's tag), like docker-publish.yml.
+          if [[ "${REF}" == "refs/tags/openflows-${TAG}" && "${TAG}" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            tags="${tags}"$'\n'"${image}:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"$'\n'"${image}:${BASH_REMATCH[1]}"$'\n'"${image}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "${tags}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -55,7 +74,7 @@ jobs:
           file: Dockerfile.manager
           platforms: linux/amd64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: |
             org.opencontainers.image.title=openflows-manager
             org.opencontainers.image.description=OpenFlows Manager service
