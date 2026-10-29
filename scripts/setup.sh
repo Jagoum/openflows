@@ -810,8 +810,17 @@ main() {
         [ -n "$NAME" ] || NAME="$(env_get OPENFLOWS_SETUP_NAME)"
         [ -n "$FLEET" ] || FLEET="$(env_get OPENFLOWS_SETUP_FLEET)"
     fi
-    NAME="${NAME:-${REPO/\//-}}"   # new repo: owner-repo, so orgA/backend and orgB/backend do not collide
-    NAME="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
+    # The tenant workspace is openflows-nexus-NAME and Coder caps workspace names at 32 characters
+    # (letters, digits, single hyphens), so NAME gets at most 16 of them.
+    if [ -z "$NAME" ]; then   # new repo: owner-repo, so orgA/backend and orgB/backend do not collide
+        NAME="$(printf '%s' "${REPO/\//-}" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//; s/-*$//')"
+        if [ "${#NAME}" -gt 16 ]; then   # too long: keep a readable prefix plus a hash of the repo so names stay distinct
+            NAME="$(printf '%s-%06x' "$(printf '%s' "${NAME:0:9}" | sed 's/-*$//')" "$(( $(printf '%s' "$REPO" | cksum | cut -d' ' -f1) % 16777216 ))")"
+        fi
+    fi
+    [[ "$NAME" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$ && "${#NAME}" -le 16 ]] \
+        || die "Tenant name '${NAME}' does not fit Coder's workspace name rules." \
+               "Use at most 16 letters, digits and single hyphens:  ./scripts/setup.sh ${REPO} --name <short-name>"
     if [ -z "$FLEET" ] && is_tty; then   # first run, no --fleet given: ask (a re-run reuses the saved value)
         printf '\n  %sFleet = FORGE-SENTINEL pairs (a builder plus its reviewer). 1 pair works one issue at a time;\n  N pairs work N issues in parallel, using more LLM tokens and workspaces. Start small — you can add more later.%s\n' "$D" "$N"
         while true; do
