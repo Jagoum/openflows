@@ -150,6 +150,22 @@ cargo run -p openflows-manager
 cargo test -p openflows-manager provisioning::source
 ```
 
+# Container image
+
+`ghcr.io/the-agenticflow/openflows-manager:<tag>` runs `openflows-manager serve`
+as a non-root user and listens on `0.0.0.0:3002` (`OPENFLOWS_MANAGER_ADDR`).
+`GET /health` is the liveness probe and `GET /ready` the readiness probe. The
+other subcommands run in the same image: `setup`, `doctor`, `repair-runtime` and
+`set-coder-hook-secret`. The image has no Docker CLI, so the `docker` provisioner
+backend is not supported in it.
+
+All settings come from the environment, as listed in `.env.openflows.example`;
+the image holds no configuration or secrets. It is built from
+[`Dockerfile.manager`](../../Dockerfile.manager) by the `Docker Publish Manager`
+workflow, which `release.yml` dispatches for each release and which can be
+dispatched by hand for any ref and tag. It is `linux/amd64` only. Deploy it by
+digest, not by tag.
+
 # Deployment commands
 
 Use `openflows-manager --config .env.openflows setup`, then `doctor` and `serve`.
