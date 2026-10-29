@@ -1159,6 +1159,7 @@ mod tests {
         std::env::remove_var(MODE_ENV);
         std::env::remove_var(DATABASE_URL_ENV);
         std::env::remove_var(SECRET_PROVIDER_ENV);
+        std::env::remove_var(CONNECTED_LOCAL_ENABLED_ENV);
 
         let cfg = ManagerConfig::from_env().unwrap();
         assert_eq!(cfg.mode, Mode::Local);
@@ -1175,6 +1176,7 @@ mod tests {
         let _guard = EnvGuard::capture(ALL_KEYS);
         std::env::set_var(MODE_ENV, "local");
         std::env::remove_var(DATABASE_URL_ENV);
+        std::env::remove_var(CONNECTED_LOCAL_ENABLED_ENV);
 
         let cfg = ManagerConfig::from_env().unwrap();
         assert_eq!(cfg.mode, Mode::Local);
