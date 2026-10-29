@@ -1,6 +1,6 @@
 name: Docker Publish Manager
 
-# Pushes ghcr.io/the-agenticflow/openflows-manager (linux/amd64). The newest release also gets X.Y, X and latest.
+# Pushes ghcr.io/the-agenticflow/openflows-manager (linux/amd64). A release build also moves X.Y, X and latest if still the newest.
 on:
   workflow_dispatch:
     inputs:
@@ -13,7 +13,7 @@ on:
         required: true
 
 concurrency:
-  group: docker-publish-manager
+  group: docker-publish-manager-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
@@ -37,33 +37,16 @@ jobs:
         id: rev
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve image tags
-        id: tags
+      - name: Resolve build type
+        id: kind
         env:
           TAG: ${{ inputs.tag }}
           REF: ${{ inputs.ref }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          tags="${image}:${TAG}"
-          # A release dispatch (ref is that release's tag) also moves X.Y, X and latest, but only
-          # when it is the newest release in that series, so an older build never rolls them back.
-          if [[ "${REF}" == "refs/tags/openflows-${TAG}" && "${TAG}" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
-            major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"
-            refs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/openflows-" --jq '.[].ref')"
-            releases="$(sed 's|refs/tags/openflows-||' <<<"${refs}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)"
-            releases="$(printf '%s\n%s\n' "${releases}" "${TAG}")"
-            newest() { grep -E "$1" <<<"${releases}" | sort -V | tail -1; }
-            [[ "$(newest "^${major}\.${minor}\.")" == "${TAG}" ]] && tags="${tags}"$'\n'"${image}:${major}.${minor}"
-            [[ "$(newest "^${major}\.")" == "${TAG}" ]] && tags="${tags}"$'\n'"${image}:${major}"
-            [[ "$(newest '.')" == "${TAG}" ]] && tags="${tags}"$'\n'"${image}:latest"
-          fi
-          {
-            echo "tags<<EOF"
-            echo "${tags}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          release=false
+          [[ "${REF}" == "refs/tags/openflows-${TAG}" && "${TAG}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && release=true
+          echo "release=${release}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -83,7 +66,7 @@ jobs:
           file: Dockerfile.manager
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
           labels: |
             org.opencontainers.image.title=openflows-manager
             org.opencontainers.image.description=OpenFlows Manager service
@@ -94,6 +77,29 @@ jobs:
           cache-from: type=gha,scope=openflows-manager-docker
           cache-to: type=gha,mode=max,scope=openflows-manager-docker
           provenance: false
+
+      - name: Move floating tags
+        if: steps.kind.outputs.release == 'true'
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Decided after the build, so a slower older build cannot roll X.Y, X or latest back.
+          image="${REGISTRY}/${IMAGE_NAME}"
+          [[ "${TAG}" =~ ^([0-9]+)\.([0-9]+)\. ]]
+          major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"
+          refs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/openflows-" --jq '.[].ref')"
+          releases="$(sed 's|refs/tags/openflows-||' <<<"${refs}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+          releases="$(printf '%s\n%s\n' "${releases}" "${TAG}")"
+          newest() { grep -E "$1" <<<"${releases}" | sort -V | tail -1; }
+          args=()
+          [[ "$(newest "^${major}\.${minor}\.")" == "${TAG}" ]] && args+=(-t "${image}:${major}.${minor}")
+          [[ "$(newest "^${major}\.")" == "${TAG}" ]] && args+=(-t "${image}:${major}")
+          [[ "$(newest '.')" == "${TAG}" ]] && args+=(-t "${image}:latest")
+          if [ "${#args[@]}" -gt 0 ]; then
+            docker buildx imagetools create "${args[@]}" "${image}:${TAG}"
+          fi
 
       - name: Print the image digest
         env:
