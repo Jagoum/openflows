@@ -26,13 +26,13 @@ expect_eq "org/a-b" "$(default_tenant_name org/a-b)" "org-a-b"
 expect_eq "abcdefgh/ijklmno (16 chars)" "$(default_tenant_name abcdefgh/ijklmno)" "abcdefgh-ijklmno"
 
 echo "Names that had to change get a repo hash"
-for repo in org/a.b org/a_b org/x--y Jagoum/rust-libary The-AgenticFlow/openflows a.b/c_d__e; do
+for repo in org/a.b org/a_b org/x--y Jagoum/rust-library The-AgenticFlow/openflows a.b/c_d__e; do
     name="$(default_tenant_name "$repo")"
     if [[ "$name" =~ -[0-9a-f]{6}$ ]]; then pass "$repo -> $name"; else fail "$repo -> $name has no hash suffix"; fi
 done
 
 echo "Every default name fits Coder's workspace name rule"
-for repo in org/backend org/a.b org/a_b org/a-b org/x--y Jagoum/rust-libary \
+for repo in org/backend org/a.b org/a_b org/a-b org/x--y Jagoum/rust-library \
     The-AgenticFlow/openflows a.b/c_d__e _org/-repo- abcdefgh/ijklmnop; do
     name="$(default_tenant_name "$repo")"
     if tenant_name_ok "$name"; then pass "$repo -> $name (${#name})"; else fail "$repo -> '$name' is not a valid tenant name"; fi

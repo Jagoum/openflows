@@ -705,7 +705,7 @@ mod tests {
     #[test]
     fn nexus_workspace_name_rejects_names_coder_would_reject() {
         for bad in [
-            "Jagoum-rust-libary", // 34-character workspace name
+            "Jagoum-rust-library", // 35-character workspace name
             "",
             "my_team",
             "my.team",
