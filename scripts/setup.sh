@@ -738,6 +738,23 @@ ensure_github_link() {
     ok "GitHub linked"
 }
 
+# The tenant workspace is openflows-nexus-NAME and Coder caps workspace names at 32 characters
+# (letters, digits, single hyphens), so NAME gets at most 16 of them.
+tenant_name_ok() { [[ "$1" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$ && "${#1}" -le 16 ]]; }
+
+# default_tenant_name owner/repo: owner-repo when that is already a valid tenant name, so
+# orgA/backend and orgB/backend do not collide. Otherwise a 9-character prefix plus a hash of the
+# repo, so repos that normalise alike (org/a.b, org/a_b) or share a long prefix stay distinct.
+default_tenant_name() {
+    local raw="${1/\//-}" name
+    name="$(printf '%s' "$raw" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//; s/-*$//')"
+    if [ "$name" != "$raw" ] || [ "${#name}" -gt 16 ]; then
+        name="$(printf '%s-%06x' "$(printf '%s' "${name:0:9}" | sed 's/-*$//')" \
+            "$(( $(printf '%s' "$1" | cksum | cut -d' ' -f1) % 16777216 ))")"
+    fi
+    printf '%s' "$name"
+}
+
 # check_existing_tenant — `tenant add` returns an existing workspace unchanged, so a tenant name already bound
 # to a different repo would keep running against the old one. Stop with the fix instead of reporting success.
 check_existing_tenant() {
@@ -810,15 +827,8 @@ main() {
         [ -n "$NAME" ] || NAME="$(env_get OPENFLOWS_SETUP_NAME)"
         [ -n "$FLEET" ] || FLEET="$(env_get OPENFLOWS_SETUP_FLEET)"
     fi
-    # The tenant workspace is openflows-nexus-NAME and Coder caps workspace names at 32 characters
-    # (letters, digits, single hyphens), so NAME gets at most 16 of them.
-    if [ -z "$NAME" ]; then   # new repo: owner-repo, so orgA/backend and orgB/backend do not collide
-        NAME="$(printf '%s' "${REPO/\//-}" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//; s/-*$//')"
-        if [ "${#NAME}" -gt 16 ]; then   # too long: keep a readable prefix plus a hash of the repo so names stay distinct
-            NAME="$(printf '%s-%06x' "$(printf '%s' "${NAME:0:9}" | sed 's/-*$//')" "$(( $(printf '%s' "$REPO" | cksum | cut -d' ' -f1) % 16777216 ))")"
-        fi
-    fi
-    [[ "$NAME" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$ && "${#NAME}" -le 16 ]] \
+    [ -n "$NAME" ] || NAME="$(default_tenant_name "$REPO")"   # new repo: derived from owner/repo
+    tenant_name_ok "$NAME" \
         || die "Tenant name '${NAME}' does not fit Coder's workspace name rules." \
                "Use at most 16 letters, digits and single hyphens:  ./scripts/setup.sh ${REPO} --name <short-name>"
     if [ -z "$FLEET" ] && is_tty; then   # first run, no --fleet given: ask (a re-run reuses the saved value)
