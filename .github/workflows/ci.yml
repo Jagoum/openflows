@@ -277,6 +277,7 @@ jobs:
       - manager-postgres
       - cargo-doc
       - cargo-machete
+      - shell-tests
       - typos
       - redis-lifecycle
       - coder-e2e
